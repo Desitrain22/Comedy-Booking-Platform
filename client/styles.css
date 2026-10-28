@@ -1,0 +1,204 @@
+/*
+ * Design tokens (spec §8): zinc neutrals, one indigo accent, light + dark via
+ * prefers-color-scheme. Use the semantic utilities below instead of raw zinc/indigo so
+ * dark mode comes for free:
+ *
+ *   bg-app  bg-surface  bg-surface-2  bg-surface-3     page / card / subtle fill / stronger fill
+ *   border-border  border-border-strong                hairlines
+ *   text-fg  text-fg-muted  text-fg-subtle             text
+ *   text-accent  bg-accent  bg-accent-soft  ring-accent  the accent (links, selection, focus)
+ *   bg-accent-solid  text-accent-solid-fg               solid accent buttons
+ *   {bg,text,border}-{confirmed,awaiting,notsent,unconfirmed,available}[-soft|-fg]
+ *                                                       booking status + availability colors
+ */
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif,
+    'Apple Color Emoji', 'Segoe UI Emoji';
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  /* animate-fade-in / animate-pop-in (dialogs, popovers, menus) */
+  --animate-fade-in: cbp-fade-in 120ms ease-out;
+  --animate-pop-in: cbp-pop-in 140ms ease-out;
+
+  @keyframes cbp-fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+  @keyframes cbp-pop-in {
+    from {
+      opacity: 0;
+      transform: translateY(4px) scale(0.98);
+    }
+  }
+}
+
+@theme inline {
+  --color-app: var(--app);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-solid: var(--accent-solid);
+  --color-accent-solid-hover: var(--accent-solid-hover);
+  --color-accent-solid-fg: var(--accent-solid-fg);
+
+  --color-danger: var(--danger);
+  --color-danger-solid: var(--danger-solid);
+  --color-danger-solid-hover: var(--danger-solid-hover);
+  --color-danger-soft: var(--danger-soft);
+
+  /* Booking status (spec §4/§8) */
+  --color-confirmed: var(--confirmed);
+  --color-confirmed-soft: var(--confirmed-soft);
+  --color-confirmed-fg: var(--confirmed-fg);
+  --color-awaiting: var(--awaiting);
+  --color-awaiting-soft: var(--awaiting-soft);
+  --color-awaiting-fg: var(--awaiting-fg);
+  --color-notsent: var(--notsent);
+  --color-notsent-soft: var(--notsent-soft);
+  --color-notsent-fg: var(--notsent-fg);
+  --color-unconfirmed: var(--unconfirmed);
+  --color-unconfirmed-soft: var(--unconfirmed-soft);
+  --color-unconfirmed-fg: var(--unconfirmed-fg);
+
+  /* Availability green (emerald) */
+  --color-available: var(--available);
+  --color-available-soft: var(--available-soft);
+  --color-available-fg: var(--available-fg);
+}
+
+:root {
+  color-scheme: light dark;
+
+  --app: var(--color-zinc-50);
+  --surface: var(--color-white);
+  --surface-2: var(--color-zinc-100);
+  --surface-3: var(--color-zinc-200);
+  --border: var(--color-zinc-200);
+  --border-strong: var(--color-zinc-300);
+  --fg: var(--color-zinc-900);
+  --fg-muted: var(--color-zinc-500);
+  --fg-subtle: var(--color-zinc-400);
+
+  --accent: var(--color-indigo-600);
+  --accent-hover: var(--color-indigo-700);
+  --accent-soft: var(--color-indigo-50);
+  --accent-solid: var(--color-indigo-600);
+  --accent-solid-hover: var(--color-indigo-700);
+  --accent-solid-fg: var(--color-white);
+
+  --danger: var(--color-red-600);
+  --danger-solid: var(--color-red-600);
+  --danger-solid-hover: var(--color-red-700);
+  --danger-soft: var(--color-red-50);
+
+  --confirmed: var(--color-emerald-500);
+  --confirmed-soft: var(--color-emerald-50);
+  --confirmed-fg: var(--color-emerald-800);
+  --awaiting: var(--color-amber-500);
+  --awaiting-soft: var(--color-amber-50);
+  --awaiting-fg: var(--color-amber-800);
+  --notsent: var(--color-zinc-400);
+  --notsent-soft: var(--color-zinc-100);
+  --notsent-fg: var(--color-zinc-700);
+  --unconfirmed: var(--color-red-500);
+  --unconfirmed-soft: var(--color-red-50);
+  --unconfirmed-fg: var(--color-red-700);
+
+  --available: var(--color-emerald-500);
+  --available-soft: var(--color-emerald-50);
+  --available-fg: var(--color-emerald-700);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --app: var(--color-zinc-950);
+    --surface: var(--color-zinc-900);
+    --surface-2: var(--color-zinc-800);
+    --surface-3: var(--color-zinc-700);
+    --border: var(--color-zinc-800);
+    --border-strong: var(--color-zinc-700);
+    --fg: var(--color-zinc-100);
+    --fg-muted: var(--color-zinc-400);
+    --fg-subtle: var(--color-zinc-500);
+
+    --accent: var(--color-indigo-400);
+    --accent-hover: var(--color-indigo-300);
+    --accent-soft: color-mix(in oklab, var(--color-indigo-500) 18%, transparent);
+    --accent-solid: var(--color-indigo-500);
+    --accent-solid-hover: var(--color-indigo-400);
+    --accent-solid-fg: var(--color-white);
+
+    --danger: var(--color-red-400);
+    --danger-solid: var(--color-red-600);
+    --danger-solid-hover: var(--color-red-500);
+    --danger-soft: color-mix(in oklab, var(--color-red-500) 15%, transparent);
+
+    --confirmed: var(--color-emerald-400);
+    --confirmed-soft: color-mix(in oklab, var(--color-emerald-500) 15%, transparent);
+    --confirmed-fg: var(--color-emerald-300);
+    --awaiting: var(--color-amber-400);
+    --awaiting-soft: color-mix(in oklab, var(--color-amber-500) 15%, transparent);
+    --awaiting-fg: var(--color-amber-300);
+    --notsent: var(--color-zinc-500);
+    --notsent-soft: var(--color-zinc-800);
+    --notsent-fg: var(--color-zinc-300);
+    --unconfirmed: var(--color-red-400);
+    --unconfirmed-soft: color-mix(in oklab, var(--color-red-500) 18%, transparent);
+    --unconfirmed-fg: var(--color-red-300);
+
+    --available: var(--color-emerald-400);
+    --available-soft: color-mix(in oklab, var(--color-emerald-500) 18%, transparent);
+    --available-fg: var(--color-emerald-300);
+  }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  body {
+    @apply bg-app font-sans text-sm text-fg antialiased;
+    min-height: 100dvh;
+  }
+
+  #root {
+    min-height: 100dvh;
+  }
+
+  /* Keyboard focus rings everywhere; no ring for mouse clicks. */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-accent;
+  }
+
+  ::selection {
+    @apply bg-accent-soft;
+  }
+
+  button:not(:disabled),
+  [role='button']:not([aria-disabled='true']) {
+    cursor: pointer;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 1ms !important;
+      transition-duration: 1ms !important;
+    }
+  }
+}

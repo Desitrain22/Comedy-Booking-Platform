@@ -1,0 +1,30 @@
+# docker compose up -d   →   http://localhost:3000 (first visit runs the setup wizard)
+#
+# Values below can be set in a .env file next to this one (see .env.example).
+services:
+  app:
+    build: .
+    image: comedy-booking-platform:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      # Public URL used in email links. The setup wizard saves the URL you open it from;
+      # this is only a fallback (e.g. https://booking.yourclub.com).
+      APP_URL: ${APP_URL:-}
+      # Optional SMTP fallback. Settings → Email in the app takes precedence.
+      # With neither, emails land in the outbox (Settings → Email log, and the container log).
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_SECURE: ${SMTP_SECURE:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
+      SMTP_FROM_NAME: ${SMTP_FROM_NAME:-}
+      SMTP_REPLY_TO: ${SMTP_REPLY_TO:-}
+    volumes:
+      - club-data:/data
+
+volumes:
+  # Holds club.db (+ WAL files). Back it up; see README → Backups.
+  club-data:

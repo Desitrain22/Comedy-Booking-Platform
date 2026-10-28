@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.data/
+*.db
+*.db-*
+.env
+.superpowers/
+test-results/
+playwright-report/
+.DS_Store

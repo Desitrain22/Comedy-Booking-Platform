@@ -1,0 +1,11 @@
+{
+  // Editor/tooling config covering the whole repo. `npm run typecheck` uses the
+  // stricter split configs: tsconfig.server.json (Node) and tsconfig.client.json (DOM).
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "types": ["node", "vite/client"]
+  },
+  "include": ["server", "shared", "client", "e2e", "*.config.ts"]
+}
