@@ -104,6 +104,7 @@ describe('verify a code', () => {
 
     const cookie = cookieFrom(res);
     expect(await me({ cookie })).toEqual({ admin: { email: OWNER } });
+    expect((await h.request(admin('/overview'), { headers: { cookie } })).status).toBe(200);
   });
 
   it('accepts the code with spaces, once only', async () => {
@@ -170,6 +171,9 @@ describe('sessions', () => {
     const { cookie } = await signIn();
     h.hosted.adminEmails = ['someone-else@platform.test'];
     expect(await me({ cookie })).toEqual({ admin: null });
+    const res = await h.request(admin('/overview'), { headers: { cookie } });
+    expect(res.status).toBe(401);
+    expect((await readJson<{ code: string }>(res)).code).toBe('unauthorized');
     // The stale session is gone for good: listing the address again doesn't revive it.
     expect(h.platform.db.select().from(adminSessions).all()).toHaveLength(0);
     h.hosted.adminEmails = [OWNER];
@@ -243,6 +247,17 @@ describe('platform host only', () => {
     const { cookie } = await signIn();
     const res = await h.request('http://www.localhost:3000/api/platform/admin/me', { headers: { cookie } });
     expect(await readJson(res)).toEqual({ admin: { email: OWNER } });
+  });
+
+  it('every console route needs a session', async () => {
+    const { club } = h.createClub({ slug: 'broadway' });
+    for (const [method, path] of [
+      ['GET', '/overview'],
+      ['GET', `/clubs/${club.id}`],
+    ] as const) {
+      const res = await h.request(admin(path), { method });
+      expect(res.status, path).toBe(401);
+    }
   });
 });
 

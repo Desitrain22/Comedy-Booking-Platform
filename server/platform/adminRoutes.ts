@@ -7,17 +7,26 @@
  *   POST /api/platform/admin/verify-code        → session cookie (7 days)
  *   GET  /api/platform/admin/me                 { admin: { email } | null }
  *   POST /api/platform/admin/logout
+ *   GET  /api/platform/admin/overview           totals + clubs (?status=active|suspended|archived|all&search=)
+ *   GET  /api/platform/admin/clubs/:id          one club in depth
  *
  * Sign-in is rate limited per IP and per email (server/platform/limits.ts). An address that
  * isn't an owner's gets the same answers as one that is (no email, and its codes never work).
  */
 import { Hono } from 'hono';
-import { adminRequestCodeSchema, adminVerifyCodeSchema, type AdminMeResponse } from '../../shared/api/platformAdmin';
+import {
+  adminOverviewQuerySchema,
+  adminRequestCodeSchema,
+  adminVerifyCodeSchema,
+  type AdminClubDetail,
+  type AdminMeResponse,
+  type AdminOverview,
+} from '../../shared/api/platformAdmin';
 import type { OkResponse } from '../../shared/types';
 import { clientIp } from '../auth/request';
 import type { AppEnv } from '../context';
 import { env } from '../env';
-import { jsonError } from '../lib/http';
+import { jsonError, parseId } from '../lib/http';
 import { isDevServer } from '../lib/rateLimitConfig';
 import { tooManyRequests } from '../lib/rateLimit';
 import { validate } from '../lib/validate';
@@ -27,14 +36,17 @@ import {
   getPlatformAdmin,
   isPlatformAdminEmail,
   issueAdminCode,
+  requirePlatformAdmin,
   startAdminSession,
   verifyAdminCode,
 } from './adminAuth';
+import { buildAdminClubDetail, buildAdminOverview } from './adminStats';
 import type { Platform } from './index';
 
 export function platformAdminRoutes(platform: Platform): Hono<AppEnv> {
   const routes = new Hono<AppEnv>();
   const { hosted, limiter, mailer } = platform;
+  const requireOwner = requirePlatformAdmin(platform);
 
   // -------------------------------------------------------------------------
   // Sign-in
@@ -90,6 +102,21 @@ export function platformAdminRoutes(platform: Platform): Hono<AppEnv> {
   routes.post('/platform/admin/logout', (c) => {
     endAdminSession(c, platform);
     return c.json({ ok: true } satisfies OkResponse);
+  });
+
+  // -------------------------------------------------------------------------
+  // Overview & club detail
+  // -------------------------------------------------------------------------
+
+  routes.get('/platform/admin/overview', requireOwner, validate('query', adminOverviewQuerySchema), (c) => {
+    const { status, search } = c.req.valid('query');
+    return c.json(buildAdminOverview(platform, { status, search }) satisfies AdminOverview);
+  });
+
+  routes.get('/platform/admin/clubs/:id', requireOwner, (c) => {
+    const club = platform.registry.getClubById(parseId(c.req.param('id')));
+    if (!club) return jsonError(c, 404, 'Club not found', 'not_found');
+    return c.json(buildAdminClubDetail(platform, club) satisfies AdminClubDetail);
   });
 
   return routes;
