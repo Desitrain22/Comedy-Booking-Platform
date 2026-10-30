@@ -1,8 +1,8 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  checkBulkRows,
-  parseBulkLines,
+  BULK_ADD_BODY_MAX_BYTES,
+  BULK_ADD_MAX,
   type BulkAddResult,
   type BulkLoginLinkResult,
   type BulkUpdateResult,
@@ -193,6 +193,18 @@ describe('GET /api/comedians', () => {
     expect(await names('  gomez ')).toEqual(['Maria Gomez']);
   });
 
+  it('includes the phone and finds comedians by it', async () => {
+    createComedian(t.db, { name: 'Jo Lee', email: 'jo@example.test', phone: '(212) 555-0142' });
+    createComedian(t.db, { name: 'Al Roe', email: 'al@example.test' });
+    const list = await ok<ComedianListItem[]>(get('/api/comedians'));
+    expect(list.map((c) => [c.name, c.phone])).toEqual([
+      ['Al Roe', ''],
+      ['Jo Lee', '(212) 555-0142'],
+    ]);
+    const found = await ok<ComedianListItem[]>(get(`/api/comedians?search=${encodeURIComponent('555-0142')}`));
+    expect(found.map((c) => c.name)).toEqual(['Jo Lee']);
+  });
+
   it('filters by any of several tags', async () => {
     const a = createComedian(t.db, { name: 'A' });
     const b = createComedian(t.db, { name: 'B' });
@@ -262,6 +274,21 @@ describe('POST /api/comedians', () => {
       code: 'email_taken',
       existing: { id: existing.id, name: 'Jason Lee', archived: true },
     });
+  });
+
+  it('stores an optional phone as typed (trimmed) and validates it', async () => {
+    const withPhone = await ok<ComedianDetail>(
+      send('POST', '/api/comedians', { name: 'Jo Lee', email: 'jo@example.test', phone: '  +1 (212) 555-0142 ext. 9 ' }),
+      201,
+    );
+    expect(withPhone.phone).toBe('+1 (212) 555-0142 ext. 9');
+    const without = await ok<ComedianDetail>(send('POST', '/api/comedians', { name: 'Al Roe', email: 'al@example.test' }), 201);
+    expect(without.phone).toBe('');
+    for (const phone of ['call me', '1'.repeat(41), '555#0100']) {
+      const res = await send('POST', '/api/comedians', { name: 'X', email: `x${phone.length}@example.test`, phone });
+      expect(res.status, phone).toBe(400);
+      expect(await readJson(res)).toMatchObject({ code: 'validation_error', issues: [{ path: 'phone' }] });
+    }
   });
 
   it('validates name and email', async () => {
@@ -372,47 +399,26 @@ describe('GET/PATCH /api/comedians/:id', () => {
   });
 });
 
+describe('phone on the profile', () => {
+  it('a booker can set, change and clear it; it shows on the profile and hover card', async () => {
+    const comic = createComedian(t.db, { name: 'Jason', email: 'jason@example.test' });
+    expect((await ok<ComedianDetail>(get(`/api/comedians/${comic.id}`))).phone).toBe('');
+    const set = await ok<ComedianDetail>(send('PATCH', `/api/comedians/${comic.id}`, { phone: ' 917-555-0199 ' }));
+    expect(set.phone).toBe('917-555-0199');
+    expect((await ok<ComedianCard>(get(`/api/comedians/${comic.id}/card`))).phone).toBe('917-555-0199');
+    const bad = await send('PATCH', `/api/comedians/${comic.id}`, { phone: 'nope' });
+    expect(bad.status).toBe(400);
+    expect((await ok<ComedianDetail>(get(`/api/comedians/${comic.id}`))).phone).toBe('917-555-0199');
+    const cleared = await ok<ComedianDetail>(send('PATCH', `/api/comedians/${comic.id}`, { phone: '' }));
+    expect(cleared.phone).toBe('');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Bulk add
 // ---------------------------------------------------------------------------
 
 describe('bulk add', () => {
-  it('parses Name, email / Name <email> / email, Name / tabs / "Name email" lines', () => {
-    const text = [
-      'Jason Lee, Jason@Example.com',
-      '',
-      '  "Maria Gomez" <maria@example.com>  ',
-      'pat@example.com, Pat Smith',
-      'Sam Jones\tsam@example.com',
-      'Chris Rock chris@example.com',
-      'no email here',
-      'only@example.com',
-      'Bad Email, nope@',
-    ].join('\n');
-    expect(parseBulkLines(text)).toEqual([
-      { line: 1, raw: 'Jason Lee, Jason@Example.com', name: 'Jason Lee', email: 'jason@example.com' },
-      { line: 3, raw: '"Maria Gomez" <maria@example.com>', name: 'Maria Gomez', email: 'maria@example.com' },
-      { line: 4, raw: 'pat@example.com, Pat Smith', name: 'Pat Smith', email: 'pat@example.com' },
-      { line: 5, raw: 'Sam Jones\tsam@example.com', name: 'Sam Jones', email: 'sam@example.com' },
-      { line: 6, raw: 'Chris Rock chris@example.com', name: 'Chris Rock', email: 'chris@example.com' },
-      { line: 7, raw: 'no email here', name: 'no email here', email: '' },
-      { line: 8, raw: 'only@example.com', name: '', email: 'only@example.com' },
-      { line: 9, raw: 'Bad Email, nope@', name: 'Bad Email', email: 'nope@' },
-    ]);
-  });
-
-  it('flags missing names, invalid emails and in-batch duplicates without a database', () => {
-    expect(
-      checkBulkRows([
-        { name: 'A', email: 'a@example.com' },
-        { name: '', email: 'b@example.com' },
-        { name: 'C', email: 'nope' },
-        { name: 'A again', email: 'A@example.com' },
-        { name: 'D', email: 'd@example.com' },
-      ]),
-    ).toEqual([null, 'missing_name', 'invalid_email', 'duplicate', null]);
-  });
-
   it('dry run previews without writing; the real run creates valid rows and reports skips', async () => {
     const existing = createComedian(t.db, { name: 'Already Here', email: 'here@example.test' });
     const rows = [
@@ -427,8 +433,8 @@ describe('bulk add', () => {
     const preview = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows, dryRun: true }));
     expect(preview.dryRun).toBe(true);
     expect(preview.created).toEqual([
-      { index: 0, id: 0, name: 'New One', email: 'one@example.test' },
-      { index: 5, id: 0, name: 'New Two', email: 'two@example.test' },
+      { index: 0, id: 0, name: 'New One', email: 'one@example.test', phone: '', note: '' },
+      { index: 5, id: 0, name: 'New Two', email: 'two@example.test', phone: '', note: '' },
     ]);
     expect(preview.skipped).toEqual([
       { index: 1, row: rows[1], reason: 'missing_name' },
@@ -482,8 +488,145 @@ describe('bulk add', () => {
   it('validates the envelope', async () => {
     expect((await send('POST', '/api/comedians/bulk', { rows: [] })).status).toBe(400);
     expect((await send('POST', '/api/comedians/bulk', { rows: [{ name: 'x' }] })).status).toBe(400);
-    const tooMany = Array.from({ length: 501 }, (_, i) => ({ name: `C ${i}`, email: `c${i}@example.test` }));
+    const tooMany = Array.from({ length: BULK_ADD_MAX + 1 }, (_, i) => ({ name: `C ${i}`, email: `c${i}@example.test` }));
     expect((await send('POST', '/api/comedians/bulk', { rows: tooMany })).status).toBe(400);
+    // Raw strings past the hard caps reject the request (clients clamp before sending).
+    expect((await send('POST', '/api/comedians/bulk', { rows: [{ name: 'x', email: 'x@x.test', note: 'x'.repeat(8001) }] })).status).toBe(400);
+    expect((await send('POST', '/api/comedians/bulk', { rows: [{ name: 'x', email: 'x@x.test', phone: 5 }] })).status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CSV import (bulk add with phone and notes)
+// ---------------------------------------------------------------------------
+
+describe('CSV import (POST /api/comedians/bulk with phone and notes)', () => {
+  const ROWS = [
+    { name: 'Jason Park', email: 'Jason.Park@Gmail.com', phone: ' (212) 555-0142 ', note: '  Great closer,\r\nclean set available ' },
+    { name: 'Keisha Grant', email: 'keisha@example.test', phone: '', note: '' },
+    { name: 'Maria Delgado', email: 'maria@example.test', phone: '646-555-0110', note: 'Would overwrite' },
+    { name: 'Tony R', email: '', phone: '718-555-0175' },
+    { name: 'Bad Email', email: 'not-an-email' },
+    { name: 'Jason Again', email: 'jason.park@gmail.com' },
+    { name: 'Phone Bad', email: 'phone.bad@example.test', phone: 'call my agent' },
+    { name: 'Note Long', email: 'note.long@example.test', note: 'x'.repeat(2001) },
+    { name: '', email: 'nameless@example.test' },
+    { name: 'N'.repeat(101), email: 'long.name@example.test' },
+    { name: 'Priya Raman', email: 'priya.r@example.test', phone: '+1 347 555 0103 x12' },
+  ];
+
+  it('previews per-row statuses on a dry run without writing anything', async () => {
+    const maria = createComedian(t.db, { name: 'Maria Delgado', email: 'maria@example.test', phone: '' });
+    const preview = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: ROWS, dryRun: true, sendLoginLinks: true }));
+    expect(preview.created.map((c) => [c.index, c.id, c.name, c.email, c.phone, c.note])).toEqual([
+      [0, 0, 'Jason Park', 'jason.park@gmail.com', '(212) 555-0142', 'Great closer,\nclean set available'],
+      [1, 0, 'Keisha Grant', 'keisha@example.test', '', ''],
+      [10, 0, 'Priya Raman', 'priya.r@example.test', '+1 347 555 0103 x12', ''],
+    ]);
+    expect(preview.skipped.map((s) => [s.index, s.reason])).toEqual([
+      [2, 'email_taken'],
+      [3, 'invalid_email'],
+      [4, 'invalid_email'],
+      [5, 'duplicate'],
+      [6, 'invalid_phone'],
+      [7, 'note_too_long'],
+      [8, 'missing_name'],
+      [9, 'name_too_long'],
+    ]);
+    expect(preview.skipped[0]).toEqual({
+      index: 2,
+      row: ROWS[2],
+      reason: 'email_taken',
+      existing: { id: maria.id, name: 'Maria Delgado', archived: false },
+    });
+    expect(preview.loginLinks).toBeNull();
+    expect(t.db.select().from(comedians).all()).toHaveLength(1);
+    expect(t.db.select().from(notes).all()).toHaveLength(0);
+    expect(emailsTo(t.db)).toEqual([]);
+  });
+
+  it('creates the new rows with their phone and a note by the importing booker; existing comedians are never overwritten', async () => {
+    const maria = createComedian(t.db, { name: 'Maria Delgado', email: 'maria@example.test', phone: '', bio: 'Original bio' });
+    const result = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: ROWS }), 201);
+    expect(result.created.map((c) => c.email)).toEqual(['jason.park@gmail.com', 'keisha@example.test', 'priya.r@example.test']);
+    expect(result.created.every((c) => c.id > 0)).toBe(true);
+    expect(result.skipped).toHaveLength(8);
+    expect(result.loginLinks).toBeNull();
+
+    const jason = await ok<ComedianDetail>(get(`/api/comedians/${result.created[0]!.id}`));
+    expect(jason).toMatchObject({ name: 'Jason Park', email: 'jason.park@gmail.com', phone: '(212) 555-0142' });
+    const jasonNotes = await ok<NoteDto[]>(get(`/api/comedians/${jason.id}/notes`));
+    expect(jasonNotes).toEqual([
+      expect.objectContaining({ body: 'Great closer,\nclean set available', authorId: bookerId, authorName: 'Dana Booker', canEdit: true }),
+    ]);
+    // No note row for comedians imported without one.
+    expect(t.db.select().from(notes).all()).toHaveLength(1);
+
+    // Maria is untouched: no phone, no note, same bio.
+    const after = t.db.select().from(comedians).where(eq(comedians.id, maria.id)).get()!;
+    expect(after).toMatchObject({ name: 'Maria Delgado', phone: '', bio: 'Original bio' });
+    expect(await ok<NoteDto[]>(get(`/api/comedians/${maria.id}/notes`))).toEqual([]);
+
+    // Importing the same file again adds nobody.
+    const again = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: ROWS }));
+    expect(again.created).toEqual([]);
+    expect(again.skipped.filter((s) => s.reason === 'email_taken').map((s) => s.index)).toEqual([0, 1, 2, 10]);
+  });
+
+  it('skips emails of archived comedians too', async () => {
+    const gone = createComedian(t.db, { name: 'Gone Comic', email: 'gone@example.test', archived: true });
+    const result = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: [{ name: 'Back', email: 'GONE@example.test' }] }));
+    expect(result.skipped).toEqual([
+      { index: 0, row: { name: 'Back', email: 'GONE@example.test' }, reason: 'email_taken', existing: { id: gone.id, name: 'Gone Comic', archived: true } },
+    ]);
+  });
+
+  it('emails each new comedian a sign-in link when asked (and nobody it skipped)', async () => {
+    createComedian(t.db, { name: 'Maria Delgado', email: 'maria@example.test' });
+    const result = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: ROWS, sendLoginLinks: true }), 201);
+    expect(result.loginLinks).toEqual({ sent: 0, outbox: 3, failed: 0, skipped: 0 });
+    expect(emailsTo(t.db).map((m) => [m.toEmail, m.kind]).sort()).toEqual([
+      ['jason.park@gmail.com', 'login_link'],
+      ['keisha@example.test', 'login_link'],
+      ['priya.r@example.test', 'login_link'],
+    ]);
+  });
+
+  it('accepts 1,000 rows, with a body bigger than the rest of the API allows', async () => {
+    const note = 'n'.repeat(1500); // ~1.6 MB of JSON: over the global 1 MB limit
+    const rows = Array.from({ length: BULK_ADD_MAX }, (_, i) => ({
+      name: `Comic Number ${i}`,
+      email: `comic${i}@example.test`,
+      phone: '(212) 555-0100',
+      note,
+    }));
+    const body = JSON.stringify({ rows });
+    expect(body.length).toBeGreaterThan(1024 * 1024);
+    expect(body.length).toBeLessThan(BULK_ADD_BODY_MAX_BYTES);
+    const result = await ok<BulkAddResult>(t.request('/api/comedians/bulk', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body }), 201);
+    expect(result.created).toHaveLength(BULK_ADD_MAX);
+    expect(t.db.select().from(comedians).all()).toHaveLength(BULK_ADD_MAX);
+    expect(t.db.select().from(notes).all()).toHaveLength(BULK_ADD_MAX);
+  });
+
+  it('413s a body over its own limit, and other routes keep the smaller global limit', async () => {
+    const huge = JSON.stringify({ rows: [{ name: 'x', email: 'x@x.test', note: 'x'.repeat(BULK_ADD_BODY_MAX_BYTES) }] });
+    const res = await t.request('/api/comedians/bulk', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: huge });
+    expect(res.status).toBe(413);
+    expect(await readJson(res)).toMatchObject({ code: 'payload_too_large' });
+
+    const mid = JSON.stringify({ name: 'x', email: 'x@x.test', note: 'x'.repeat(1024 * 1024 + 10) });
+    const other = await t.request('/api/comedians', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: mid });
+    expect(other.status).toBe(413);
+    // The bigger limit is for this exact endpoint only.
+    const lookalike = await t.request('/api/comedians/bulk-tag', { method: 'POST', headers: { ...headers, 'content-type': 'application/json' }, body: mid });
+    expect(lookalike.status).toBe(413);
+  });
+
+  it('still requires a booker before reading a big body', async () => {
+    const body = JSON.stringify({ rows: [{ name: 'x', email: 'x@x.test', note: 'x'.repeat(2 * 1024 * 1024) }] });
+    const res = await t.request('/api/comedians/bulk', { method: 'POST', headers: { cookie: '', 'content-type': 'application/json' }, body });
+    expect(res.status).toBe(401);
   });
 });
 

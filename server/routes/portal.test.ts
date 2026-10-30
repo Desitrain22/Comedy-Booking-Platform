@@ -150,6 +150,7 @@ describe('GET /api/portal/me', () => {
         id: john.id,
         name: 'John Mercer',
         email: 'john@example.test',
+        phone: '',
         bio: 'Dry wit.',
         headshotUrl: 'https://img.test/j.jpg',
       },
@@ -463,6 +464,7 @@ describe('portal profile', () => {
       id: john.id,
       name: 'John Mercer',
       email: 'john@example.test',
+      phone: '',
       bio: '',
       headshotUrl: '',
     });
@@ -478,6 +480,7 @@ describe('portal profile', () => {
       id: john.id,
       name: 'Johnny Mercer',
       email: 'john@example.test',
+      phone: '',
       bio: 'Ten years of dry wit.\nOpened for everyone.',
       headshotUrl: 'https://cdn.example.test/johnny.jpg',
     };
@@ -490,6 +493,28 @@ describe('portal profile', () => {
     const cleared = await put('/api/portal/profile', { name: 'John', bio: 'x'.repeat(1000), headshotUrl: '' });
     expect(cleared.status).toBe(200);
     expect(await readJson(cleared)).toMatchObject({ headshotUrl: '', bio: 'x'.repeat(1000) });
+  });
+
+  it('has an optional phone: set, kept when omitted, cleared with an empty string', async () => {
+    const valid = { name: 'John Mercer', bio: '', headshotUrl: '' };
+    const set = await put('/api/portal/profile', { ...valid, phone: '  (212)  555-0142 x7 ' });
+    expect(set.status).toBe(200);
+    expect(await readJson(set)).toMatchObject({ phone: '(212) 555-0142 x7' });
+    // Older clients that don't send a phone leave it alone.
+    expect(await readJson(await put('/api/portal/profile', { ...valid, bio: 'New bio' }))).toMatchObject({
+      bio: 'New bio',
+      phone: '(212) 555-0142 x7',
+    });
+    expect(await readJson(await get('/api/portal/me'))).toMatchObject({ comedian: { phone: '(212) 555-0142 x7' } });
+    // The booker sees it too.
+    expect(t.db.select().from(comedians).where(eq(comedians.id, john.id)).get()!.phone).toBe('(212) 555-0142 x7');
+    expect(await readJson(await put('/api/portal/profile', { ...valid, phone: '' }))).toMatchObject({ phone: '' });
+
+    for (const phone of ['call me maybe', '1'.repeat(41), '212/555/0142', 42]) {
+      const res = await put('/api/portal/profile', { ...valid, phone });
+      expect(res.status, String(phone)).toBe(400);
+      expect(await readJson(res)).toMatchObject({ code: 'validation_error', issues: [{ path: 'phone' }] });
+    }
   });
 
   it('validates the name, bio length and headshot URL', async () => {

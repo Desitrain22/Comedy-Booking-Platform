@@ -30,6 +30,7 @@
  *                                          404 `not_found`, 409 `spot_past`. Idempotent.
  *   GET  /api/portal/profile               PortalProfile
  *   PUT  /api/portal/profile               UpdatePortalProfileInput → PortalProfile
+ *                                          (phone is optional: omitted keeps it, '' clears it)
  *   GET  /api/portal/confirm/:token        ConfirmLinkInfo — read-only, no session needed
  *                                          (email scanners prefetch links)
  *   POST /api/portal/confirm/:token        ConfirmLinkResult — confirms the week's scheduled,
@@ -51,6 +52,7 @@ import { z } from 'zod';
 import { isValidAvailabilityRange, type AvailabilityEntry, type AvailabilityRange } from '../availability';
 import type { BookingStatus } from '../bookingStatus';
 import { dateSchema, monthSchema } from '../schemas';
+import { phoneSchema } from './comedians';
 import { PLANNING_NEXT_MONTH_FROM_DAY, planningMonth } from '../time';
 import type { ClubInfo, ConfirmedBy, MeComedian } from '../types';
 
@@ -153,6 +155,8 @@ export const updatePortalProfileSchema = z.object({
     .trim()
     .max(PORTAL_HEADSHOT_URL_MAX, 'That link is too long')
     .refine((v) => v === '' || isHttpUrl(v), 'Enter a link starting with http:// or https://'),
+  /** Optional; only the club's bookers see it. Omitted = unchanged, '' = none. */
+  phone: phoneSchema.optional(),
 });
 export type UpdatePortalProfileInput = z.input<typeof updatePortalProfileSchema>;
 
@@ -165,6 +169,8 @@ export interface PortalProfile {
   name: string;
   /** Read-only in the portal ("Contact the club to change it"). */
   email: string;
+  /** Optional ('' when not given); bookers see it, it's never used for texting. */
+  phone: string;
   bio: string;
   headshotUrl: string;
 }

@@ -7,6 +7,10 @@
  * what will be created. The selection survives month navigation; Create sends it all, and
  * the success toast can Undo it. Without `?month` it opens the month being planned (next
  * month from the 20th on).
+ *
+ * Setup guide targets (client/components/guide): `shows-form` (location, name, start, slots),
+ * `shows-weekdays`, `shows-calendar` and `shows-create`; the page also tells the guide how many
+ * shows Create would make, so "Put it on the calendar" moves on to "Create them".
  */
 import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, CalendarSync, ChevronLeft, ChevronRight, MapPin, TriangleAlert } from 'lucide-react';
@@ -37,6 +41,7 @@ import {
   WEEKDAY_NAMES,
 } from '../../../shared/time';
 import type { Location } from '../../../shared/types';
+import { useGuideSignal } from '../../components/guide';
 import { MonthGrid, type PaintGesture } from '../../components/MonthGrid';
 import {
   Button,
@@ -212,6 +217,7 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
   const toCreate = selectedDates.length - duplicates.length;
   const monthSelected = selectedDates.filter((d) => d.startsWith(month)).length;
   const pastMonth = lastDayOfMonth(month) < today;
+  useGuideSignal('showsSelected', slotError ? 0 : toCreate);
 
   function onPaint(dates: string[], gesture: PaintGesture) {
     if (gesture.phase === 'start') paintMode.current = selected.has(gesture.origin) ? 'remove' : 'add';
@@ -258,9 +264,9 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
   return (
     <div className="grid items-start gap-5 xl:grid-cols-[300px_minmax(0,1fr)]">
       {/* Settings panel */}
-      <Card className="xl:sticky xl:top-6">
+      <Card className="xl:sticky xl:top-[calc(var(--guide-rail-h,0px)+1.5rem)]">
         <CardBody className="grid gap-x-6 gap-y-4 lg:grid-cols-2 xl:grid-cols-1">
-          <div className="space-y-4">
+          <div className="space-y-4" data-guide="shows-form">
             <Field label="Location">
               <Select
                 value={location.id}
@@ -318,6 +324,7 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
               <Button
                 size="lg"
                 className="w-full"
+                data-guide="shows-create"
                 onClick={() => void create()}
                 loading={bulk.isPending}
                 disabled={toCreate === 0 || Boolean(slotError)}
@@ -345,7 +352,7 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
       </Card>
 
       {/* Calendar */}
-      <Card>
+      <Card data-guide="shows-calendar">
         <div className="flex items-center justify-between gap-3 px-4 pt-3.5 pb-2">
           <h2 className="text-base font-semibold text-fg" aria-live="polite">
             {formatMonthLong(month)}
@@ -431,7 +438,7 @@ function WeekdayChips({
   onClear?: () => void;
 }) {
   return (
-    <fieldset>
+    <fieldset data-guide="shows-weekdays">
       <div className="mb-1.5 flex items-baseline justify-between">
         <legend className="text-[13px] font-medium text-fg">Repeat on</legend>
         {onClear && (

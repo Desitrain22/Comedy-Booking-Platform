@@ -1,6 +1,7 @@
 /**
- * /portal/profile — how the club sees the comedian: name, bio (≤ 1000 chars) and a
- * headshot link with a live preview (falls back to initials when the image won't load).
+ * /portal/profile — how the club sees the comedian: name, bio (≤ 1000 chars), a headshot
+ * link with a live preview (falls back to initials when the image won't load), and an
+ * optional phone number (only the club's bookers see it; never used for texts).
  * Email is read-only ("Contact the club to change it").
  */
 import { useMutation, useQueryClient } from '@tanstack/react-query';
@@ -21,7 +22,7 @@ import { ME_QUERY_KEY } from '../../lib/useMe';
 import { portalKeys, useProfile } from './portalQueries';
 import { useUnsavedChangesGuard } from './useUnsavedChangesGuard';
 
-type Form = { name: string; bio: string; headshotUrl: string };
+type Form = { name: string; bio: string; headshotUrl: string; phone: string };
 type FormErrors = Partial<Record<keyof Form, string>>;
 
 const header = <PageHeader title="Profile" description="This is what the club sees when they book you." />;
@@ -49,14 +50,14 @@ export function ProfilePage() {
   );
 }
 
-const toForm = (p: PortalProfile): Form => ({ name: p.name, bio: p.bio, headshotUrl: p.headshotUrl });
+const toForm = (p: PortalProfile): Form => ({ name: p.name, bio: p.bio, headshotUrl: p.headshotUrl, phone: p.phone });
 
 /** zod issues (client-side parse or the server's 400 body) → one message per field. */
 function fieldErrors(issues: readonly { path: readonly PropertyKey[] | string; message: string }[]): FormErrors {
   const out: FormErrors = {};
   for (const issue of issues) {
     const key = (typeof issue.path === 'string' ? issue.path : String(issue.path[0] ?? '')) as keyof Form;
-    if (key in { name: 1, bio: 1, headshotUrl: 1 } && !out[key]) out[key] = issue.message;
+    if (key in { name: 1, bio: 1, headshotUrl: 1, phone: 1 } && !out[key]) out[key] = issue.message;
   }
   return out;
 }
@@ -66,7 +67,8 @@ function ProfileForm({ profile }: { profile: PortalProfile }) {
   const [saved, setSaved] = useState<Form>(() => toForm(profile));
   const [form, setForm] = useState<Form>(saved);
   const [errors, setErrors] = useState<FormErrors>({});
-  const dirty = form.name !== saved.name || form.bio !== saved.bio || form.headshotUrl !== saved.headshotUrl;
+  const dirty =
+    form.name !== saved.name || form.bio !== saved.bio || form.headshotUrl !== saved.headshotUrl || form.phone !== saved.phone;
 
   const save = useMutation({
     mutationFn: (input: UpdatePortalProfileInput) => api.put<PortalProfile>('/portal/profile', input),
@@ -182,6 +184,23 @@ function ProfileForm({ profile }: { profile: PortalProfile }) {
                 className="h-11 sm:h-9"
                 value={form.headshotUrl}
                 onChange={(e) => set('headshotUrl', e.target.value)}
+              />
+            </Field>
+
+            <Field
+              label="Phone"
+              aside={<span className="text-xs text-fg-muted">Optional</span>}
+              hint="Only the club's bookers see it, so they can reach you on show night. No texts."
+              error={errors.phone}
+            >
+              <Input
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                placeholder="(212) 555-0142"
+                className="h-11 sm:h-9"
+                value={form.phone}
+                onChange={(e) => set('phone', e.target.value)}
               />
             </Field>
 

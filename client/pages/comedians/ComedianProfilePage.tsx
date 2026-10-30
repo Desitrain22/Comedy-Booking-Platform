@@ -1,14 +1,14 @@
 /**
- * /app/comedians/:id — profile: header (headshot/initials, name, email, tags editor,
- * bio), actions (send sign-in link, edit, archive/restore), private notes, read-only
- * availability calendar and upcoming spots.
+ * /app/comedians/:id — profile: header (headshot/initials, name, email, phone as a
+ * tap-to-call link, tags editor, bio), actions (send sign-in link, edit, archive/restore),
+ * private notes, read-only availability calendar and upcoming spots.
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Archive, ArchiveRestore, ArrowLeft, Copy, Ellipsis, Mail, Pencil, Plus, Send, X } from 'lucide-react';
+import { Archive, ArchiveRestore, ArrowLeft, Copy, Ellipsis, Mail, Pencil, Phone, Plus, Send, X } from 'lucide-react';
 import { useState } from 'react';
 import { Link, useParams } from 'react-router';
 import { toast } from 'sonner';
-import type { ComedianDetail, SendLoginLinkResponse, TagSummary } from '../../../shared/api/comedians';
+import { telHref, type ComedianDetail, type SendLoginLinkResponse, type TagSummary } from '../../../shared/api/comedians';
 import { formatRelative } from '../../../shared/time';
 import {
   Avatar,
@@ -122,14 +122,18 @@ function Profile({ comedian }: { comedian: ComedianDetail }) {
         <Avatar name={comedian.name} src={comedian.headshotUrl} size="xl" className="shadow-sm ring-4 ring-surface" />
         <div className="min-w-0 flex-1 space-y-2.5">
           <div className="flex flex-wrap items-start gap-x-4 gap-y-3">
-            <div className="min-w-0 flex-1">
+            <div className="min-w-0 flex-1 basis-60">
               <h1 className="text-2xl font-semibold tracking-tight text-fg">{comedian.name}</h1>
-              <p className="mt-0.5 text-sm text-fg-muted">
-                <a href={`mailto:${comedian.email}`} className="break-all hover:text-fg hover:underline">
+              <p className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-fg-muted">
+                <a
+                  href={`mailto:${comedian.email}`}
+                  className="inline-flex min-w-0 items-center gap-1.5 break-all hover:text-fg hover:underline"
+                >
+                  <Mail className="size-3.5 shrink-0" aria-hidden />
                   {comedian.email}
                 </a>
-                <span aria-hidden> · </span>
-                <span className="whitespace-nowrap">
+                {comedian.phone && <PhoneLink phone={comedian.phone} />}
+                <span className="whitespace-nowrap text-fg-subtle">
                   {comedian.lastLoginAt ? `Signed in ${formatRelative(comedian.lastLoginAt)}` : 'Never signed in'}
                 </span>
               </p>
@@ -164,6 +168,18 @@ function Profile({ comedian }: { comedian: ComedianDetail }) {
                   >
                     <Copy /> Copy email
                   </MenuItem>
+                  {comedian.phone && (
+                    <MenuItem
+                      onSelect={() =>
+                        void navigator.clipboard.writeText(comedian.phone).then(
+                          () => toast.success('Phone number copied'),
+                          () => toast.error('Couldn’t copy'),
+                        )
+                      }
+                    >
+                      <Phone /> Copy phone number
+                    </MenuItem>
+                  )}
                   <MenuItem onSelect={() => (window.location.href = `mailto:${comedian.email}`)}>
                     <Mail /> Write an email
                   </MenuItem>
@@ -220,6 +236,24 @@ function Profile({ comedian }: { comedian: ComedianDetail }) {
         onConfirm={() => setArchived.mutateAsync(true)}
       />
     </div>
+  );
+}
+
+/** The phone number, tappable to call on a phone (`tel:`; an extension dials after a pause). */
+function PhoneLink({ phone }: { phone: string }) {
+  const href = telHref(phone);
+  const content = (
+    <>
+      <Phone className="size-3.5 shrink-0" aria-hidden />
+      <span className="tabular-nums">{phone}</span>
+    </>
+  );
+  return href ? (
+    <a href={href} className="inline-flex items-center gap-1.5 whitespace-nowrap hover:text-fg hover:underline" title={`Call ${phone}`}>
+      {content}
+    </a>
+  ) : (
+    <span className="inline-flex items-center gap-1.5 whitespace-nowrap">{content}</span>
   );
 }
 

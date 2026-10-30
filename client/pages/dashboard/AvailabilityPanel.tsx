@@ -5,6 +5,9 @@
  * who haven't**. The planning month follows the portal's rule: next month from the 20th on.
  * A month that's winding down (this month, once we're planning the next) shows its progress
  * without the buttons.
+ *
+ * The header's Request availability is the setup guide's `dashboard-request-availability`
+ * target; while the guide points at it, it opens on the guide's month (the one with shows).
  */
 import { BellRing, CircleCheck, Megaphone } from 'lucide-react';
 import { Link } from 'react-router';
@@ -24,12 +27,15 @@ export interface AvailabilityPanelProps {
   data: DashboardResponse;
   /** Open the request/remind dialog. */
   onRequest: (target: RequestDialogTarget) => void;
+  /** The month the header button asks for (default: the planning month). */
+  requestMonth?: string;
 }
 
-export function AvailabilityPanel({ data, onRequest }: AvailabilityPanelProps) {
+export function AvailabilityPanel({ data, onRequest, requestMonth }: AvailabilityPanelProps) {
   const planning = data.planningMonth;
   const noComedians = data.setup.comedians === 0;
-  const planningProgress = data.availability.find((p) => p.month === planning);
+  const headerMonth = requestMonth ?? planning;
+  const headerProgress = data.availability.find((p) => p.month === headerMonth);
 
   return (
     <Card>
@@ -39,9 +45,10 @@ export function AvailabilityPanel({ data, onRequest }: AvailabilityPanelProps) {
         actions={
           <Button
             size="sm"
+            data-guide="dashboard-request-availability"
             disabled={noComedians}
             title={noComedians ? 'Add comedians first' : undefined}
-            onClick={() => onRequest({ kind: defaultRequestKind(planningProgress), month: planning })}
+            onClick={() => onRequest({ kind: defaultRequestKind(headerProgress), month: headerMonth })}
           >
             <Megaphone aria-hidden />
             Request availability

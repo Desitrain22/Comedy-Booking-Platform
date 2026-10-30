@@ -11,24 +11,33 @@
  * - Changing a comedian's email revokes everything tied to the old address: sessions,
  *   magic/confirmation link tokens and login codes.
  * - Adding comedians can email them a sign-in link right away (`sendLoginLink(s)`).
+ * - Bulk add / CSV import (`POST /comedians/bulk`): up to 1,000 rows; every row is checked on
+ *   its own (bad rows are skipped with a reason), existing emails are skipped and never
+ *   overwritten, and a row's note becomes a booker note by the importing booker. It has its
+ *   own body limit (BULK_ADD_BODY_MAX_BYTES), larger than the rest of the API's.
+ * - Phone numbers are optional and stored as typed (trimmed; `phoneSchema`).
  * - Notes: any booker can add; only the author or an admin can edit/delete (403 `forbidden`).
  * - Tag names are unique case-insensitively → 409 `tag_exists`.
  */
 import { and, asc, count, desc, eq, gte, inArray, lte, sql, type SQL } from 'drizzle-orm';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import {
+  BULK_ADD_BODY_MAX_BYTES,
   bulkAddSchema,
   bulkArchiveSchema,
   bulkSendLoginLinkSchema,
+  bulkRowIssues,
   bulkTagSchema,
   CARD_NOTE_COUNT,
-  checkBulkRows,
   comedianAvailabilityQuerySchema,
   comedianBookingsQuerySchema,
   createComedianSchema,
   createTagSchema,
+  firstBulkReason,
   listComediansQuerySchema,
   nextTagColor,
+  normalizeBulkRow,
   noteBodySchema,
   setComedianTagsSchema,
   updateComedianSchema,
@@ -37,6 +46,7 @@ import {
   type BulkCreated,
   type BulkLoginLinkResult,
   type BulkSkip,
+  type BulkSkipReason,
   type BulkUpdateResult,
   type ComedianAvailability,
   type ComedianBooking,
@@ -81,6 +91,18 @@ import { validate } from '../lib/validate';
 import { EMAIL_CONCURRENCY, mapWithConcurrency } from '../services/batch';
 
 export const comediansRoutes = new Hono<AppEnv>();
+
+/**
+ * The bulk add / CSV import endpoint. `server/app.ts` skips the global body limit for this
+ * path because the route applies its own, larger one (a 2 MB CSV of 1,000 comedians).
+ */
+export const BULK_ADD_PATH = '/api/comedians/bulk';
+
+const bulkAddBodyLimit = bodyLimit({
+  maxSize: BULK_ADD_BODY_MAX_BYTES,
+  onError: (c) =>
+    c.json({ error: 'That import is too large. Split the file and import it in parts.', code: 'payload_too_large' }, 413),
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -152,6 +174,7 @@ function toDetail(db: DbOrTx, comedian: Comedian): ComedianDetail {
     id: comedian.id,
     name: comedian.name,
     email: comedian.email,
+    phone: comedian.phone,
     bio: comedian.bio,
     headshotUrl: comedian.headshotUrl,
     archived: comedian.archived,
@@ -324,7 +347,9 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
   if (!archived) filters.push(eq(comedians.archived, false));
   if (search) {
     const pattern = likePattern(search);
-    filters.push(sql`(${comedians.name} LIKE ${pattern} ESCAPE '\\' OR ${comedians.email} LIKE ${pattern} ESCAPE '\\')`);
+    filters.push(
+      sql`(${comedians.name} LIKE ${pattern} ESCAPE '\\' OR ${comedians.email} LIKE ${pattern} ESCAPE '\\' OR ${comedians.phone} LIKE ${pattern} ESCAPE '\\')`,
+    );
   }
   if (tagIds.length) {
     filters.push(
@@ -357,6 +382,7 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
     id: r.id,
     name: r.name,
     email: r.email,
+    phone: r.phone,
     headshotUrl: r.headshotUrl,
     archived: r.archived,
     tags: tagMap.get(r.id) ?? [],
@@ -370,71 +396,79 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
 
 comediansRoutes.post('/comedians', requireBooker, validate('json', createComedianSchema), async (c) => {
   const db = c.var.db;
-  const { name, email, sendLoginLink: invite = false } = c.req.valid('json');
+  const { name, email, phone = '', sendLoginLink: invite = false } = c.req.valid('json');
   assertEmailFree(db, email);
-  const comedian = db.insert(comedians).values({ name, email }).returning().get();
+  const comedian = db.insert(comedians).values({ name, email, phone }).returning().get();
   const loginLink = invite ? await sendLoginLink(db, comedian) : null;
   return c.json({ ...toDetail(db, comedian), loginLink } satisfies CreateComedianResponse, 201);
 });
 
-comediansRoutes.post('/comedians/bulk', requireBooker, validate('json', bulkAddSchema), async (c) => {
-  const db = c.var.db;
-  const { rows, dryRun = false, sendLoginLinks: invite = false } = c.req.valid('json');
-  const problems = checkBulkRows(rows);
-  const normalized = rows.map((r) => ({ name: r.name.trim().replace(/\s+/g, ' '), email: normalizeEmail(r.email) }));
+comediansRoutes.post(
+  '/comedians/bulk',
+  requireBooker,
+  bulkAddBodyLimit,
+  validate('json', bulkAddSchema),
+  async (c) => {
+    const db = c.var.db;
+    const booker = c.var.booker;
+    const { rows, dryRun = false, sendLoginLinks: invite = false } = c.req.valid('json');
+    const issues = bulkRowIssues(rows);
+    const normalized = rows.map(normalizeBulkRow);
 
-  const candidateEmails = normalized.filter((_, i) => problems[i] === null).map((r) => r.email);
-  const existing = new Map(
-    candidateEmails.length
-      ? db
-          .select({ id: comedians.id, name: comedians.name, email: comedians.email, archived: comedians.archived })
-          .from(comedians)
-          .where(inArray(comedians.email, candidateEmails))
-          .all()
-          .map(({ email, ...rest }) => [email, rest])
-      : [],
-  );
-
-  const skipped: BulkSkip[] = [];
-  const toCreate: { index: number; name: string; email: string }[] = [];
-  normalized.forEach((row, index) => {
-    const reason = problems[index];
-    const original = rows[index]!;
-    if (reason) {
-      skipped.push({ index, row: { name: original.name, email: original.email }, reason });
-      return;
-    }
-    const taken = existing.get(row.email);
-    if (taken) {
-      skipped.push({ index, row: { name: original.name, email: original.email }, reason: 'email_taken', existing: taken });
-      return;
-    }
-    toCreate.push({ index, ...row });
-  });
-
-  let created: BulkCreated[] = toCreate.map((r) => ({ ...r, id: 0 }));
-  if (!dryRun && toCreate.length) {
-    created = db.transaction((tx) =>
-      toCreate.map((r) => {
-        const row = tx
-          .insert(comedians)
-          .values({ name: r.name, email: r.email })
-          .returning({ id: comedians.id })
-          .get();
-        return { ...r, id: row.id };
-      }),
+    // Emails already on the roster (archived or not) are skipped, never overwritten.
+    const candidateEmails = [
+      ...new Set(normalized.filter((_, i) => !issues[i]!.includes('invalid_email')).map((r) => r.email)),
+    ];
+    const existing = new Map(
+      candidateEmails.length
+        ? db
+            .select({ id: comedians.id, name: comedians.name, email: comedians.email, archived: comedians.archived })
+            .from(comedians)
+            .where(inArray(comedians.email, candidateEmails))
+            .all()
+            .map(({ email, ...rest }) => [email, rest])
+        : [],
     );
-  }
-  const loginLinks =
-    !dryRun && invite && created.length
-      ? await sendLoginLinks(
-          db,
-          created.map((r) => ({ id: r.id, name: r.name, email: r.email, archived: false })),
-        )
-      : null;
-  const result: BulkAddResult = { dryRun, created, skipped, loginLinks };
-  return c.json(result, dryRun || created.length === 0 ? 200 : 201);
-});
+
+    const skipped: BulkSkip[] = [];
+    const toCreate: Omit<BulkCreated, 'id'>[] = [];
+    normalized.forEach((row, index) => {
+      const taken = existing.get(row.email);
+      const reasons: BulkSkipReason[] = taken ? [...issues[index]!, 'email_taken'] : issues[index]!;
+      const reason = firstBulkReason(reasons);
+      if (reason) {
+        skipped.push({ index, row: rows[index]!, reason, ...(reason === 'email_taken' && taken ? { existing: taken } : {}) });
+        return;
+      }
+      toCreate.push({ index, ...row });
+    });
+
+    let created: BulkCreated[] = toCreate.map((r) => ({ ...r, id: 0 }));
+    if (!dryRun && toCreate.length) {
+      created = db.transaction((tx) =>
+        toCreate.map((r) => {
+          const { id } = tx
+            .insert(comedians)
+            .values({ name: r.name, email: r.email, phone: r.phone })
+            .returning({ id: comedians.id })
+            .get();
+          // Same as a note added by hand: private, authored by this booker.
+          if (r.note) tx.insert(notes).values({ comedianId: id, authorId: booker.id, body: r.note }).run();
+          return { ...r, id };
+        }),
+      );
+    }
+    const loginLinks =
+      !dryRun && invite && created.length
+        ? await sendLoginLinks(
+            db,
+            created.map((r) => ({ id: r.id, name: r.name, email: r.email, archived: false })),
+          )
+        : null;
+    const result: BulkAddResult = { dryRun, created, skipped, loginLinks };
+    return c.json(result, dryRun || created.length === 0 ? 200 : 201);
+  },
+);
 
 comediansRoutes.post('/comedians/bulk-tag', requireBooker, validate('json', bulkTagSchema), (c) => {
   const db = c.var.db;
@@ -605,6 +639,7 @@ comediansRoutes.get('/comedians/:id/card', requireBooker, (c) => {
     id: comedian.id,
     name: comedian.name,
     email: comedian.email,
+    phone: comedian.phone,
     bio: comedian.bio,
     headshotUrl: comedian.headshotUrl,
     archived: comedian.archived,

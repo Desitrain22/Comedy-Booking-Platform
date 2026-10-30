@@ -8,17 +8,22 @@
  *
  * One payload (`GET /api/dashboard`, key `['dashboard']`), refreshed every minute. "Tonight"
  * is the club night: until 6 AM the dashboard still shows last night's late shows.
+ *
+ * Getting started reads the setup guide's state (`GET /api/onboarding`, the one source of
+ * truth), and the guide's last step asks this page to open Request availability on the month
+ * that has the shows (`useGuideAction('request-availability')`).
  */
 import { CalendarDays, CircleAlert } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router';
 import { formatDateLong } from '../../../shared/time';
+import { useGuide, useGuideAction, useOnboarding } from '../../components/guide';
 import { Button, Card, EmptyState, PageHeader, PageSpinner, buttonClasses } from '../../components/ui';
 import { errorMessage } from '../../lib/api';
 import { useBooker } from '../../lib/useMe';
 import { AvailabilityPanel, type RequestDialogTarget } from './AvailabilityPanel';
 import { AvailabilityRequestDialog } from './AvailabilityRequestDialog';
-import { defaultRequestKind, setupSteps, showChecklist, tonightCounts, tonightSummary } from './format';
+import { defaultRequestKind, showGettingStarted, tonightCounts, tonightSummary } from './format';
 import { GettingStarted, OutboxBanner } from './GettingStarted';
 import { NeedsReplacement } from './NeedsReplacement';
 import { ThisWeek } from './ThisWeek';
@@ -30,6 +35,16 @@ export function DashboardPage() {
   const { data, isPending, isError, error, refetch, isRefetching } = useDashboard();
   const isAdmin = useBooker().role === 'admin';
   const [requestDialog, setRequestDialog] = useState<RequestDialogTarget | null>(null);
+  const onboarding = useOnboarding().data;
+  const guide = useGuide();
+
+  /** Request availability for the setup guide's month (the one with shows), audience everyone. */
+  function requestGuideMonth() {
+    if (!data) return;
+    const month = onboarding?.suggestedMonth ?? data.planningMonth;
+    setRequestDialog({ kind: defaultRequestKind(data.availability.find((p) => p.month === month)), month });
+  }
+  useGuideAction('request-availability', requestGuideMonth);
 
   if (isPending) {
     return (
@@ -60,9 +75,11 @@ export function DashboardPage() {
     );
   }
 
-  const steps = setupSteps(data, isAdmin);
-  const checklist = showChecklist(steps);
-  const planningProgress = data.availability.find((p) => p.month === data.planningMonth);
+  // null while the guide's state loads (so the banner doesn't flash before the checklist).
+  const checklist = onboarding ? showGettingStarted(onboarding) : null;
+  const guidePaused = guide != null && guide.mode === 'setup' && (!guide.open || guide.minimized);
+  const resumeGuide = guidePaused ? (guide.minimized ? guide.restore : guide.start) : null;
+  const guideRequesting = guide?.open && guide.mark?.id === 'request';
 
   return (
     <div>
@@ -79,15 +96,14 @@ export function DashboardPage() {
         }
       />
 
-      {(checklist || (isAdmin && !data.emailConfigured)) && (
+      {(checklist || (checklist === false && isAdmin && !data.emailConfigured)) && (
         <div className="mb-5">
-          {checklist ? (
+          {checklist && onboarding ? (
             <GettingStarted
-              steps={steps}
-              canRequestAvailability={data.setup.comedians > 0}
-              onRequestAvailability={() =>
-                setRequestDialog({ kind: defaultRequestKind(planningProgress), month: data.planningMonth })
-              }
+              onboarding={onboarding}
+              isAdmin={isAdmin}
+              onRequestAvailability={requestGuideMonth}
+              onResumeGuide={resumeGuide}
             />
           ) : (
             <OutboxBanner />
@@ -103,7 +119,11 @@ export function DashboardPage() {
         </div>
         <div className="min-w-0 space-y-5">
           <ThisWeek data={data} />
-          <AvailabilityPanel data={data} onRequest={setRequestDialog} />
+          <AvailabilityPanel
+            data={data}
+            onRequest={setRequestDialog}
+            requestMonth={guideRequesting ? onboarding?.suggestedMonth : undefined}
+          />
         </div>
       </div>
 

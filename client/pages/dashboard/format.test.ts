@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { AvailabilityRequestSummary, MonthAvailabilityProgress } from '../../../shared/api/dashboard';
+import type { OnboardingResponse } from '../../../shared/api/onboarding';
 import type { AvailabilityAudience } from '../../../shared/types';
 import {
   askedLine,
@@ -10,8 +11,8 @@ import {
   percent,
   plural,
   relativeDay,
-  setupSteps,
-  showChecklist,
+  checklistItems,
+  showGettingStarted,
   spotLabel,
   tonightCounts,
   tonightSummary,
@@ -131,24 +132,39 @@ describe('availability request defaults (ux#B7)', () => {
   });
 });
 
-describe('getting started checklist (ux#B12)', () => {
-  const fresh = { setup: { locations: 1, comedians: 0, shows: 0, availabilityRequests: 0 }, emailConfigured: false };
+describe('getting started checklist (from /api/onboarding)', () => {
+  const fresh: OnboardingResponse = {
+    steps: [
+      { key: 'club', status: 'done' },
+      { key: 'shows', status: 'current', progress: { count: 2, target: 3 } },
+      { key: 'comedians', status: 'todo' },
+    ],
+    currentStep: 'shows',
+    completedAt: null,
+    dismissedAt: null,
+    emailConfigured: false,
+    suggestedMonth: '2026-11',
+    mode: 'setup',
+    counts: { locations: 1, scheduledShows: 2, comedians: 0, bookers: 1 },
+    availabilityRequested: false,
+  };
 
-  it('lists the steps, with email only for admins', () => {
-    expect(setupSteps(fresh, true).map((s) => [s.id, s.done])).toEqual([
-      ['location', true],
-      ['comedians', false],
-      ['shows', false],
-      ['email', false],
-      ['availability', false],
+  it('lists the three guide steps with progress, then the extras for admins only', () => {
+    expect(checklistItems(fresh, true)).toEqual([
+      { id: 'club', done: true, optional: false },
+      { id: 'shows', done: false, optional: false, progress: { count: 2, target: 3 } },
+      { id: 'comedians', done: false, optional: false },
+      { id: 'email', done: false, optional: true },
+      { id: 'invite', done: false, optional: true },
     ]);
-    expect(setupSteps(fresh, false).map((s) => s.id)).toEqual(['location', 'comedians', 'shows', 'availability']);
+    expect(checklistItems(fresh, false).map((s) => s.id)).toEqual(['club', 'shows', 'comedians']);
+    const later = { ...fresh, emailConfigured: true, counts: { ...fresh.counts, bookers: 2 } };
+    expect(checklistItems(later, true).filter((s) => s.optional).map((s) => s.done)).toEqual([true, true]);
   });
 
-  it('shows until done; a running club that only lacks email gets the banner instead', () => {
-    expect(showChecklist(setupSteps(fresh, true))).toBe(true);
-    const running = { setup: { locations: 2, comedians: 30, shows: 40, availabilityRequests: 3 }, emailConfigured: false };
-    expect(showChecklist(setupSteps(running, true))).toBe(false);
-    expect(showChecklist(setupSteps({ ...running, emailConfigured: true }, true))).toBe(false);
+  it('shows while a guide step is left; a running club that only lacks email gets the banner instead', () => {
+    expect(showGettingStarted(fresh)).toBe(true);
+    expect(showGettingStarted({ currentStep: 'comedians' })).toBe(true);
+    expect(showGettingStarted({ currentStep: null })).toBe(false);
   });
 });

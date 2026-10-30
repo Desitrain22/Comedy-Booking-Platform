@@ -1,10 +1,13 @@
 /**
- * /app/comedians — the roster: search, tag filter (`?tags=1,2`, any of), show archived,
- * row selection for bulk tag / archive / "Send sign-in link", and the Add / Bulk add dialogs.
+ * /app/comedians — the roster: search (name, email, phone), tag filter (`?tags=1,2`, any
+ * of), show archived, row selection for bulk tag / archive / "Send sign-in link", and the
+ * Add / Bulk add (paste) / Import CSV dialogs.
  * URL params: `q`, `tags`, `archived=1` (the Tags page links here with `?tags=<id>`).
+ * The setup guide lights the header's Import CSV and Add comedian buttons
+ * (`data-guide="comedians-import"` / `"comedians-add"`).
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Archive, ArchiveRestore, Check, ChevronDown, ClipboardList, Plus, Search, Send, Tag, Users, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Check, ChevronDown, ClipboardList, FileUp, Plus, Search, Send, Tag, Users, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { toast } from 'sonner';
@@ -38,6 +41,7 @@ import { cn } from '../../lib/cn';
 import { useBooker, useClub } from '../../lib/useMe';
 import { AddComedianDialog } from './AddComedianDialog';
 import { BulkAddDialog } from './BulkAddDialog';
+import { ImportCsvDialog } from './ImportCsvDialog';
 import { bulkLinksToast } from './loginLinks';
 import { invalidateTags, rosterQuery, useTags } from './queries';
 
@@ -58,6 +62,7 @@ export function ComediansPage() {
   const [searchInput, setSearchInput] = useState(urlSearch);
   const [addOpen, setAddOpen] = useState(false);
   const [bulkOpen, setBulkOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
 
   // Debounce typing into the URL (replace, so Back doesn't step through keystrokes).
   useEffect(() => {
@@ -114,10 +119,13 @@ export function ComediansPage() {
         description="Your roster. Hover a name to see tags and notes."
         actions={
           <>
-            <Button variant="secondary" onClick={() => setBulkOpen(true)}>
+            <Button variant="secondary" onClick={() => setBulkOpen(true)} title="Paste a list of names and emails">
               <ClipboardList /> Bulk add
             </Button>
-            <Button onClick={() => setAddOpen(true)}>
+            <Button variant="secondary" onClick={() => setImportOpen(true)} data-guide="comedians-import">
+              <FileUp /> Import CSV
+            </Button>
+            <Button onClick={() => setAddOpen(true)} data-guide="comedians-add">
               <Plus /> Add comedian
             </Button>
           </>
@@ -132,7 +140,7 @@ export function ComediansPage() {
               type="search"
               value={searchInput}
               onChange={(e) => setSearchInput(e.target.value)}
-              placeholder="Search name or email"
+              placeholder="Search name, email or phone"
               aria-label="Search comedians"
               className="pl-9"
             />
@@ -176,11 +184,14 @@ export function ComediansPage() {
             <EmptyState
               icon={Users}
               title="No comedians yet"
-              description="Add comedians one at a time, or paste a whole list. They only need a name and an email."
+              description="Import the spreadsheet you already keep, paste a list, or add them one at a time. They only need a name and an email."
               action={
-                <div className="flex gap-2">
+                <div className="flex flex-wrap justify-center gap-2">
                   <Button variant="secondary" onClick={() => setBulkOpen(true)}>
                     <ClipboardList /> Bulk add
+                  </Button>
+                  <Button variant="secondary" onClick={() => setImportOpen(true)}>
+                    <FileUp /> Import CSV
                   </Button>
                   <Button onClick={() => setAddOpen(true)}>
                     <Plus /> Add comedian
@@ -202,6 +213,7 @@ export function ComediansPage() {
 
       <AddComedianDialog open={addOpen} onOpenChange={setAddOpen} />
       <BulkAddDialog open={bulkOpen} onOpenChange={setBulkOpen} />
+      <ImportCsvDialog open={importOpen} onOpenChange={setImportOpen} />
     </div>
   );
 }
@@ -425,13 +437,16 @@ function RosterTable({ rows, tags, availabilityMonth, fetching, filtered }: Rost
                     className="size-4 rounded accent-accent-solid"
                   />
                 </th>
-                <th scope="col" className="w-[36%] px-3 py-2.5 font-medium lg:w-[26%]">
+                <th scope="col" className="px-3 py-2.5 font-medium sm:w-[36%] lg:w-[26%] xl:w-[21%]">
                   Comedian
                 </th>
-                <th scope="col" className="hidden w-[24%] px-3 py-2.5 font-medium lg:table-cell">
+                <th scope="col" className="hidden w-[24%] px-3 py-2.5 font-medium lg:table-cell xl:w-[21%]">
                   Email
                 </th>
-                <th scope="col" className="px-3 py-2.5 font-medium">
+                <th scope="col" className="hidden w-44 px-3 py-2.5 font-medium xl:table-cell">
+                  Phone
+                </th>
+                <th scope="col" className="hidden px-3 py-2.5 font-medium sm:table-cell">
                   Tags
                 </th>
                 <th scope="col" className="w-24 px-3 py-2.5 font-medium whitespace-nowrap lg:w-36">
@@ -490,7 +505,10 @@ function RosterTable({ rows, tags, availabilityMonth, fetching, filtered }: Rost
                       </div>
                     </td>
                     <td className="hidden max-w-64 truncate px-3 py-2 text-fg-muted lg:table-cell">{c.email}</td>
-                    <td className="overflow-hidden px-3 py-2">
+                    <td className="hidden truncate px-3 py-2 whitespace-nowrap text-fg-muted tabular-nums xl:table-cell">
+                      {c.phone || <span className="text-fg-subtle">—</span>}
+                    </td>
+                    <td className="hidden overflow-hidden px-3 py-2 sm:table-cell">
                       <div className="flex flex-wrap gap-1">
                         {c.tags.map((tag) => (
                           <Badge key={tag.id} dotColor={tag.color}>

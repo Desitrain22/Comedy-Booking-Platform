@@ -79,6 +79,28 @@ const COMEDIANS: ReadonlyArray<readonly [first: string, last: string]> = [
 ];
 const ARCHIVED = new Set(['Wes']);
 const WITH_HEADSHOT = new Set(['John', 'Priya', 'Marcus', 'Lena', 'Kofi']);
+/**
+ * About half the roster has a phone, written the many ways people type them. 555-01xx
+ * numbers are reserved for fiction. (Fixed, not random: the seeded RNG sequence that drives
+ * availability and bookings stays the same.)
+ */
+const PHONES: Readonly<Record<string, string>> = {
+  John: '(212) 555-0142',
+  Jason: '917-555-0199',
+  Maria: '646.555.0110',
+  Priya: '+1 347 555 0103',
+  Devon: '(718) 555-0175',
+  Keisha: '212-555-0128',
+  Marcus: '(917) 555-0164 x12',
+  Omar: '+1 (646) 555-0187',
+  Tara: '347-555-0131',
+  Chloe: '(212) 555-0119',
+  Rafael: '718.555.0156',
+  Hannah: '(929) 555-0108',
+  Kofi: '+1 917 555 0172',
+  Mateo: '646-555-0193',
+  Paige: '(347) 555-0147',
+};
 
 const TAGS = [
   { name: 'Hosts', color: '#3b82f6', members: ['John', 'Maria', 'Devon', 'Keisha'] },
@@ -268,6 +290,7 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
         name: `${first} ${last}`,
         bio: `${first} has been doing stand-up for ${years} years, known for ${pick(STYLES)}. Credits include ${pick(CREDITS)}.`,
         headshotUrl: WITH_HEADSHOT.has(first) ? `https://i.pravatar.cc/300?u=${first.toLowerCase()}` : '',
+        phone: PHONES[first] ?? '',
         archived: ARCHIVED.has(first),
         createdAt: now - (200 - i * 5) * DAY,
         updatedAt: now - (30 - (i % 30)) * DAY,

@@ -1,13 +1,19 @@
 /**
  * First-run setup wizard (/setup, only while setupComplete is false):
  * club → first location → admin account. `appUrl` is this browser's origin.
+ *
+ * It is step 1 of 3 of the setup guide (Club → Shows → Comedians, client/components/guide):
+ * when it finishes, the new admin lands on Create shows for the month being planned, where the
+ * guide picks up with step 2.
  */
 import { useMutation } from '@tanstack/react-query';
 import { ArrowLeft, Check } from 'lucide-react';
-import { useMemo, useState, type FormEvent } from 'react';
+import { Fragment, useMemo, useState, type FormEvent } from 'react';
 import type { z } from 'zod';
 import { emailSchema, passwordSchema, setupSchema, timeZoneSchema, type SetupInput } from '../../../shared/schemas';
+import { planningMonth, todayInTz } from '../../../shared/time';
 import { AuthShell, FormError } from '../../components/AuthShell';
+import { createShowsPath } from '../../components/guide';
 import { Button, Field, Input, Select } from '../../components/ui';
 import { api, errorMessage, isApiError } from '../../lib/api';
 import { cn } from '../../lib/cn';
@@ -81,6 +87,8 @@ export function SetupPage() {
     adminPassword: '',
   }));
   const [errors, setErrors] = useState<Errors>({});
+  /** Set up: the next page is loading (keep the button busy). */
+  const [leaving, setLeaving] = useState(false);
   const timeZones = useMemo(() => {
     const zones = Intl.supportedValuesOf('timeZone');
     return zones.includes(form.timezone) ? zones : [form.timezone, ...zones];
@@ -88,8 +96,14 @@ export function SetupPage() {
 
   const setup = useMutation({
     mutationFn: (input: SetupInput) => api.post('/setup', input),
-    // On success (or if someone else finished setup first) the gate redirects away from /setup.
-    onSuccess: () => refreshMe(),
+    // On to step 2 of the setup guide: Create shows for the month being planned. A full page
+    // load (like sign-out): the setup gate redirects /setup → / as soon as it sees the finished
+    // club, before a client-side navigation could commit. The session cookie is already set, so
+    // the new page opens signed in. (If someone else finished setup first, the gate redirects.)
+    onSuccess: (_data, input) => {
+      setLeaving(true);
+      window.location.replace(createShowsPath(planningMonth(todayInTz(input.timezone))));
+    },
     onError: (err) => {
       if (isApiError(err, 'already_setup')) void refreshMe();
     },
@@ -122,7 +136,13 @@ export function SetupPage() {
   }
 
   return (
-    <AuthShell title={current.title} description={current.description} documentTitle="Set up" className="max-w-md">
+    <AuthShell
+      title={current.title}
+      description={current.description}
+      documentTitle="Set up"
+      className="max-w-md"
+      footer={<GuideSteps />}
+    >
       <ol className="mb-5 flex items-center gap-2" aria-label="Setup progress">
         {STEPS.map((s, i) => (
           <li key={s.title} className="flex flex-1 items-center gap-2" aria-current={i === step ? 'step' : undefined}>
@@ -212,15 +232,46 @@ export function SetupPage() {
 
         <div className="flex items-center gap-2 pt-1">
           {step > 0 && (
-            <Button variant="ghost" onClick={() => setStep(step - 1)} disabled={setup.isPending}>
+            <Button variant="ghost" onClick={() => setStep(step - 1)} disabled={setup.isPending || leaving}>
               <ArrowLeft /> Back
             </Button>
           )}
-          <Button type="submit" className="ml-auto" loading={setup.isPending}>
+          <Button type="submit" className="ml-auto" loading={setup.isPending || leaving}>
             {isLast ? 'Finish setup' : 'Continue'}
           </Button>
         </div>
       </form>
     </AuthShell>
+  );
+}
+
+/** Under the card: this wizard is step 1 of the 3-step setup guide. */
+function GuideSteps() {
+  const steps = ['Club', 'Shows', 'Comedians'];
+  return (
+    <div className="space-y-2">
+      <ol aria-label="Setup guide" className="flex items-center justify-center gap-2 text-xs">
+        {steps.map((label, i) => (
+          <Fragment key={label}>
+            {i > 0 && <li aria-hidden className="h-px w-6 bg-border-strong" />}
+            <li
+              aria-current={i === 0 ? 'step' : undefined}
+              className={cn('flex items-center gap-1.5', i === 0 ? 'font-semibold text-fg' : 'text-fg-muted')}
+            >
+              <span
+                className={cn(
+                  'flex size-5 items-center justify-center rounded-full text-[11px] font-semibold',
+                  i === 0 ? 'bg-accent-solid text-accent-solid-fg' : 'border border-border-strong text-fg-subtle',
+                )}
+              >
+                {i + 1}
+              </span>
+              {label}
+            </li>
+          </Fragment>
+        ))}
+      </ol>
+      <p className="text-xs text-fg-subtle">Step 1 of 3. Next, a short guide walks you through your first shows and comedians.</p>
+    </div>
   );
 }

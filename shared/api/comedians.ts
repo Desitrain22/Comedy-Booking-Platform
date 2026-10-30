@@ -1,16 +1,22 @@
 /**
- * F3 — Comedians, tags, notes: request schemas, response shapes, and the bulk-add line
- * parser (shared so the client's live preview and the server agree).
+ * F3 — Comedians, tags, notes: request schemas, response shapes, and the per-row checks
+ * for bulk add / CSV import (shared so the client's live preview and the server agree; the
+ * CSV parser itself lives in `shared/csv.ts`).
  *
- *   GET    /api/comedians?search&tagIds&archived     ComedianListItem[]
- *   POST   /api/comedians                            { name, email, sendLoginLink? } → 201 CreateComedianResponse
+ *   GET    /api/comedians?search&tagIds&archived     ComedianListItem[] (search: name, email or phone)
+ *   POST   /api/comedians                            { name, email, phone?, sendLoginLink? } → 201 CreateComedianResponse
  *                                                    (409 email_taken)
- *   POST   /api/comedians/bulk                       { rows, dryRun?, sendLoginLinks? } → BulkAddResult
+ *   POST   /api/comedians/bulk                       { rows: [{ name, email, phone?, note? }], dryRun?, sendLoginLinks? }
+ *                                                    → BulkAddResult. Up to BULK_ADD_MAX rows; bad rows are skipped
+ *                                                    with a reason (never the whole request); existing emails are
+ *                                                    skipped, never overwritten; a note becomes a booker note by the
+ *                                                    importing booker. Body limit BULK_ADD_BODY_MAX_BYTES (larger than
+ *                                                    the rest of the API).
  *   POST   /api/comedians/bulk-tag                   { comedianIds, tagId, action } → { updated }
  *   POST   /api/comedians/bulk-archive               { comedianIds, archived } → { updated }
  *   POST   /api/comedians/bulk-send-login-link       { comedianIds } → BulkLoginLinkResult (archived skipped)
  *   GET    /api/comedians/:id                        ComedianDetail
- *   PATCH  /api/comedians/:id                        { name?, email?, bio?, headshotUrl?, archived? } → ComedianDetail
+ *   PATCH  /api/comedians/:id                        { name?, email?, phone?, bio?, headshotUrl?, archived? } → ComedianDetail
  *                                                    (a new email signs them out everywhere and voids their
  *                                                    sign-in links, confirmation links and codes)
  *   PUT    /api/comedians/:id/tags                   { tagIds } → TagSummary[]
@@ -30,7 +36,15 @@
 import { z } from 'zod';
 import type { AvailabilityEntry, AvailabilityRange } from '../availability';
 import type { BookingStatus } from '../bookingStatus';
-import { emailSchema, hexColorSchema, idSchema, monthSchema, queryBooleanSchema, queryIdListSchema } from '../schemas';
+import {
+  emailSchema,
+  hexColorSchema,
+  idSchema,
+  monthSchema,
+  normalizeEmail,
+  queryBooleanSchema,
+  queryIdListSchema,
+} from '../schemas';
 import { paletteColor, TAG_PALETTE, type EmailStatus, type ShowStatus } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -42,8 +56,23 @@ export const COMEDIAN_BIO_MAX = 1000;
 export const HEADSHOT_URL_MAX = 500;
 export const NOTE_MAX = 2000;
 export const TAG_NAME_MAX = 40;
-/** Rows per bulk-add request. */
-export const BULK_ADD_MAX = 500;
+/** Phone numbers are optional and stored as typed (trimmed). */
+export const PHONE_MAX = 40;
+/** Rows per bulk-add request (Import CSV and Bulk add). */
+export const BULK_ADD_MAX = 1000;
+/** Largest CSV file Import CSV accepts. */
+export const CSV_IMPORT_MAX_BYTES = 2 * 1024 * 1024;
+/**
+ * Largest `POST /api/comedians/bulk` body: a full 2 MB CSV as JSON, with room for quoting
+ * and multi-byte characters. The rest of the API keeps its smaller limit.
+ */
+export const BULK_ADD_BODY_MAX_BYTES = 4 * 1024 * 1024;
+/**
+ * Hard caps on the raw strings in a bulk row. Longer values reject the whole request, so
+ * clients clamp to these before sending; anything over the real limits (name 100, phone 40,
+ * note 2,000) is still reported per row.
+ */
+export const BULK_RAW_MAX = { name: 500, email: 500, phone: 200, note: 4 * NOTE_MAX } as const;
 /** Notes included in the hover card. */
 export const CARD_NOTE_COUNT = 3;
 
@@ -78,6 +107,60 @@ export const headshotUrlSchema = z
   .max(HEADSHOT_URL_MAX)
   .refine((v) => v === '' || isHttpUrl(v), 'Enter a link starting with http:// or https://');
 
+// ---------------------------------------------------------------------------
+// Phone (optional; shown to bookers, never used for texting)
+// ---------------------------------------------------------------------------
+
+/** Trim and collapse runs of whitespace (spreadsheets paste tabs and non-breaking spaces). */
+export function normalizePhone(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * A (normalized) phone number as people type them: digits, spaces, `+ ( ) - .`, and an
+ * extension written with `ext` or `x`, at most PHONE_MAX characters, with at least one
+ * digit. `''` (no phone) is valid.
+ */
+export function isValidPhone(value: string): boolean {
+  if (value === '') return true;
+  if (value.length > PHONE_MAX || !/\d/.test(value)) return false;
+  return /^[\d+().\- ]*$/.test(value.replace(/ext|x/gi, ''));
+}
+
+export const PHONE_HINT = 'Use digits, spaces and + ( ) - . (add an extension with "ext" or "x")';
+
+/** Optional phone: normalized, '' when blank. */
+export const phoneSchema = z
+  .string()
+  .max(BULK_RAW_MAX.phone, `Use at most ${PHONE_MAX} characters`)
+  .transform(normalizePhone)
+  .pipe(
+    z
+      .string()
+      .max(PHONE_MAX, `Use at most ${PHONE_MAX} characters`)
+      // (Length has its own message above.)
+      .refine((v) => v.length > PHONE_MAX || isValidPhone(v), PHONE_HINT),
+  );
+
+/**
+ * `tel:` link for a stored phone: its digits (keeping a leading +), and an extension as a
+ * dialing pause (`tel:+12125550142,12`). Null when there's nothing to dial.
+ */
+export function telHref(phone: string): string | null {
+  const match = /^(.*?)(?:\s*(?:ext|x)\.?\s*(\d+))?\s*$/i.exec(phone.trim());
+  const main = match?.[1] ?? '';
+  const digits = main.replace(/\D/g, '');
+  if (!digits) return null;
+  const plus = main.trimStart().startsWith('+') ? '+' : '';
+  const ext = match?.[2];
+  return `tel:${plus}${digits}${ext ? `,${ext}` : ''}`;
+}
+
+/** Notes keep their line breaks (as \n) and lose surrounding whitespace. */
+export function normalizeNote(value: string): string {
+  return value.replace(/\r\n?/g, '\n').trim();
+}
+
 /** `GET /api/comedians` query. `archived=1` includes archived comedians (default: active only). */
 export const listComediansQuerySchema = z.object({
   search: z.string().trim().max(100).optional(),
@@ -90,6 +173,8 @@ export type ListComediansQuery = z.input<typeof listComediansQuerySchema>;
 export const createComedianSchema = z.object({
   name: comedianNameSchema,
   email: emailSchema,
+  /** Optional ('' or omitted = none). */
+  phone: phoneSchema.optional(),
   /** Email them a portal sign-in link right away ("Email them a sign-in link", on by default in the UI). */
   sendLoginLink: z.boolean().optional(),
 });
@@ -99,6 +184,8 @@ export const updateComedianSchema = z
   .object({
     name: comedianNameSchema,
     email: emailSchema,
+    /** '' clears it. */
+    phone: phoneSchema,
     bio: z.string().trim().max(COMEDIAN_BIO_MAX, `Keep it under ${COMEDIAN_BIO_MAX} characters`),
     headshotUrl: headshotUrlSchema,
     archived: z.boolean(),
@@ -106,12 +193,24 @@ export const updateComedianSchema = z
   .partial();
 export type UpdateComedianInput = z.input<typeof updateComedianSchema>;
 
+/**
+ * One bulk row as sent. Only the raw lengths are checked here (BULK_RAW_MAX); every real
+ * rule is checked per row by `bulkRowIssues`, so a bad row is skipped, not the request.
+ */
+export const bulkRowSchema = z.object({
+  name: z.string().max(BULK_RAW_MAX.name),
+  email: z.string().max(BULK_RAW_MAX.email),
+  phone: z.string().max(BULK_RAW_MAX.phone).optional(),
+  /** Becomes a private booker note on the new comedian, authored by the importing booker. */
+  note: z.string().max(BULK_RAW_MAX.note).optional(),
+});
+
 /** Rows are validated one by one on the server (bad rows are skipped, not rejected). */
 export const bulkAddSchema = z.object({
   rows: z
-    .array(z.object({ name: z.string().max(500), email: z.string().max(500) }))
+    .array(bulkRowSchema)
     .min(1, 'Paste at least one comedian')
-    .max(BULK_ADD_MAX, `Add at most ${BULK_ADD_MAX} at a time`),
+    .max(BULK_ADD_MAX, `Add at most ${BULK_ADD_MAX.toLocaleString('en-US')} at a time`),
   /** Preview only: report what would be created/skipped without writing. */
   dryRun: z.boolean().optional(),
   /** Email each comedian created a portal sign-in link (ignored on a dry run). */
@@ -190,6 +289,8 @@ export interface ComedianListItem {
   id: number;
   name: string;
   email: string;
+  /** '' when not given. */
+  phone: string;
   headshotUrl: string;
   archived: boolean;
   tags: TagSummary[];
@@ -208,6 +309,8 @@ export interface ComedianDetail {
   id: number;
   name: string;
   email: string;
+  /** '' when not given. */
+  phone: string;
   bio: string;
   headshotUrl: string;
   archived: boolean;
@@ -236,6 +339,8 @@ export interface ComedianCard {
   id: number;
   name: string;
   email: string;
+  /** '' when not given. */
+  phone: string;
   bio: string;
   headshotUrl: string;
   archived: boolean;
@@ -274,27 +379,74 @@ export interface ComedianAvailability {
   today: string;
 }
 
-export const BULK_SKIP_REASONS = ['missing_name', 'invalid_email', 'duplicate', 'email_taken'] as const;
+/**
+ * Why a bulk row was skipped, in priority order (a row reports the first that applies).
+ * `invalid_email` covers a missing email too (shown as "Needs an email").
+ */
+export const BULK_SKIP_REASONS = [
+  'invalid_email',
+  'missing_name',
+  'name_too_long',
+  'duplicate',
+  'email_taken',
+  'invalid_phone',
+  'note_too_long',
+] as const;
 export type BulkSkipReason = (typeof BULK_SKIP_REASONS)[number];
+/** Problems a row has on its own (no database needed). */
+export type BulkRowIssue = Exclude<BulkSkipReason, 'email_taken'>;
 
 export const BULK_SKIP_LABELS: Record<BulkSkipReason, string> = {
-  missing_name: 'Missing name',
   invalid_email: 'Invalid email',
+  missing_name: 'Needs a name',
+  name_too_long: 'Name too long',
   duplicate: 'Duplicate in list',
   email_taken: 'Already on roster',
+  invalid_phone: 'Invalid phone',
+  note_too_long: 'Note too long',
 };
+
+/** Longer explanations (tooltips). */
+export const BULK_SKIP_HINTS: Record<BulkSkipReason, string> = {
+  invalid_email: 'Comedians sign in with their email, so each one needs a valid address.',
+  missing_name: 'Add a name for this comedian.',
+  name_too_long: `Names can be at most ${COMEDIAN_NAME_MAX} characters.`,
+  duplicate: 'This email appears earlier in the list; only the first one is added.',
+  email_taken: 'Someone on the roster already uses this email. They are left as they are.',
+  invalid_phone: `${PHONE_HINT}, at most ${PHONE_MAX} characters.`,
+  note_too_long: `Notes can be at most ${NOTE_MAX.toLocaleString('en-US')} characters.`,
+};
+
+/** The status label for a skipped row ("Needs an email" when the email is blank). */
+export function bulkSkipLabel(reason: BulkSkipReason, email: string, source: 'list' | 'file' = 'list'): string {
+  if (reason === 'invalid_email' && email.trim() === '') return 'Needs an email';
+  if (reason === 'duplicate') return source === 'file' ? 'Duplicate in file' : BULK_SKIP_LABELS.duplicate;
+  return BULK_SKIP_LABELS[reason];
+}
+
+/** The first reason in priority order, or null. */
+export function firstBulkReason<R extends BulkSkipReason>(reasons: readonly R[]): R | null {
+  let best: R | null = null;
+  for (const reason of reasons) {
+    if (best === null || BULK_SKIP_REASONS.indexOf(reason) < BULK_SKIP_REASONS.indexOf(best)) best = reason;
+  }
+  return best;
+}
 
 export interface BulkRow {
   name: string;
   email: string;
+  phone?: string;
+  note?: string;
 }
 
 export interface BulkSkip {
   /** Index into the request's `rows`. */
   index: number;
+  /** The row as sent. */
   row: BulkRow;
   reason: BulkSkipReason;
-  /** For `email_taken`: the existing comedian. */
+  /** For `email_taken`: the existing comedian (left unchanged). */
   existing?: { id: number; name: string; archived: boolean };
 }
 
@@ -304,6 +456,10 @@ export interface BulkCreated {
   id: number;
   name: string;
   email: string;
+  /** '' when none. */
+  phone: string;
+  /** The booker note added with them ('' when none). */
+  note: string;
 }
 
 export interface BulkAddResult {
@@ -354,91 +510,60 @@ export interface EmailTakenErrorExtra {
 }
 
 // ---------------------------------------------------------------------------
-// Bulk-add parsing (pure; shared by the client preview and tests)
+// Bulk-add row checks (pure; shared by the client preview, the server and tests)
 // ---------------------------------------------------------------------------
 
-export interface ParsedBulkLine extends BulkRow {
-  /** 1-based line number in the pasted text. */
-  line: number;
-  raw: string;
+/** A bulk row as it will be stored. */
+export interface NormalizedBulkRow {
+  name: string;
+  email: string;
+  phone: string;
+  note: string;
 }
 
-function cleanName(value: string): string {
-  return value
-    .trim()
-    .replace(/^["'“”‘’]+|["'“”‘’]+$/g, '')
-    .replace(/\s+/g, ' ')
-    .trim();
+export function normalizeBulkRow(row: BulkRow): NormalizedBulkRow {
+  return {
+    name: row.name.trim().replace(/\s+/g, ' '),
+    email: normalizeEmail(row.email),
+    phone: normalizePhone(row.phone ?? ''),
+    note: normalizeNote(row.note ?? ''),
+  };
 }
 
-function cleanEmail(value: string): string {
-  return value
-    .trim()
-    .replace(/^mailto:/i, '')
-    .replace(/^[<("']+|[>)"',;.]+$/g, '')
-    .trim()
-    .toLowerCase();
-}
-
-/**
- * Parse pasted lines. Accepts `Name, email`, `Name <email>`, `email, Name`, tab- or
- * semicolon-separated columns (spreadsheet pastes), and `Name email`. Blank lines are
- * ignored. Unparseable parts come back as empty strings (flagged by `checkBulkRows`).
- */
-export function parseBulkLines(text: string): ParsedBulkLine[] {
-  const out: ParsedBulkLine[] = [];
-  text.split(/\r?\n/).forEach((rawLine, i) => {
-    const raw = rawLine.trim();
-    if (!raw) return;
-    const line = i + 1;
-
-    const angle = /^(.*?)<([^<>]*)>\s*[,;]?\s*$/.exec(raw);
-    if (angle) {
-      out.push({ line, raw, name: cleanName(angle[1]!.replace(/[,;]\s*$/, '')), email: cleanEmail(angle[2]!) });
-      return;
-    }
-
-    const parts = raw
-      .split(/[,;\t]/)
-      .map((p) => p.trim())
-      .filter(Boolean);
-    if (parts.length >= 2) {
-      const emailIdx = parts.findIndex((p) => p.includes('@'));
-      if (emailIdx === -1) {
-        out.push({ line, raw, name: cleanName(parts.join(' ')), email: '' });
-        return;
-      }
-      const name = parts.filter((_, idx) => idx !== emailIdx).join(' ');
-      out.push({ line, raw, name: cleanName(name), email: cleanEmail(parts[emailIdx]!) });
-      return;
-    }
-
-    // One column: maybe "Name email" separated by spaces.
-    const tokens = raw.split(/\s+/);
-    const emailIdx = tokens.findIndex((tok) => tok.includes('@'));
-    if (emailIdx === -1) {
-      out.push({ line, raw, name: cleanName(raw), email: '' });
-      return;
-    }
-    const name = tokens.filter((_, idx) => idx !== emailIdx).join(' ');
-    out.push({ line, raw, name: cleanName(name), email: cleanEmail(tokens[emailIdx]!) });
-  });
-  return out;
+/** One row's own problems (every one that applies, in priority order). */
+function rowIssues(row: BulkRow): BulkRowIssue[] {
+  const { name, phone, note } = normalizeBulkRow(row);
+  const issues: BulkRowIssue[] = [];
+  if (!emailSchema.safeParse(row.email).success) issues.push('invalid_email');
+  if (!name) issues.push('missing_name');
+  else if (name.length > COMEDIAN_NAME_MAX) issues.push('name_too_long');
+  if (!isValidPhone(phone)) issues.push('invalid_phone');
+  if (note.length > NOTE_MAX) issues.push('note_too_long');
+  return issues;
 }
 
 /**
- * Per-row problems that need no database: missing name, invalid email, or an email that
- * appeared earlier in the same batch. `null` = looks fine. The server adds `email_taken`.
+ * Every problem each row has without looking at the database, in priority order: invalid
+ * or missing email, missing or too-long name, an email used by an earlier row (that has a
+ * valid name and email), an invalid phone, a note over NOTE_MAX. `[]` = looks fine. The
+ * server adds `email_taken`.
  */
-export function checkBulkRows(rows: readonly BulkRow[]): (BulkSkipReason | null)[] {
+export function bulkRowIssues(rows: readonly BulkRow[]): BulkRowIssue[][] {
   const seen = new Set<string>();
   return rows.map((row) => {
-    const name = comedianNameSchema.safeParse(row.name);
-    const email = emailSchema.safeParse(row.email);
-    if (!email.success) return 'invalid_email';
-    if (!name.success) return 'missing_name';
-    if (seen.has(email.data)) return 'duplicate';
-    seen.add(email.data);
-    return null;
+    const issues = rowIssues(row);
+    if (issues.includes('invalid_email') || issues.includes('missing_name') || issues.includes('name_too_long')) {
+      return issues;
+    }
+    const email = normalizeEmail(row.email);
+    // Only phone/note problems can be left here, and `duplicate` outranks them.
+    if (seen.has(email)) return ['duplicate', ...issues];
+    seen.add(email);
+    return issues;
   });
+}
+
+/** The first problem of each row (see `bulkRowIssues`), or null when it looks fine. */
+export function checkBulkRows(rows: readonly BulkRow[]): (BulkRowIssue | null)[] {
+  return bulkRowIssues(rows).map((issues) => firstBulkReason(issues));
 }

@@ -18,12 +18,14 @@ export interface AddComedianDialogProps {
 interface FieldErrors {
   name?: string;
   email?: string;
+  phone?: string;
   form?: string;
 }
 
 /**
- * Name + email is all it takes; comedians add their own bio and headshot in the portal.
- * "Email them a sign-in link" (on by default) invites them to the portal right away.
+ * Name + email is all it takes (phone is optional); comedians add their own bio and
+ * headshot in the portal. "Email them a sign-in link" (on by default) invites them to the
+ * portal right away.
  */
 export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps) {
   const queryClient = useQueryClient();
@@ -31,11 +33,12 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
   const isAdmin = useBooker().role === 'admin';
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [sendLink, setSendLink] = useState(true);
   const [errors, setErrors] = useState<FieldErrors>({});
 
   const create = useMutation({
-    mutationFn: (input: { name: string; email: string; sendLoginLink: boolean }) =>
+    mutationFn: (input: { name: string; email: string; phone: string; sendLoginLink: boolean }) =>
       api.post<CreateComedianResponse>('/comedians', input),
     onSuccess: (comedian) => {
       invalidateComedians(queryClient);
@@ -62,6 +65,7 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
     if (!next) {
       setName('');
       setEmail('');
+      setPhone('');
       setSendLink(true);
       setErrors({});
       create.reset();
@@ -71,18 +75,18 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
 
   function submit(e: FormEvent) {
     e.preventDefault();
-    const parsed = createComedianSchema.safeParse({ name, email });
+    const parsed = createComedianSchema.safeParse({ name, email, phone });
     if (!parsed.success) {
       const next: FieldErrors = {};
       for (const issue of parsed.error.issues) {
         const key = issue.path[0];
-        if ((key === 'name' || key === 'email') && !next[key]) next[key] = issue.message;
+        if ((key === 'name' || key === 'email' || key === 'phone') && !next[key]) next[key] = issue.message;
       }
       setErrors(next);
       return;
     }
     setErrors({});
-    create.mutate({ name: parsed.data.name, email: parsed.data.email, sendLoginLink: sendLink });
+    create.mutate({ name: parsed.data.name, email: parsed.data.email, phone: parsed.data.phone ?? '', sendLoginLink: sendLink });
   }
 
   return (
@@ -114,6 +118,19 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
             onChange={(e) => setEmail(e.target.value)}
             autoComplete="off"
             placeholder="jason@example.com"
+          />
+        </Field>
+        <Field label="Phone" aside={<span className="text-xs text-fg-subtle">Optional</span>} error={errors.phone}>
+          <Input
+            type="tel"
+            inputMode="tel"
+            value={phone}
+            onChange={(e) => {
+              setPhone(e.target.value);
+              if (errors.phone) setErrors((prev) => ({ ...prev, phone: undefined }));
+            }}
+            autoComplete="off"
+            placeholder="(212) 555-0142"
           />
         </Field>
         <SendLinkCheckbox checked={sendLink} onChange={setSendLink} />

@@ -1,5 +1,6 @@
 /** Small copy helpers for the dashboard (pure; unit-tested in format.test.ts). */
 import type { DashboardResponse, MonthAvailabilityProgress, NextConfirmationSend } from '../../../shared/api/dashboard';
+import type { OnboardingResponse } from '../../../shared/api/onboarding';
 import { addDays, formatDateMedium, formatDateShort, formatTime, monthOf, todayInTz } from '../../../shared/time';
 import type { AvailabilityRequestKind } from '../../../shared/types';
 
@@ -120,38 +121,44 @@ export function askedLine(progress: MonthAvailabilityProgress | undefined, timeZ
 }
 
 // ---------------------------------------------------------------------------
-// Getting started (new clubs)
+// Getting started (new clubs) — the setup guide's home on the dashboard
 // ---------------------------------------------------------------------------
 
-export type SetupStepId = 'location' | 'comedians' | 'shows' | 'email' | 'availability';
+/** The three setup guide steps, then the optional extras (admins only). */
+export type ChecklistItemId = 'club' | 'shows' | 'comedians' | 'email' | 'invite';
 
-export interface SetupStep {
-  id: SetupStepId;
+export interface ChecklistItem {
+  id: ChecklistItemId;
   done: boolean;
+  /** Not one of the guide's three steps (connect email, invite a booker). */
+  optional: boolean;
+  /** Shows: "2 of 3". */
+  progress?: { count: number; target: number };
 }
 
 /**
- * The new-club checklist, in order. "Connect email" is an admin's job, so bookers don't see it.
+ * The Getting started card, from `GET /api/onboarding` (one source of truth with the guide):
+ * Club, Shows (with progress), Comedians, then for admins the optional extras — connect email
+ * and invite another booker.
  */
-export function setupSteps(
-  data: Pick<DashboardResponse, 'setup' | 'emailConfigured'>,
-  isAdmin: boolean,
-): SetupStep[] {
-  const { setup } = data;
-  const steps: SetupStep[] = [
-    { id: 'location', done: setup.locations > 0 },
-    { id: 'comedians', done: setup.comedians > 0 },
-    { id: 'shows', done: setup.shows > 0 },
-  ];
-  if (isAdmin) steps.push({ id: 'email', done: data.emailConfigured });
-  steps.push({ id: 'availability', done: setup.availabilityRequests > 0 });
-  return steps;
+export function checklistItems(onboarding: OnboardingResponse, isAdmin: boolean): ChecklistItem[] {
+  const items: ChecklistItem[] = onboarding.steps.map((step) => ({
+    id: step.key,
+    done: step.status === 'done',
+    optional: false,
+    ...(step.progress ? { progress: step.progress } : {}),
+  }));
+  if (isAdmin) {
+    items.push({ id: 'email', done: onboarding.emailConfigured, optional: true });
+    items.push({ id: 'invite', done: onboarding.counts.bookers > 1, optional: true });
+  }
+  return items;
 }
 
 /**
- * Show the checklist while something besides email is left to do. A running club that only
- * lacks email gets the slimmer "emails are in the outbox" banner instead (admins).
+ * Show the card while a guide step is left. A running club that only lacks email gets the
+ * slimmer "emails are in the outbox" banner instead (admins).
  */
-export function showChecklist(steps: SetupStep[]): boolean {
-  return steps.some((s) => !s.done && s.id !== 'email');
+export function showGettingStarted(onboarding: Pick<OnboardingResponse, 'currentStep'>): boolean {
+  return onboarding.currentStep !== null;
 }

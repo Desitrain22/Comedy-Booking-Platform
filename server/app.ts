@@ -27,10 +27,11 @@ import {
   type RateLimitConfig,
 } from './lib/rateLimit';
 import { authRoutes } from './routes/auth';
-import { comediansRoutes } from './routes/comedians';
+import { BULK_ADD_PATH, comediansRoutes } from './routes/comedians';
 import { dashboardRoutes } from './routes/dashboard';
 import { lineupRoutes } from './routes/lineup';
 import { locationsRoutes } from './routes/locations';
+import { onboardingRoutes } from './routes/onboarding';
 import { portalRoutes } from './routes/portal';
 import { settingsRoutes } from './routes/settings';
 import { setupRoutes } from './routes/setup';
@@ -127,13 +128,12 @@ export function createApp({ db, clientDir, logRequests = false, rateLimits }: Cr
     }),
   );
 
-  app.use(
-    '/api/*',
-    bodyLimit({
-      maxSize: API_BODY_LIMIT_BYTES,
-      onError: (c) => c.json({ error: 'That request is too large', code: 'payload_too_large' }, 413),
-    }),
-  );
+  const apiBodyLimit = bodyLimit({
+    maxSize: API_BODY_LIMIT_BYTES,
+    onError: (c) => c.json({ error: 'That request is too large', code: 'payload_too_large' }, 413),
+  });
+  // CSV import (up to 1,000 comedians) applies its own, larger limit: server/routes/comedians.ts.
+  app.use('/api/*', (c, next) => (c.req.path === BULK_ADD_PATH ? next() : apiBodyLimit(c, next)));
 
   app.use(
     '/api/*',
@@ -165,6 +165,7 @@ export function createApp({ db, clientDir, logRequests = false, rateLimits }: Cr
   app.route('/api', portalRoutes);
   app.route('/api', dashboardRoutes);
   app.route('/api', settingsRoutes);
+  app.route('/api', onboardingRoutes);
 
   app.all('/api/*', (c) => c.json({ error: 'Not found', code: 'not_found' }, 404));
 

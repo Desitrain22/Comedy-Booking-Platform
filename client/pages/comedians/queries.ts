@@ -95,8 +95,9 @@ export function useTags() {
 }
 
 /**
- * After a comedian's name/email/archived/tags change: the roster, profiles, cards, and
- * other features' screens that show comedians (day view pool, dashboard).
+ * After a comedian's name/email/phone/archived/tags change: the roster, profiles, cards, and
+ * other features' screens that show comedians (day view pool, dashboard). The setup guide
+ * refetches on its own when `['comedians']` is invalidated.
  */
 export function invalidateComedians(queryClient: QueryClient): void {
   void queryClient.invalidateQueries({ queryKey: comedianKeys.all });

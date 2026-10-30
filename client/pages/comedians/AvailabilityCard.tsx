@@ -68,14 +68,14 @@ export function AvailabilityCard({ comedianId }: { comedianId: number }) {
         actions={
           <div className="flex items-center gap-1">
             {month !== thisMonth && (
-              <Button variant="ghost" size="sm" onClick={() => setMonth(thisMonth)}>
+              <Button variant="ghost" size="sm" className="hidden sm:inline-flex" onClick={() => setMonth(thisMonth)}>
                 This month
               </Button>
             )}
             <Button variant="ghost" size="icon-sm" aria-label="Previous month" onClick={() => setMonth(addMonths(month, -1))}>
               <ChevronLeft />
             </Button>
-            <span className="w-32 text-center text-sm font-medium text-fg tabular-nums" aria-live="polite">
+            <span className="w-28 text-center text-sm font-medium text-fg tabular-nums sm:w-32" aria-live="polite">
               {formatMonthLong(month)}
             </span>
             <Button variant="ghost" size="icon-sm" aria-label="Next month" onClick={() => setMonth(addMonths(month, 1))}>

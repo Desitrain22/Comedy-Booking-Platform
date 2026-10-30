@@ -12,7 +12,7 @@ import { api, errorMessage, isApiError } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { comedianKeys, invalidateComedians } from './queries';
 
-type FieldName = 'name' | 'email' | 'bio' | 'headshotUrl';
+type FieldName = 'name' | 'email' | 'phone' | 'bio' | 'headshotUrl';
 type Errors = Partial<Record<FieldName | 'form', string>>;
 
 export interface EditComedianDialogProps {
@@ -21,14 +21,14 @@ export interface EditComedianDialogProps {
   onOpenChange: (open: boolean) => void;
 }
 
-/** Bookers can change everything comedians can (name, bio, headshot) plus the email. */
+/** Bookers can change everything comedians can (name, phone, bio, headshot) plus the email. */
 export function EditComedianDialog({ comedian, open, onOpenChange }: EditComedianDialogProps) {
   return (
     <Dialog
       open={open}
       onOpenChange={onOpenChange}
       title="Edit comedian"
-      description="Comedians can also update their name, bio and headshot from the portal."
+      description="Comedians can also update their name, phone, bio and headshot from the portal."
       size="md"
     >
       {/* Remount per open so the form starts from the latest saved values. */}
@@ -42,6 +42,7 @@ function EditForm({ comedian, onDone }: { comedian: ComedianDetail; onDone: () =
   const [values, setValues] = useState({
     name: comedian.name,
     email: comedian.email,
+    phone: comedian.phone,
     headshotUrl: comedian.headshotUrl,
     bio: comedian.bio,
   });
@@ -118,6 +119,16 @@ function EditForm({ comedian, onDone }: { comedian: ComedianDetail; onDone: () =
           }
         >
           <Input type="email" value={values.email} onChange={(e) => set('email', e.target.value)} autoComplete="off" />
+        </Field>
+        <Field label="Phone" aside={<span className="text-xs text-fg-subtle">Optional</span>} error={errors.phone}>
+          <Input
+            type="tel"
+            inputMode="tel"
+            value={values.phone}
+            onChange={(e) => set('phone', e.target.value)}
+            autoComplete="off"
+            placeholder="(212) 555-0142"
+          />
         </Field>
       </div>
       <div className="flex items-start gap-3">

@@ -70,7 +70,7 @@ export const CONFIRM_LINK_SESSION_TTL_MS = 7 * 86_400_000;
 // ---------------------------------------------------------------------------
 
 function toProfile(c: Comedian): PortalProfile {
-  return { id: c.id, name: c.name, email: c.email, bio: c.bio, headshotUrl: c.headshotUrl };
+  return { id: c.id, name: c.name, email: c.email, phone: c.phone, bio: c.bio, headshotUrl: c.headshotUrl };
 }
 
 function loadComedian(db: DbOrTx, id: number): Comedian {
@@ -447,10 +447,10 @@ portalRoutes.get('/portal/profile', requireComedian, (c) => {
 
 portalRoutes.put('/portal/profile', requireComedian, validate('json', updatePortalProfileSchema), (c) => {
   const db = c.var.db;
-  const { name, bio, headshotUrl } = c.req.valid('json');
+  const { name, bio, headshotUrl, phone } = c.req.valid('json');
   const updated = db
     .update(comedians)
-    .set({ name, bio, headshotUrl })
+    .set({ name, bio, headshotUrl, ...(phone === undefined ? {} : { phone }) })
     .where(eq(comedians.id, c.var.comedian.id))
     .returning()
     .get();

@@ -1,5 +1,6 @@
 /**
- * Hover card with a comedian's headshot, tags, bio excerpt and latest private notes.
+ * Hover card with a comedian's headshot, email and phone, tags, bio excerpt and latest
+ * private notes.
  * Wrap any element that names a comedian (roster rows, lineup chips, pool cards):
  *
  *   <ComedianHoverCard comedianId={c.id}><span>{c.name}</span></ComedianHoverCard>
@@ -18,10 +19,10 @@
  */
 import * as HoverCard from '@radix-ui/react-hover-card';
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, Archive, StickyNote } from 'lucide-react';
+import { ArrowRight, Archive, Phone, StickyNote } from 'lucide-react';
 import { useRef, useState, type ReactElement } from 'react';
 import { Link } from 'react-router';
-import type { ComedianCard } from '../../shared/api/comedians';
+import { telHref, type ComedianCard } from '../../shared/api/comedians';
 import { formatRelative } from '../../shared/time';
 import { api } from '../lib/api';
 import { cn } from '../lib/cn';
@@ -150,6 +151,15 @@ function CardContent({ comedianId }: { comedianId: number }) {
         <div className="min-w-0 flex-1 pt-0.5">
           <p className="truncate text-sm leading-tight font-semibold text-fg">{card.name}</p>
           <p className="mt-0.5 truncate text-xs text-fg-muted">{card.email}</p>
+          {card.phone && (
+            <a
+              href={telHref(card.phone) ?? undefined}
+              className="mt-0.5 flex items-center gap-1 truncate text-xs text-fg-muted tabular-nums hover:text-fg hover:underline"
+            >
+              <Phone className="size-3 shrink-0" aria-hidden />
+              {card.phone}
+            </a>
+          )}
           {card.archived && (
             <Badge variant="outline" className="mt-1.5 gap-1 py-0 text-[11px]">
               <Archive className="size-3" aria-hidden /> Archived

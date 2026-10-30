@@ -4,17 +4,18 @@ import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import {
   BULK_ADD_MAX,
-  BULK_SKIP_LABELS,
-  checkBulkRows,
-  parseBulkLines,
+  BULK_SKIP_HINTS,
+  bulkSkipLabel,
   type BulkAddResult,
   type BulkSkip,
   type BulkSkipReason,
 } from '../../../shared/api/comedians';
+import { parseComedianCsv } from '../../../shared/csv';
 import { Badge, Button, Dialog, Spinner, Textarea } from '../../components/ui';
 import { api } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { useBooker } from '../../lib/useMe';
+import { formatCount, toBulkRow } from './csvImport';
 import { bulkLinksToast } from './loginLinks';
 import { invalidateComedians } from './queries';
 import { SendLinkCheckbox } from './SendLinkCheckbox';
@@ -26,7 +27,7 @@ export interface BulkAddDialogProps {
 
 const PLACEHOLDER = `Jason Lee, jason@example.com
 Maria Gomez <maria@example.com>
-Sam Jones, sam@example.com`;
+Sam Jones, sam@example.com, (212) 555-0142, Great closer`;
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -40,8 +41,10 @@ function useDebounced<T>(value: T, delayMs: number): T {
 type RowStatus = { kind: 'new' } | { kind: 'skip'; reason: BulkSkipReason; detail?: string };
 
 /**
- * Paste `Name, email` / `Name <email>` lines → live preview (invalid/duplicate flagged) →
- * create, emailing each new comedian a sign-in link unless unchecked.
+ * Paste `Name, email[, phone, notes]` / `Name <email>` lines (or rows copied from a
+ * spreadsheet, header row optional) → live preview (problems flagged) → create, emailing
+ * each new comedian a sign-in link unless unchecked. Same parser and four columns as
+ * Import CSV (`parseComedianCsv`).
  */
 export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   const queryClient = useQueryClient();
@@ -49,9 +52,10 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   const [text, setText] = useState('');
   const [sendLinks, setSendLinks] = useState(true);
 
-  const parsed = useMemo(() => parseBulkLines(text), [text]);
-  const rows = useMemo(() => parsed.map(({ name, email }) => ({ name, email })), [parsed]);
-  const local = useMemo(() => checkBulkRows(rows), [rows]);
+  const parsed = useMemo(() => parseComedianCsv(text).rows, [text]);
+  const rows = useMemo(() => parsed.map(toBulkRow), [parsed]);
+  const hasPhone = parsed.some((r) => r.phone);
+  const hasNote = parsed.some((r) => r.note);
   const rowsKey = JSON.stringify(rows);
   const debouncedKey = useDebounced(rowsKey, 300);
   const tooMany = rows.length > BULK_ADD_MAX;
@@ -71,8 +75,8 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   }, [preview.data, debouncedKey, rowsKey]);
   const checking = rows.length > 0 && !tooMany && (debouncedKey !== rowsKey || preview.isFetching);
 
-  const statuses: RowStatus[] = rows.map((_, i) => {
-    const reason = local[i];
+  const statuses: RowStatus[] = parsed.map((row, i) => {
+    const reason = row.issues[0];
     if (reason) return { kind: 'skip', reason };
     const skip = serverSkips.get(i);
     if (skip) {
@@ -116,8 +120,9 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
       title="Bulk add comedians"
       description={
         <>
-          Paste one comedian per line as <code className="rounded bg-surface-2 px-1 text-fg">Name, email</code> or{' '}
-          <code className="rounded bg-surface-2 px-1 text-fg">Name &lt;email&gt;</code>. Rows with problems are skipped.
+          Paste one comedian per line as <code className="rounded bg-surface-2 px-1 text-fg">Name, email</code>, optionally
+          followed by phone and notes, or as <code className="rounded bg-surface-2 px-1 text-fg">Name &lt;email&gt;</code>.
+          Rows copied from a spreadsheet work too. Rows with problems are skipped.
         </>
       }
       size="lg"
@@ -127,7 +132,7 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
             {rows.length === 0
               ? 'Nothing pasted yet'
               : tooMany
-                ? `Too many rows — add at most ${BULK_ADD_MAX} at a time`
+                ? `Too many rows — add at most ${formatCount(BULK_ADD_MAX)} at a time`
                 : `${newCount} to add${skipCount ? ` · ${skipCount} skipped` : ''}`}
           </p>
           <Button variant="secondary" onClick={() => close(false)}>
@@ -176,7 +181,7 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
                       Name
                     </th>
                     <th scope="col" className="px-3 py-1.5 font-medium">
-                      Email
+                      Email{hasPhone || hasNote ? ` · ${[hasPhone && 'phone', hasNote && 'notes'].filter(Boolean).join(', ')}` : ''}
                     </th>
                     <th scope="col" className="px-3 py-1.5 font-medium">
                       Status
@@ -193,8 +198,13 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
                         <td className={cn('max-w-40 truncate px-3 py-1.5', !row.name && 'text-fg-subtle italic')}>
                           {row.name || 'no name'}
                         </td>
-                        <td className={cn('max-w-56 truncate px-3 py-1.5 text-fg-muted', !row.email && 'text-fg-subtle italic')}>
-                          {row.email || 'no email'}
+                        <td className="max-w-56 px-3 py-1.5 text-fg-muted">
+                          <span className={cn('block truncate', !row.email && 'text-fg-subtle italic')}>{row.email || 'no email'}</span>
+                          {(row.phone || row.note) && (
+                            <span className="block truncate text-xs text-fg-subtle" title={row.note || undefined}>
+                              {[row.phone, row.note].filter(Boolean).join(' · ')}
+                            </span>
+                          )}
                         </td>
                         <td className="px-3 py-1.5">
                           {status.kind === 'new' ? (
@@ -204,10 +214,10 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
                           ) : (
                             <span
                               className="inline-flex items-center gap-1 text-xs font-medium text-danger"
-                              title={status.detail}
+                              title={status.detail ?? BULK_SKIP_HINTS[status.reason]}
                             >
                               <CircleAlert className="size-3.5" aria-hidden />
-                              {status.reason === 'invalid_email' && !row.email ? 'Missing email' : BULK_SKIP_LABELS[status.reason]}
+                              {bulkSkipLabel(status.reason, row.email)}
                               {status.detail && <span className="font-normal text-fg-muted">· {status.detail}</span>}
                             </span>
                           )}
