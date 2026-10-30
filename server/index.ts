@@ -17,7 +17,8 @@ import { env, type HostedEnv } from './env';
 import { getSettings } from './lib/settings';
 import { createPlatform } from './platform';
 import { clubUrl } from './platform/hosts';
-import { startPlatformScheduler } from './platform/scheduler';
+import { nightlyBackupJob } from './platform/backups';
+import { DEFAULT_PLATFORM_JOBS, startPlatformScheduler } from './platform/scheduler';
 import { startScheduler } from './services/scheduler';
 
 /** In the bundle (dist/server/index.js) the built client sits at dist/client. */
@@ -86,12 +87,15 @@ function startHosted(hosted: HostedEnv): Running {
         `[server] Comedy Booking API listening on http://localhost:${port} (hosted mode: ${hosted.platformName})`,
         `[server] Platform site: ${hosted.platformUrl}   Clubs: ${clubUrl(hosted, '<slug>')}`,
         `[server] Data: ${env.platformDbFile}, ${env.clubsDir}/<id>.db (${clubs.length} clubs, ${active} active)`,
+        `[server] Nightly backups (03:30 UTC, 14 days): ${env.backupsDir}`,
         `[server] Sign-ups ${hosted.signupsOpen ? 'open' : 'closed'}; platform email ${
           env.smtp ? `via ${env.smtp.host}` : 'to the outbox (console + platform_email_log)'
         }`,
       ];
     },
-    stopScheduler: startPlatformScheduler(platform),
+    stopScheduler: startPlatformScheduler(platform, {
+      jobs: [...DEFAULT_PLATFORM_JOBS, nightlyBackupJob({ backupsDir: env.backupsDir })],
+    }),
     close: () => platform.close(),
   };
 }

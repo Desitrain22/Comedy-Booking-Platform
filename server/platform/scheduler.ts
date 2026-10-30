@@ -6,9 +6,10 @@
  *    day) and its own try/catch, so one club's failure never stops the others. Suspended and
  *    archived clubs are skipped: no email goes out for them.
  * 2. then runs the platform jobs, each in its own try/catch. Built in: a daily cleanup of
- *    stale sign-up handoffs. A later PR adds the nightly backup the same way:
+ *    stale sign-up handoffs and owner-console sessions/codes. server/index.ts adds the
+ *    nightly backup (./backups.ts) the same way:
  *
- *      startPlatformScheduler(platform, { jobs: [...DEFAULT_PLATFORM_JOBS, nightlyBackupJob] });
+ *      startPlatformScheduler(platform, { jobs: [...DEFAULT_PLATFORM_JOBS, nightlyBackupJob(…)] });
  *
  * A job decides for itself whether it is due (`platform_job_runs` holds idempotency keys such
  * as `backup:2026-11-02`, see claimPlatformJob).
@@ -22,6 +23,7 @@ import {
   type SchedulerState,
   type SchedulerTickResult,
 } from '../services/scheduler';
+import { deleteStaleAdminAuth } from './adminAuth';
 import { deleteStaleHandoffs } from './handoffs';
 import type { Platform } from './index';
 import { platformJobRuns } from './schema';
@@ -67,12 +69,16 @@ export function claimPlatformJob(platform: Platform, key: string, now = Date.now
   );
 }
 
-/** Daily (UTC): delete sign-up handoffs that expired or were used over a day ago. */
+/**
+ * Daily (UTC): delete sign-up handoffs that expired or were used over a day ago, and
+ * owner-console sessions and sign-in codes that are no longer any use.
+ */
 export const handoffCleanupJob: PlatformJob = {
   name: 'handoff-cleanup',
   run({ platform, now }) {
     if (!claimPlatformJob(platform, `handoff-cleanup:${todayInTz('UTC', now)}`, now.getTime())) return;
     deleteStaleHandoffs(platform.db, now.getTime());
+    deleteStaleAdminAuth(platform.db, now.getTime());
   },
 };
 

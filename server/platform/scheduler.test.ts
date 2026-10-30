@@ -13,7 +13,8 @@ import {
   startPlatformScheduler,
   type PlatformJob,
 } from './scheduler';
-import { handoffs, platformJobRuns } from './schema';
+import { createAdminSession, issueAdminCode } from './adminAuth';
+import { adminLoginCodes, adminSessions, handoffs, platformJobRuns } from './schema';
 
 /** Monday Nov 9 2026, 10 AM in New York: the default weekly send is due. */
 const MON_1000 = new Date('2026-11-09T15:00:00Z');
@@ -118,6 +119,18 @@ describe('multi-club scheduler', () => {
     // Once a day: a second run that day doesn't claim again.
     expect(claimPlatformJob(h.platform, 'handoff-cleanup:2026-11-09')).toBe(false);
     expect(handoffCleanupJob.name).toBe('handoff-cleanup');
+  });
+
+  it('cleans up expired owner-console sessions and dead sign-in codes in the same daily job', async () => {
+    const day = 24 * 60 * 60_000;
+    const now = MON_1000.getTime();
+    const live = createAdminSession(h.platform.db, 'owner@platform.test', now);
+    createAdminSession(h.platform.db, 'owner@platform.test', now - 8 * day); // 7-day session, expired
+    issueAdminCode(h.platform.db, 'owner@platform.test', now - 2 * day); // expired a day+ ago
+    issueAdminCode(h.platform.db, 'owner@platform.test', now); // still live
+    await runPlatformTick(h.platform, { now: MON_1000 });
+    expect(h.platform.db.select().from(adminSessions).all().map((r) => r.expiresAt)).toEqual([live.expiresAt]);
+    expect(h.platform.db.select().from(adminLoginCodes).all()).toHaveLength(1);
   });
 
   it('startPlatformScheduler ticks on an interval and stops', async () => {
