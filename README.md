@@ -5,8 +5,10 @@ shows on the calendar, ask your comedians which nights they're free, build each 
 lineups by drag and drop, and let weekly confirmation emails find out who's coming. It
 replaces the spreadsheet, the group chat and the "still on for Friday?" texts with one app.
 Bookers get a dashboard, and comedians get a phone-friendly portal with no password to
-remember. One deployment runs one club. It's a single Node process with a single SQLite
-file, and a guided setup gets a new club from nothing to its first month in a few minutes.
+remember. It's a single Node process with SQLite, and a guided setup gets a new club from
+nothing to its first month in a few minutes. Run it for **one club** on your own server, or
+in **hosted mode** for many clubs, each at its own address (`yourclub.yourdomain.com`),
+with self-serve sign-up and an owner console.
 
 ## Features
 
@@ -305,7 +307,14 @@ real environment variables win.
 | `APP_URL` | (none) | Base URL for email links when Settings → Club has none |
 | `TRUST_PROXY` | (none) | Number of reverse proxies in front of the app (usually `1`). See [Security](#security) |
 | `BCRYPT_ROUNDS` | `10` | Password hashing cost for booker accounts |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME`, `SMTP_REPLY_TO` | (none) | Fallback SMTP settings, used only when Settings → Email has no host |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM_EMAIL`, `SMTP_FROM_NAME`, `SMTP_REPLY_TO` | (none) | Fallback SMTP settings, used only when Settings → Email has no host. In hosted mode: the platform's sender |
+| `PLATFORM_URL` | (none) | Turns on [hosted mode](#hosted-mode-many-clubs), e.g. `https://yourdomain.com` |
+| `PLATFORM_NAME` | `Comedy Booking` | Hosted mode: the name on the platform site and its emails |
+| `PLATFORM_ADMIN_EMAILS` | (none) | Hosted mode: who can open the owner console (comma-separated); told about every new club |
+| `SUPPORT_EMAIL` | first admin email | Hosted mode: shown on "account paused" and "sign-ups closed" pages |
+| `APP_SECRET` | (none) | Encrypts saved mailbox passwords. Required in hosted mode in production; never change it once set |
+| `SIGNUPS` | `open` | Hosted mode: `closed` turns off new sign-ups |
+| `PLATFORM_DAILY_EMAIL_CAP` | `2000` | Hosted mode: emails per club per day through the platform's sender |
 
 ### Email
 
@@ -361,12 +370,38 @@ and the scheduler are single-node by design. The container has a health check on
 - **Render:** create a Web Service from the repo with the Docker runtime, add a persistent
   disk mounted at `/data` (this needs a paid instance), and set the health check path to
   `/api/health`.
-- **Fly.io:** run `fly launch` (it detects the Dockerfile), then
-  `fly volumes create data --size 1`, and add `[mounts] source = "data"`,
-  `destination = "/data"` to `fly.toml`. Keep one machine.
+- **Fly.io:** the repo's [`fly.toml`](fly.toml) is ready: `fly apps create <name>` (put the
+  name in `fly.toml`), `fly volumes create data --size 1 --region iad`, then `fly deploy`.
+  Keep one machine. [docs/DEPLOY.md](docs/DEPLOY.md) has the full walkthrough.
 - **Any VPS:** install Docker and run `docker compose up -d`. Compose publishes the port on
   `127.0.0.1` only, so put Caddy or nginx in front for TLS and set `TRUST_PROXY=1`. With Caddy:
   `booking.yourclub.com { reverse_proxy localhost:3000 }`.
+
+### Hosted mode (many clubs)
+
+Set `PLATFORM_URL` and one server runs any number of clubs:
+
+- `yourdomain.com` is the platform site: a landing page, **sign-up** (a booker picks their
+  club's address and lands in the setup guide, signed in), **find my club** (emails the
+  sign-in links for an address), and the **owner console** at `/admin` (sign in with an
+  emailed code; see every club, its bookers and usage; suspend, reactivate, archive,
+  restore, download a backup).
+- `<club>.yourdomain.com` is that club's app: everything in this README, with its own
+  bookers, comedians and settings. Each club's data is a separate SQLite file
+  (`$DATA_DIR/clubs/<id>.db`); the registry is `$DATA_DIR/platform.db`.
+- Email works out of the box through the platform's sender (`SMTP_*`): comedians see the
+  club's name, and replies go to the club's company email. A club can choose whether emails
+  come from the company or from each booker, and can connect its own mailbox instead.
+- Every night at 03:30 UTC the server copies every database to `$DATA_DIR/backups/<date>/`
+  and keeps 14 days.
+
+You need a domain whose root and `*` wildcard both point at the server, with a wildcard
+certificate. [docs/DEPLOY.md](docs/DEPLOY.md) walks through Fly.io, Cloudflare DNS and
+Resend step by step (about $5 a month to start).
+
+Try it locally: `PLATFORM_URL=http://localhost:5173 PLATFORM_ADMIN_EMAILS=you@example.com npm run dev`,
+then open <http://localhost:5173>. Clubs live at `http://<club>.localhost:5173` (Chrome and
+Firefox resolve `*.localhost` to your machine); emails print to the console.
 
 ## Security
 
@@ -423,6 +458,9 @@ docker compose exec app rm /data/backup.db
 
 To restore, stop the app, replace `club.db` in the volume with your backup (and delete any
 `club.db-wal` / `club.db-shm` next to it), then start the app again.
+
+In hosted mode the server also takes nightly copies of every club, and the owner console
+can download any club's database. Restoring is in [docs/DEPLOY.md](docs/DEPLOY.md#backups).
 
 ## Development
 
