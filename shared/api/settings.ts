@@ -23,6 +23,42 @@ import { emailSchema, passwordSchema, timeZoneSchema } from '../schemas';
 import { EMAIL_KINDS, EMAIL_STATUSES, ROLES, type EmailKind, type EmailStatus, type Role } from '../types';
 
 // ---------------------------------------------------------------------------
+// Who emails come from (hosted MVP spec §5)
+// ---------------------------------------------------------------------------
+
+/**
+ * `company`: every email comes from the company. `booker`: availability requests come from
+ * the booker who sent them, confirmations from the booker who booked every spot in them.
+ * Sign-in codes, magic links and invites always come from the company.
+ */
+export const SENDER_MODES = ['company', 'booker'] as const;
+export type SenderMode = (typeof SENDER_MODES)[number];
+
+/**
+ * How an email went out: the company's connected mailbox (Settings → Email), a booker's own
+ * mailbox (Settings → Account), the platform sender (hosted mode, or the server's SMTP_*
+ * variables) or the outbox (nothing configured).
+ */
+export const EMAIL_VIAS = ['company-mailbox', 'booker-mailbox', 'platform', 'outbox'] as const;
+export type EmailVia = (typeof EMAIL_VIAS)[number];
+
+export const EMAIL_VIA_LABELS: Record<EmailVia, string> = {
+  'company-mailbox': 'Company mailbox',
+  'booker-mailbox': "Booker's mailbox",
+  platform: 'Platform sender',
+  outbox: 'Outbox',
+};
+
+/** What comedians see on an email: `From: "<fromName>" <fromEmail>`, replies to `replyTo`. */
+export interface SenderPreview {
+  via: Exclude<EmailVia, 'outbox'>;
+  fromName: string;
+  fromEmail: string;
+  /** Where replies go: the Reply-To, or the From address when there is none. */
+  replyTo: string;
+}
+
+// ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
@@ -46,10 +82,17 @@ export interface SettingsDto {
   fromName: string;
   fromEmail: string;
   replyTo: string;
-  /** Some SMTP server is in effect (these settings or SMTP_* env vars). False → outbox. */
+  /**
+   * Some SMTP server is in effect for company emails (the company mailbox, SMTP_* env vars or
+   * the hosted platform sender). False → outbox.
+   */
   emailConfigured: boolean;
-  /** Where the SMTP config in effect comes from, or null in outbox mode. */
-  emailSource: 'settings' | 'env' | null;
+  /**
+   * Where the SMTP config in effect comes from, or null in outbox mode: `settings` = the
+   * company mailbox, `env` = SMTP_* env vars (single-club), `platform` = the hosted platform
+   * sender.
+   */
+  emailSource: 'settings' | 'env' | 'platform' | null;
   /** Host in effect, e.g. `smtp.gmail.com` (null in outbox mode). */
   emailHost: string | null;
   /** Formatted From header in effect, e.g. `"The Laugh Track" <booking@club.com>`. */

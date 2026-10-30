@@ -411,6 +411,9 @@ settingsRoutes.delete('/users/:id', requireAdmin, (c) => {
   }
   db.transaction((tx) => {
     deleteSessionsFor(tx, 'booker', target.id);
+    // Migration 0003 added email_log.sender_user_id without ON DELETE SET NULL, so the foreign
+    // key would refuse this delete: their logged emails become the company's instead.
+    tx.update(emailLog).set({ senderUserId: null }).where(eq(emailLog.senderUserId, target.id)).run();
     tx.delete(users).where(eq(users.id, target.id)).run();
   });
   return c.json({ ok: true } satisfies OkResponse);

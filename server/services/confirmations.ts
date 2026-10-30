@@ -10,9 +10,14 @@
  *
  * Declined spots (the comedian said "Can't make it"; only when settings.allowDeclines)
  * are left out entirely: never listed, never a reason to email, never re-stamped. When
- * declines are allowed each listed spot gets its own "Can't make it?" link. Reply-To falls
- * back to an admin's address when none is configured, so "reply to this email" reaches
- * a person.
+ * declines are allowed each listed spot gets its own "Can't make it?" link.
+ *
+ * Who it comes from (hosted MVP spec §5): the booker who booked *every* spot listed
+ * (`bookings.bookedById`, all equal and non-null) is passed as the sender, so with
+ * senderMode `booker` the email comes from them and replies go to them. Mixed bookers, a
+ * removed booker (bookedById set null) or an unknown one: the company. A company send's
+ * Reply-To falls back to an admin's address when no company email is configured, so
+ * "reply to this email" always reaches a person.
  *
  * The scheduler (./scheduler.ts) sends the weekly run and a daily catch-up of this week's
  * never-emailed bookings, both with `onlyUnsent`.
@@ -25,7 +30,7 @@ import { createConfirmLink } from '../auth/tokens';
 import type { Db, DbOrTx } from '../db/client';
 import { bookings, comedians, locations, shows } from '../db/schema';
 import { confirmationEmail, type ConfirmationSpot } from '../email/featureTemplates';
-import { replyToWithAdminFallback, sendEmail } from '../email/mailer';
+import { sendEmail } from '../email/mailer';
 import { getSettings } from '../lib/settings';
 import { EMAIL_CONCURRENCY, mapWithConcurrency } from './batch';
 
@@ -62,6 +67,8 @@ export interface WeekSpot extends ConfirmationSpot {
   bookingId: number;
   confirmedAt: number | null;
   confirmationSentAt: number | null;
+  /** The booker who booked it (null: unknown, or since removed). */
+  bookedById: number | null;
 }
 
 export interface ComedianWeekSpots {
@@ -99,6 +106,7 @@ export function weekSpotsByComedian(
       comedianId: bookings.comedianId,
       confirmedAt: bookings.confirmedAt,
       confirmationSentAt: bookings.confirmationSentAt,
+      bookedById: bookings.bookedById,
       date: shows.date,
       startMin: shows.startMin,
       showName: shows.name,
@@ -145,6 +153,7 @@ export function weekSpotsByComedian(
       bookingId: row.bookingId,
       confirmedAt: row.confirmedAt,
       confirmationSentAt: row.confirmationSentAt,
+      bookedById: row.bookedById,
       date: row.date,
       startMin: row.startMin,
       showName: row.showName,
@@ -201,6 +210,16 @@ export function weekPhrase(weekStart: string, today: string): string {
 // Sending
 // ---------------------------------------------------------------------------
 
+/**
+ * Who a confirmation listing these spots is from: the booker who booked every one of them,
+ * else null (the company) — two bookers sharing a comedian's week, or a removed booker.
+ */
+export function confirmationSenderId(spots: readonly Pick<WeekSpot, 'bookedById'>[]): number | null {
+  const first = spots[0]?.bookedById ?? null;
+  if (first == null) return null;
+  return spots.every((s) => s.bookedById === first) ? first : null;
+}
+
 async function deliver(
   db: Db,
   group: ComedianWeekSpots,
@@ -223,8 +242,9 @@ async function deliver(
     ...content,
     kind: 'confirmation',
     comedianId: group.comedianId,
-    // "Can't make one? Reply to this email" must reach a person even with no Reply-To set.
-    replyTo: replyToWithAdminFallback(db) || undefined,
+    senderUserId: confirmationSenderId(group.spots),
+    // "Can't make one? Reply to this email" must reach a person even with no company email.
+    replyToPerson: true,
   });
   if (result.status !== 'failed') {
     db.update(bookings)
