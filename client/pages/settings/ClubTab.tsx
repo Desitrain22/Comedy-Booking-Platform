@@ -1,4 +1,7 @@
-/** Settings → Club: name, timezone, app URL, all-night default range. */
+/**
+ * Settings → Club: name, timezone, app URL, all-night default range. On a hosted club the
+ * address is its subdomain and shown read-only.
+ */
 import { Lock } from 'lucide-react';
 import { useMemo, type FormEvent } from 'react';
 import { toast } from 'sonner';
@@ -7,6 +10,7 @@ import { AVAILABILITY_MAX_END, AVAILABILITY_MIN_START } from '../../../shared/av
 import { formatRange, nowMinutesInTz, timeOptions, todayInTz, formatDateMedium, formatTime } from '../../../shared/time';
 import { Button, Card, CardBody, CardHeader, Field, Input, PageSpinner, Select } from '../../components/ui';
 import { errorMessage } from '../../lib/api';
+import { useHost } from '../../lib/host';
 import { useBooker } from '../../lib/useMe';
 import { SaveFooter } from './SettingsParts';
 import { apiFieldErrors, pick, useDraft, useSaveSettings, useSettings, validateSettingsPatch } from './settingsData';
@@ -35,6 +39,8 @@ function timeZoneLabel(timeZone: string): string {
 function ClubForm({ saved, effectiveAppUrl }: { saved: ClubValues; effectiveAppUrl: string }) {
   // The app address starts every emailed link, so only admins may change it (the server enforces this too).
   const isAdmin = useBooker().role === 'admin';
+  // Hosted: the club's address is its subdomain, fixed at sign-up (the server refuses changes).
+  const hostedClub = useHost().mode === 'club';
   const { draft, set, errors, setErrors, reset, dirty } = useDraft<ClubValues>(saved);
   const save = useSaveSettings({ refreshClub: true });
   const browserOrigin = window.location.origin;
@@ -50,7 +56,7 @@ function ClubForm({ saved, effectiveAppUrl }: { saved: ClubValues; effectiveAppU
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     const { appUrl, ...rest } = draft;
-    const patch = isAdmin ? { ...rest, appUrl } : rest;
+    const patch = isAdmin && !hostedClub ? { ...rest, appUrl } : rest;
     const invalid = validateSettingsPatch(patch);
     if (invalid) return setErrors(invalid);
     // mutateAsync (not mutate callbacks): a successful save re-keys this form.
@@ -88,45 +94,60 @@ function ClubForm({ saved, effectiveAppUrl }: { saved: ClubValues; effectiveAppU
             </Select>
           </Field>
 
-          <Field
-            label="App address"
-            error={errors.appUrl}
-            className="sm:col-span-2"
-            hint={
-              isAdmin ? (
-                <>
-                  Links in emails (sign-in links, confirmations, invites) start with this — use the address people open
-                  this app at.
-                  {!draft.appUrl && ` Blank uses ${effectiveAppUrl}.`}
-                </>
-              ) : (
+          {hostedClub ? (
+            <Field
+              label="Club address"
+              className="sm:col-span-2"
+              hint={
                 <span className="inline-flex items-start gap-1.5">
                   <Lock aria-hidden className="mt-px size-3.5 shrink-0" />
-                  <span>
-                    Only admins can change the app address — links in emails start with it.
-                    {!draft.appUrl && ` Blank uses ${effectiveAppUrl}.`}
-                  </span>
+                  <span>Your club's own address. Links in emails start with it. It can't be changed.</span>
                 </span>
-              )
-            }
-            aside={
-              isAdmin && draft.appUrl !== browserOrigin ? (
-                <Button variant="link" className="text-xs" onClick={() => set('appUrl', browserOrigin)}>
-                  Use {browserOrigin}
-                </Button>
-              ) : undefined
-            }
-          >
-            <Input
-              type="url"
-              inputMode="url"
-              value={draft.appUrl}
-              placeholder={isAdmin ? 'https://booking.yourclub.com' : effectiveAppUrl}
-              onChange={(e) => set('appUrl', e.target.value)}
-              readOnly={!isAdmin}
-              className={isAdmin ? undefined : 'bg-surface-2/60 text-fg-muted'}
-            />
-          </Field>
+              }
+            >
+              <Input type="url" value={effectiveAppUrl} readOnly className="bg-surface-2/60 text-fg-muted" />
+            </Field>
+          ) : (
+            <Field
+              label="App address"
+              error={errors.appUrl}
+              className="sm:col-span-2"
+              hint={
+                isAdmin ? (
+                  <>
+                    Links in emails (sign-in links, confirmations, invites) start with this — use the address people open
+                    this app at.
+                    {!draft.appUrl && ` Blank uses ${effectiveAppUrl}.`}
+                  </>
+                ) : (
+                  <span className="inline-flex items-start gap-1.5">
+                    <Lock aria-hidden className="mt-px size-3.5 shrink-0" />
+                    <span>
+                      Only admins can change the app address — links in emails start with it.
+                      {!draft.appUrl && ` Blank uses ${effectiveAppUrl}.`}
+                    </span>
+                  </span>
+                )
+              }
+              aside={
+                isAdmin && draft.appUrl !== browserOrigin ? (
+                  <Button variant="link" className="text-xs" onClick={() => set('appUrl', browserOrigin)}>
+                    Use {browserOrigin}
+                  </Button>
+                ) : undefined
+              }
+            >
+              <Input
+                type="url"
+                inputMode="url"
+                value={draft.appUrl}
+                placeholder={isAdmin ? 'https://booking.yourclub.com' : effectiveAppUrl}
+                onChange={(e) => set('appUrl', e.target.value)}
+                readOnly={!isAdmin}
+                className={isAdmin ? undefined : 'bg-surface-2/60 text-fg-muted'}
+              />
+            </Field>
+          )}
 
           <fieldset className="space-y-1.5 sm:col-span-2">
             <legend className="text-[13px] font-medium text-fg">“All night” means</legend>

@@ -5,6 +5,7 @@ import type { ClubInfo } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
 import { settings, type Settings, type SettingsUpdate } from '../db/schema';
 import { env } from '../env';
+import { getClubHosting } from './hosting';
 
 export type { Settings, SettingsUpdate };
 
@@ -26,8 +27,15 @@ export function isSetupComplete(db: DbOrTx): boolean {
   return getSettings(db).setupComplete;
 }
 
-/** Base URL for links in emails: settings.appUrl → APP_URL env → http://localhost:$PORT. */
+/**
+ * Base URL for links in emails: in hosted mode the club's own address
+ * (`<protocol>//<slug>.<domain>`, server/lib/hosting.ts), whatever its settings say; else
+ * settings.appUrl → APP_URL env → http://localhost:$PORT. (A hosted club's transaction handle
+ * falls back to settings.appUrl, which sign-up sets to the same address.)
+ */
 export function getAppUrl(db: DbOrTx): string {
+  const hosted = getClubHosting(db);
+  if (hosted) return hosted.clubUrl;
   const fromSettings = getSettings(db).appUrl.trim();
   const base = fromSettings || env.appUrl || `http://localhost:${env.port}`;
   return base.replace(/\/+$/, '');

@@ -11,6 +11,7 @@
  *   POST /api/auth/comedian/verify-code     → comedian session
  *   POST /api/auth/comedian/logout          comedian sign out
  *   POST /api/auth/magic                    magic-link token → comedian session + redirectTo
+ *   POST /api/auth/handoff                  hosted mode, club host: sign-up handoff token → booker session
  *
  * Password and code sign-in are rate limited per IP, per account/email and IP (the hard lock,
  * so nobody can lock someone else out from their own address) and per account/email across
@@ -20,6 +21,7 @@
  */
 import { and, eq } from 'drizzle-orm';
 import { Hono } from 'hono';
+import { handoffSchema, type HandoffResponse } from '../../shared/api/platform';
 import { changePasswordSchema, type ChangePasswordResponse } from '../../shared/api/settings';
 import {
   acceptInviteSchema,
@@ -44,6 +46,7 @@ import { httpError, jsonError } from '../lib/http';
 import { accountIpKey, rateLimiter, tooManyRequests } from '../lib/rateLimit';
 import { getClubInfo, getSettings } from '../lib/settings';
 import { validate } from '../lib/validate';
+import { redeemHandoff } from '../platform/handoffs';
 
 export const authRoutes = new Hono<AppEnv>();
 
@@ -141,6 +144,35 @@ authRoutes.get('/auth/invite/:token', (c) => {
   const body: InviteInfo = { email: user.email, name: user.name, clubName: getSettings(db).clubName };
   return c.json(body);
 });
+
+/**
+ * Hosted mode: the new club's founder arrives from sign-up on the platform host with a
+ * one-time token (server/platform/handoffs.ts). It must be for this club, unused and less
+ * than 2 minutes old; it then works like a password sign-in. 404 outside a club host.
+ */
+authRoutes.post(
+  '/auth/handoff',
+  (c, next) => (c.var.platform && c.var.club ? next() : jsonError(c, 404, 'Not found', 'not_found')),
+  validate('json', handoffSchema),
+  (c) => {
+    const { platform, club } = c.var;
+    if (!platform || !club) return jsonError(c, 404, 'Not found', 'not_found');
+    const db = c.var.db;
+    const userId = redeemHandoff(platform.db, club.id, c.req.valid('json').token);
+    const user = userId == null ? undefined : db.select().from(users).where(eq(users.id, userId)).get();
+    if (!user || !user.passwordHash) {
+      const message = 'This sign-in link has expired. Sign in with your email and password.';
+      return jsonError(c, 400, message, 'invalid_handoff');
+    }
+    db.update(users).set({ lastLoginAt: Date.now() }).where(eq(users.id, user.id)).run();
+    signIn(c, db, 'booker', user.id);
+    const body: HandoffResponse = {
+      ok: true,
+      booker: { id: user.id, email: user.email, name: user.name, role: user.role },
+    };
+    return c.json(body);
+  },
+);
 
 authRoutes.post('/auth/accept-invite', validate('json', acceptInviteSchema), async (c) => {
   const db = c.var.db;

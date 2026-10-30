@@ -16,5 +16,8 @@ export default defineConfig({
     // createDb() resolves migrations relative to the bundle: dist/server/migrations.
     rmSync('dist/server/migrations', { recursive: true, force: true });
     cpSync('server/db/migrations', 'dist/server/migrations', { recursive: true });
+    // createPlatformDb() (hosted mode): dist/server/platform-migrations.
+    rmSync('dist/server/platform-migrations', { recursive: true, force: true });
+    cpSync('server/platform/migrations', 'dist/server/platform-migrations', { recursive: true });
   },
 });

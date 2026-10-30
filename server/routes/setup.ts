@@ -3,68 +3,24 @@
  *
  *   GET  /api/setup/status   { setupComplete }
  *   POST /api/setup          club + admin + first location → admin session
+ *
+ * The work itself is server/services/setup.ts (hosted sign-up runs it too).
  */
-import { eq } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { setupSchema } from '../../shared/schemas';
-import { hashPassword } from '../auth/password';
 import { signIn } from '../auth/sessions';
 import type { AppEnv } from '../context';
-import { locations, users } from '../db/schema';
-import { httpError, jsonError } from '../lib/http';
-import { getSettings, updateSettings } from '../lib/settings';
+import { getSettings } from '../lib/settings';
 import { validate } from '../lib/validate';
+import { setUpClub } from '../services/setup';
 
 export const setupRoutes = new Hono<AppEnv>();
 
 setupRoutes.get('/setup/status', (c) => c.json({ setupComplete: getSettings(c.var.db).setupComplete }));
 
-const ALREADY_SETUP = 'This club is already set up';
-
 setupRoutes.post('/setup', validate('json', setupSchema), async (c) => {
   const db = c.var.db;
-  if (getSettings(db).setupComplete) {
-    return jsonError(c, 409, ALREADY_SETUP, 'already_setup');
-  }
-  const input = c.req.valid('json');
-  const passwordHash = await hashPassword(input.admin.password);
-
-  const admin = db.transaction((tx) => {
-    // Check again inside the transaction: two requests can both pass the check above while
-    // hashing; only the first to get here creates the club (the other gets 409, nothing saved).
-    if (getSettings(tx).setupComplete) throw httpError(409, ALREADY_SETUP, 'already_setup');
-    updateSettings(tx, {
-      clubName: input.clubName,
-      timezone: input.timezone,
-      appUrl: input.appUrl,
-      setupComplete: true,
-    });
-    tx.insert(locations)
-      .values({ name: input.location.name, address: input.location.address, color: input.location.color, sortOrder: 0 })
-      .run();
-    // Re-running setup after a half-finished attempt reuses the same admin email.
-    const existing = tx.select().from(users).where(eq(users.email, input.admin.email)).get();
-    if (existing) {
-      return tx
-        .update(users)
-        .set({ name: input.admin.name, passwordHash, role: 'admin', lastLoginAt: Date.now() })
-        .where(eq(users.id, existing.id))
-        .returning()
-        .get();
-    }
-    return tx
-      .insert(users)
-      .values({
-        email: input.admin.email,
-        name: input.admin.name,
-        passwordHash,
-        role: 'admin',
-        lastLoginAt: Date.now(),
-      })
-      .returning()
-      .get();
-  });
-
+  const admin = await setUpClub(db, c.req.valid('json'));
   signIn(c, db, 'booker', admin.id);
   return c.json({ booker: { id: admin.id, email: admin.email, name: admin.name, role: admin.role } }, 201);
 });

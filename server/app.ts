@@ -1,6 +1,13 @@
 /**
- * The Hono app. `createApp({ db })` is used by the server (server/index.ts) and by tests
- * (server/test/helpers.ts → app.request(), no ports).
+ * The Hono app, in one of two modes:
+ *
+ * - **Single club** (the self-hosted install): `createApp({ db })`. Every request uses `db`.
+ * - **Hosted** (`PLATFORM_URL` set): `createApp({ platform })`. The request's host picks the
+ *   site (server/platform/tenancy.ts): `<domain>` serves the platform API, `<slug>.<domain>`
+ *   that club's database and every route below.
+ *
+ * Used by the server (server/index.ts) and by tests (server/test/helpers.ts and
+ * server/test/hosted.ts → app.request(), no ports).
  *
  * Every route module is a `new Hono<AppEnv>()` mounted at `/api`, defining full paths
  * after the prefix (`/shows`, `/days/:date`, …). Handlers read the DB from `c.var.db`.
@@ -14,18 +21,16 @@ import { logger } from 'hono/logger';
 import { secureHeaders } from 'hono/secure-headers';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import type { HostContext } from '../shared/api/platform';
 import { timingDummyHash } from './auth/password';
 import type { AppEnv } from './context';
 import type { Db } from './db/client';
-import { env } from './env';
 import { HttpError } from './lib/http';
-import {
-  DEFAULT_RATE_LIMITS,
-  RateLimiter,
-  scaleRateLimits,
-  setRateLimiter,
-  type RateLimitConfig,
-} from './lib/rateLimit';
+import { RateLimiter, setRateLimiter, type RateLimitConfig } from './lib/rateLimit';
+import { resolveRateLimits } from './lib/rateLimitConfig';
+import type { Platform } from './platform';
+import { platformRoutes } from './platform/routes';
+import { hostedTenancy } from './platform/tenancy';
 import { authRoutes } from './routes/auth';
 import { BULK_ADD_PATH, comediansRoutes } from './routes/comedians';
 import { dashboardRoutes } from './routes/dashboard';
@@ -37,18 +42,34 @@ import { settingsRoutes } from './routes/settings';
 import { setupRoutes } from './routes/setup';
 import { showsRoutes } from './routes/shows';
 
-export interface CreateAppOptions {
-  db: Db;
+interface CommonAppOptions {
   /** Serve the built SPA from this directory (production). Omit in dev/tests. */
   clientDir?: string;
   /** Log each request to the console. */
   logRequests?: boolean;
+}
+
+/** The self-hosted single club: one database for every request. */
+export interface SingleAppOptions extends CommonAppOptions {
+  db: Db;
+  platform?: undefined;
   /**
    * Sign-in rate limits (server/lib/rateLimit.ts). Default: the production limits, ×10 under
    * `npm run dev` so repeated e2e runs against one dev server never trip them.
    */
   rateLimits?: Partial<RateLimitConfig>;
 }
+
+/**
+ * Hosted mode: many clubs, picked by host name. Each club database's sign-in limits are set
+ * by the platform (`createPlatform({ clubRateLimits })`).
+ */
+export interface HostedAppOptions extends CommonAppOptions {
+  platform: Platform;
+  db?: undefined;
+}
+
+export type CreateAppOptions = SingleAppOptions | HostedAppOptions;
 
 /** Largest request body the API accepts (bulk-adding 500 comedians is well under this). */
 export const API_BODY_LIMIT_BYTES = 1024 * 1024;
@@ -87,11 +108,6 @@ function isJsonContentType(value: string): boolean {
   return type === 'application/json' || (type.startsWith('application/') && type.endsWith('+json'));
 }
 
-function resolveRateLimits(overrides: Partial<RateLimitConfig> = {}): RateLimitConfig {
-  const base = !env.isProduction && !env.isTest ? scaleRateLimits(DEFAULT_RATE_LIMITS, 10) : DEFAULT_RATE_LIMITS;
-  return { ...base, ...overrides };
-}
-
 /** Same-host check that ignores scheme (TLS is often terminated by a proxy). */
 function sameHost(origin: string, requestUrl: string): boolean {
   try {
@@ -101,18 +117,23 @@ function sameHost(origin: string, requestUrl: string): boolean {
   }
 }
 
-export function createApp({ db, clientDir, logRequests = false, rateLimits }: CreateAppOptions): Hono<AppEnv> {
+export function createApp(options: CreateAppOptions): Hono<AppEnv> {
+  const { clientDir, logRequests = false } = options;
+  const platform = options.platform ?? null;
   const app = new Hono<AppEnv>();
-  setRateLimiter(db, new RateLimiter(resolveRateLimits(rateLimits)));
+  if (options.db) setRateLimiter(options.db, new RateLimiter(resolveRateLimits(options.rateLimits)));
   // Hash the sign-in timing decoy now (with the configured bcrypt cost), not on the first login.
   void timingDummyHash();
 
   if (logRequests) app.use('/api/*', logger());
 
-  app.use('*', async (c, next) => {
-    c.set('db', db);
-    await next();
-  });
+  if (options.db) {
+    const db = options.db;
+    app.use('*', async (c, next) => {
+      c.set('db', db);
+      await next();
+    });
+  }
 
   app.use(
     '*',
@@ -152,7 +173,16 @@ export function createApp({ db, clientDir, logRequests = false, rateLimits }: Cr
     await next();
   });
 
+  // Hosted mode: which club (or the platform) this host is; sets c.var.db for a club, and
+  // answers /api/host itself.
+  if (platform) app.use('/api/*', hostedTenancy(platform));
+
   app.get('/api/health', (c) => c.json({ ok: true as const }));
+  if (!platform) app.get('/api/host', (c) => c.json({ mode: 'single' } satisfies HostContext));
+
+  // Hosted mode, platform host only (the tenancy middleware keeps club hosts out): sign-up
+  // and find my club. The owner console (hosted MVP PR 3) mounts its routes here too.
+  if (platform) app.route('/api', platformRoutes(platform));
 
   // Foundation
   app.route('/api', authRoutes);
