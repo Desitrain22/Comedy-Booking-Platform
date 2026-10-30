@@ -11,10 +11,15 @@
  *
  *   hostedMode({ dailyEmailCap: 3 });             // PLATFORM_URL set, platform sender, APP_SECRET
  *   const sent = captureMail();                   // every sendMail call, with the server it used
+ *   resolveSmtpHosts({ 'smtp.evil.test': ['127.0.0.1'] });  // what mailbox hosts resolve to
+ *
+ * In hosted mode mailbox hosts are resolved before sending (the SMTP host guard). Tests never
+ * touch real DNS: `hostedMode` resolves every host to PUBLIC_TEST_ADDRESS unless told otherwise.
  */
 import type { SendMailOptions } from 'nodemailer';
 import { env, type Env, type HostedEnv, type SmtpEnv } from '../env';
 import { setTransportFactory, type SmtpServer } from '../email/mailer';
+import { setSmtpHostLookup } from '../email/smtpHostGuard';
 
 type EmailEnv = Pick<Env, 'hosted' | 'smtp' | 'appSecret'>;
 
@@ -25,10 +30,26 @@ export function setEnv(patch: Partial<EmailEnv>): void {
   Object.assign(env, patch);
 }
 
-/** Put the env back as the process started, and the real SMTP transport. */
+/** Put the env back as the process started, with the real SMTP transport and DNS lookup. */
 export function restoreEnv(): void {
   Object.assign(env, original);
   setTransportFactory(null);
+  setSmtpHostLookup(null);
+}
+
+/** A public address (TEST-NET-3, documentation only) that mailbox hosts resolve to in tests. */
+export const PUBLIC_TEST_ADDRESS = '203.0.113.10';
+
+/**
+ * What SMTP hosts resolve to for the host guard: the listed hosts to their addresses, any
+ * other to PUBLIC_TEST_ADDRESS. A host mapped to [] doesn't resolve (ENOTFOUND).
+ */
+export function resolveSmtpHosts(addresses: Record<string, string[]> = {}): void {
+  setSmtpHostLookup(async (host) => {
+    const found = addresses[host] ?? [PUBLIC_TEST_ADDRESS];
+    if (found.length === 0) throw new Error(`getaddrinfo ENOTFOUND ${host}`);
+    return found.map((address) => ({ address, family: address.includes(':') ? 6 : 4 }));
+  });
 }
 
 /** The platform sender (`SMTP_*` env) used in tests. Its From name and Reply-To must never reach a club's emails. */
@@ -64,9 +85,13 @@ export function singleClubMode(patch: Partial<EmailEnv> = {}): void {
   setEnv({ hosted: null, smtp: null, appSecret: null, ...patch });
 }
 
-/** Hosted mode: PLATFORM_URL set, the platform sender configured, APP_SECRET set (plus `patch`). */
+/**
+ * Hosted mode: PLATFORM_URL set, the platform sender configured, APP_SECRET set (plus
+ * `patch`), and mailbox hosts resolving to a public address (see `resolveSmtpHosts`).
+ */
 export function hostedMode(hosted: Partial<HostedEnv> = {}, patch: Partial<EmailEnv> = {}): void {
   setEnv({ hosted: testHostedEnv(hosted), smtp: PLATFORM_SMTP, appSecret: TEST_APP_SECRET, ...patch });
+  resolveSmtpHosts();
 }
 
 export interface CapturedMail extends SendMailOptions {

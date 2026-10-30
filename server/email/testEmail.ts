@@ -17,6 +17,9 @@ export const TEST_EMAIL_TIMEOUT_MS = 25_000;
 export function smtpErrorHint(error: string, server: { host: string; port: number }): string {
   const host = server.host.toLowerCase();
   const where = `${server.host}:${server.port}`;
+  if (/private network address/i.test(error)) {
+    return `"${server.host}" points inside a private network, which isn't allowed here. Use your email provider's SMTP server, like smtp.gmail.com.`;
+  }
   if (/EAUTH|invalid login|535|534|username and password not accepted|authentication (failed|unsuccessful)|bad ?credentials|missing credentials/i.test(error)) {
     if (host.includes('gmail') || host.includes('google')) {
       return 'Gmail rejected the username or password. Gmail needs an App Password — your normal Google password won’t work. Turn on 2-Step Verification, create an App Password at myaccount.google.com/apppasswords, and paste the 16 letters as the password. The username is your full Gmail address.';

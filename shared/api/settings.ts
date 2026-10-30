@@ -3,13 +3,14 @@
  *
  *   GET  /api/settings                   SettingsDto (never the SMTP password)
  *   PUT  /api/settings                   UpdateSettingsInput (partial) → SettingsDto; changing an
- *                                        ADMIN_ONLY_SETTINGS field as a non-admin → 403 admin_only
+ *                                        ADMIN_ONLY_SETTINGS field as a non-admin → 403 admin_only.
+ *                                        Hosted mode: changing appUrl → 400 app_url_locked; an SMTP
+ *                                        host inside a private network → 400 smtp_host_not_allowed
  *   POST /api/settings/test-email        { to? } → TestEmailResponse | 502 email_failed | 504 email_timeout
  *                                        (non-admins: only to themselves, else 403 forbidden)
- *                                        Hosted mode: changing appUrl → 400 app_url_locked
  *   GET    /api/me/mailbox               MailboxDto (the signed-in booker's own mailbox; never the password)
  *   PUT    /api/me/mailbox               UpdateMailboxInput → MailboxDto (blank smtpPass keeps the saved one)
- *                                        | 400 from_email_required
+ *                                        | 400 from_email_required | 400 smtp_host_not_allowed (hosted)
  *   DELETE /api/me/mailbox               → MailboxDto (disconnected)
  *   POST   /api/me/mailbox/test          → TestEmailResponse (to yourself, through your mailbox)
  *                                        | 409 mailbox_not_connected | 502 email_failed | 504 email_timeout

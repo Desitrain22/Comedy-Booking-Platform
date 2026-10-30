@@ -5,8 +5,9 @@
  *   PUT  /api/settings                    any booker — partial update; blank smtpPass keeps it.
  *                                         Email settings, sender mode + app URL (ADMIN_ONLY_SETTINGS)
  *                                         are admin-only. Hosted mode: the app URL is locked
- *                                         (400 app_url_locked). Mailbox passwords are stored
- *                                         encrypted when APP_SECRET is set
+ *                                         (400 app_url_locked) and the SMTP host must be public
+ *                                         (400 smtp_host_not_allowed). Mailbox passwords are
+ *                                         stored encrypted when APP_SECRET is set
  *   POST /api/settings/test-email         any booker — sends the test template via sendEmail
  *                                         (non-admins only to their own address)
  *   /api/me/mailbox…                      each booker's own mailbox: ./mailbox.ts (mounted here)
@@ -55,6 +56,7 @@ import { testEmail } from '../email/templates';
 import { awaitTestEmail } from '../email/testEmail';
 import { env } from '../env';
 import { httpError, orNotFound, parseId } from '../lib/http';
+import { SMTP_HOST_NOT_ALLOWED_MESSAGE, smtpHostNotAllowed } from '../email/smtpHostGuard';
 import { encryptSecret } from '../lib/secrets';
 import { clubToday, getAppUrl, getSettings, updateSettings, type Settings, type SettingsUpdate } from '../lib/settings';
 import { validate } from '../lib/validate';
@@ -190,6 +192,11 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
     SMTP_CONNECTION_FIELDS.some((f) => patch[f] !== undefined && patch[f] !== current[f])
   ) {
     patch.smtpPass = '';
+  }
+
+  // Hosted mode: the company mailbox must be a public server, never inside our network.
+  if (env.hosted && patch.smtpHost && smtpHostNotAllowed(patch.smtpHost)) {
+    throw invalid('smtpHost', SMTP_HOST_NOT_ALLOWED_MESSAGE, 'smtp_host_not_allowed');
   }
 
   // Cross-field checks run against the merged result (the body may hold only one side).

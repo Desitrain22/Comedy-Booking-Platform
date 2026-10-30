@@ -8,7 +8,8 @@
  *   GET    /api/me/mailbox        MailboxDto
  *   PUT    /api/me/mailbox        UpdateMailboxInput → MailboxDto (blank smtpPass keeps the saved
  *                                 one unless the server, port, security or username changed)
- *                                 | 400 from_email_required
+ *                                 | 400 from_email_required | 400 smtp_host_not_allowed (hosted mode:
+ *                                 a local, internal or private-network server)
  *   DELETE /api/me/mailbox        → MailboxDto (disconnected)
  *   POST   /api/me/mailbox/test   → TestEmailResponse: the test email, to yourself, through your
  *                                 mailbox | 409 mailbox_not_connected | 502 email_failed | 504 email_timeout
@@ -29,7 +30,9 @@ import type { DbOrTx } from '../db/client';
 import { emailLog, users, type User } from '../db/schema';
 import { bookerMailbox, previewSender, sendEmail } from '../email/mailer';
 import { testEmail } from '../email/templates';
+import { SMTP_HOST_NOT_ALLOWED_MESSAGE, smtpHostNotAllowed } from '../email/smtpHostGuard';
 import { awaitTestEmail } from '../email/testEmail';
+import { env } from '../env';
 import { httpError, orNotFound } from '../lib/http';
 import { encryptSecret } from '../lib/secrets';
 import { getSettings } from '../lib/settings';
@@ -101,6 +104,12 @@ mailboxRoutes.put('/me/mailbox', requireBooker, validate('json', updateMailboxSc
   // A saved password only ever goes to the server it was entered for.
   else if (CONNECTION_FIELDS.some((f) => next[f] !== current[f])) next.smtpPass = '';
 
+  // Hosted mode: a public server only, never one inside our network.
+  if (env.hosted && smtpHostNotAllowed(next.smtpHost)) {
+    throw httpError(400, SMTP_HOST_NOT_ALLOWED_MESSAGE, 'smtp_host_not_allowed', {
+      issues: [{ path: 'smtpHost', message: SMTP_HOST_NOT_ALLOWED_MESSAGE }],
+    });
+  }
   if (!emailSchema.safeParse(next.smtpFromEmail || next.smtpUser).success) {
     throw httpError(
       400,

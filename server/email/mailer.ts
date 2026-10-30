@@ -21,7 +21,9 @@
  * don't count). In single-club mode the env sender is the club's own fallback and keeps its
  * original behaviour (SMTP_FROM_NAME / SMTP_REPLY_TO win, no cap).
  *
- * Mailbox passwords are stored encrypted when APP_SECRET is set (server/lib/secrets.ts).
+ * Mailbox passwords are stored encrypted when APP_SECRET is set (server/lib/secrets.ts). In
+ * hosted mode, mailboxes a club or booker connects must resolve to public addresses only
+ * (./smtpHostGuard.ts): checked before every send, and the connection goes to the vetted IP.
  */
 import { and, asc, count, eq, gte, isNotNull, lt } from 'drizzle-orm';
 import nodemailer, { type Transporter } from 'nodemailer';
@@ -33,6 +35,7 @@ import { emailLog, users, type Settings, type User } from '../db/schema';
 import { env } from '../env';
 import { decryptSecret } from '../lib/secrets';
 import { clubToday, getSettings } from '../lib/settings';
+import { vetSmtpHost } from './smtpHostGuard';
 
 export interface SendEmailInput {
   to: string;
@@ -72,6 +75,11 @@ export interface SmtpServer {
   secure: boolean;
   user: string;
   pass: string;
+  /**
+   * Connect to this IP instead of resolving `host` again (hosted mode: the address the host
+   * guard vetted). `host` still names the server for TLS (SNI and the certificate check).
+   */
+  address?: string;
 }
 
 /** The company's sender in effect: what sign-in codes, invites and company emails go out through. */
@@ -387,7 +395,8 @@ export const SMTP_TIMEOUTS = {
 /** nodemailer transport options for a server (exported for tests). */
 export function smtpTransportOptions(config: SmtpServer) {
   return {
-    host: config.host,
+    host: config.address ?? config.host,
+    ...(config.address ? { servername: config.host } : {}),
     port: config.port,
     secure: config.secure,
     auth: config.user ? { user: config.user, pass: config.pass } : undefined,
@@ -409,7 +418,7 @@ export function setTransportFactory(factory: TransportFactory | null): void {
 }
 
 function getTransport(config: SmtpServer) {
-  const key = JSON.stringify([config.host, config.port, config.secure, config.user, config.pass]);
+  const key = JSON.stringify([config.host, config.address, config.port, config.secure, config.user, config.pass]);
   let transport = transportCache.get(key);
   if (!transport) {
     transport = transportFactory(config);
@@ -482,6 +491,14 @@ export async function sendEmail(db: DbOrTx, input: SendEmailInput): Promise<Send
     return { id: record(db, input, sender, 'outbox'), status: 'outbox' };
   }
   if (sender.error) return failed(db, input, sender, sender.error);
+  let server = sender.server;
+  // Hosted mode: a mailbox someone connected must resolve to public addresses only (the
+  // platform's own sender is trusted). Refused hosts never get a connection.
+  if (env.hosted && (sender.via === 'company-mailbox' || sender.via === 'booker-mailbox')) {
+    const vetted = await vetSmtpHost(server.host);
+    if ('error' in vetted) return failed(db, input, sender, vetted.error);
+    server = { ...server, address: vetted.address };
+  }
   const isPlatform = sender.via === 'platform';
   if (isPlatform) {
     const capped = platformCapReached(db);
@@ -489,7 +506,7 @@ export async function sendEmail(db: DbOrTx, input: SendEmailInput): Promise<Send
     adjustInFlight(db, 1);
   }
   try {
-    await getTransport(sender.server).sendMail({
+    await getTransport(server).sendMail({
       from: sender.from || undefined,
       to: input.to,
       replyTo: input.replyTo || sender.replyTo || undefined,
