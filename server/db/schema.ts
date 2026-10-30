@@ -82,6 +82,10 @@ export const users = sqliteTable('users', {
   inviteExpiresAt: integer('invite_expires_at'),
   createdAt: createdAt(),
   lastLoginAt: integer('last_login_at'),
+  /** Setup guide / welcome tour: when this booker skipped it (null = not skipped). */
+  guideDismissedAt: integer('guide_dismissed_at'),
+  /** Setup guide / welcome tour: when this booker finished it (never auto-starts again). */
+  guideCompletedAt: integer('guide_completed_at'),
 });
 
 export const sessions = sqliteTable(
@@ -108,6 +112,8 @@ export const comedians = sqliteTable('comedians', {
   name: text('name').notNull(),
   bio: text('bio').notNull().default(''),
   headshotUrl: text('headshot_url').notNull().default(''),
+  /** Optional, stored as typed (never used for texting). */
+  phone: text('phone').notNull().default(''),
   archived: bool('archived').notNull().default(false),
   createdAt: createdAt(),
   updatedAt: integer('updated_at').notNull().$defaultFn(now).$onUpdateFn(now),
