@@ -2,6 +2,9 @@
  * Day data (`['days', date]`) and the lineup mutations, all optimistic:
  * the cache changes first, the request follows, and a failure rolls back.
  *
+ * Removing someone, or replacing them by dropping a pool comedian on their slot, toasts an
+ * Undo that re-creates the removed booking exactly (`restore`: confirmation included).
+ *
  * Several mutations can be in flight at once (fast drags). Each snapshots the cache; a
  * failure restores its snapshot only when it is the sole pending lineup mutation (otherwise
  * that would undo the others) and the day is refetched once the last one settles.
@@ -9,12 +12,16 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { useCallback, useMemo } from 'react';
 import { toast } from 'sonner';
-import type {
-  DayResponse,
-  LineupBooking,
-  MoveBookingResponse,
-  UnavailableConflict,
-  UnavailableErrorBody,
+import {
+  restoreOf,
+  type BookingRestore,
+  type CreateBookingResponse,
+  type DayResponse,
+  type DeleteBookingResponse,
+  type MoveBookingResponse,
+  type RemovedBooking,
+  type UnavailableConflict,
+  type UnavailableErrorBody,
 } from '../../../shared/api/lineup';
 import { isValidDate } from '../../../shared/time';
 import { api, errorMessage, isApiError } from '../../lib/api';
@@ -58,6 +65,10 @@ export interface BookVars {
   showId: number;
   position: number;
   force?: boolean;
+  /** Replace this booking if it holds the slot (it goes back to the pool). */
+  replaceBookingId?: number;
+  /** Undo: re-create a removed booking's state exactly. */
+  restore?: BookingRestore;
 }
 export interface MoveVars {
   bookingId: number;
@@ -112,13 +123,38 @@ export function useLineupActions(date: string, handlers: LineupHandlers) {
     toast.error(errorMessage(err));
   }
 
+  /** Put a removed booking back exactly where and how it was (replacing `replaceBookingId`). */
+  function undoRemoval(removed: RemovedBooking, replaceBookingId?: number) {
+    book.mutate({
+      comedianId: removed.comedianId,
+      showId: removed.showId,
+      position: removed.position,
+      force: true,
+      replaceBookingId,
+      restore: restoreOf(removed),
+      tempId: nextTempId(),
+    });
+  }
+
   const book = useMutation({
     mutationKey,
-    mutationFn: ({ force, ...vars }: BookVars & { tempId: number }) =>
-      api.post<LineupBooking>('/bookings', { comedianId: vars.comedianId, showId: vars.showId, position: vars.position, force }),
+    mutationFn: ({ tempId: _tempId, ...vars }: BookVars & { tempId: number }) =>
+      api.post<CreateBookingResponse>('/bookings', vars),
     onMutate: (vars) => begin((day) => applyBook(day, vars)),
-    onSuccess: (booking, vars) => {
-      queryClient.setQueryData<DayResponse>(key, (day) => (day ? replaceBooking(day, vars.tempId, booking) : day));
+    onSuccess: ({ replaced, ...booking }, vars) => {
+      queryClient.setQueryData<DayResponse>(key, (day) => {
+        if (!day) return day;
+        const next = replaceBooking(day, vars.tempId, booking);
+        return replaced ? removeBooking(next, replaced.id) : next;
+      });
+      // A pool comedian replaced someone: offer to put them back (not after an Undo itself).
+      const show = replaced && !vars.restore ? getDay() && indexDay(getDay()!).shows.get(replaced.showId) : undefined;
+      if (replaced && show) {
+        toast(`Replaced ${replaced.comedianName} with ${booking.comedianName} in the ${showTitle(show)}`, {
+          id: `replace-${replaced.id}`,
+          action: { label: 'Undo', onClick: () => undoRemoval(replaced, booking.id) },
+        });
+      }
     },
     onError: (err, vars, snapshot) => {
       rollback(snapshot);
@@ -147,29 +183,16 @@ export function useLineupActions(date: string, handlers: LineupHandlers) {
 
   const unbook = useMutation({
     mutationKey,
-    mutationFn: ({ bookingId }: { bookingId: number }) => api.del(`/bookings/${bookingId}`),
-    onMutate: async ({ bookingId }) => {
-      const removed = getDay() && indexDay(getDay()!).bookings.get(bookingId);
-      const snapshot = await begin((day) => removeBooking(day, bookingId));
-      return { ...snapshot, removed };
-    },
-    onSuccess: (_data, _vars, context) => {
-      const removed = context?.removed;
-      const show = removed && context.previous ? indexDay(context.previous).shows.get(removed.showId) : undefined;
-      if (!removed || !show) return;
+    mutationFn: ({ bookingId }: { bookingId: number }) => api.del<DeleteBookingResponse>(`/bookings/${bookingId}`),
+    onMutate: ({ bookingId }) => begin((day) => removeBooking(day, bookingId)),
+    onSuccess: ({ booking: removed }, _vars, context) => {
+      const day = context?.previous ?? getDay();
+      const show = day ? indexDay(day).shows.get(removed.showId) : undefined;
+      if (!show) return;
+      // The server's copy of what was removed, so Undo restores it exactly (confirmation too).
       toast(`Removed ${removed.comedianName} from the ${showTitle(show)}`, {
         id: `unbook-${removed.id}`,
-        action: {
-          label: 'Undo',
-          onClick: () =>
-            book.mutate({
-              comedianId: removed.comedianId,
-              showId: removed.showId,
-              position: removed.position,
-              force: true,
-              tempId: nextTempId(),
-            }),
-        },
+        action: { label: 'Undo', onClick: () => undoRemoval(removed) },
       });
     },
     onError: (err, _vars, snapshot) => {

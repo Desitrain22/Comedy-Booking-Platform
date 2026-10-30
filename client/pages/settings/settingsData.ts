@@ -27,7 +27,9 @@ export function useSettings() {
 
 /**
  * Save part of the settings. `refreshClub` re-reads `/auth/me` afterwards so the club
- * name, timezone and all-night range update across the app.
+ * name, timezone and all-night range update across the app (and the day boards, whose
+ * "today" follows the timezone). The dashboard always refreshes: it shows whether email is
+ * set up and when confirmations go out next.
  */
 export function useSaveSettings(options: { refreshClub?: boolean } = {}) {
   const queryClient = useQueryClient();
@@ -36,7 +38,11 @@ export function useSaveSettings(options: { refreshClub?: boolean } = {}) {
     mutationFn: (input: UpdateSettingsInput) => api.put<SettingsDto>('/settings', input),
     onSuccess: async (data) => {
       queryClient.setQueryData(SETTINGS_KEY, data);
-      if (options.refreshClub) await refreshMe();
+      void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+      if (options.refreshClub) {
+        void queryClient.invalidateQueries({ queryKey: ['days'] });
+        await refreshMe();
+      }
     },
     // Callers show field errors / toasts themselves.
     meta: { silent: true },

@@ -211,7 +211,11 @@ function SlotRow({ show, position, booking }: { show: DayShow; position: number;
           {position + 1}
         </span>
         {booking ? (
-          <BookingChip booking={booking} position={position} swapHint={plan?.kind === 'move'} />
+          <BookingChip
+            booking={booking}
+            position={position}
+            dropHint={plan?.kind === 'move' ? 'Swap' : plan?.kind === 'book' ? 'Replace' : null}
+          />
         ) : (
           <EmptySlot show={show} position={position} plan={plan} />
         )}
@@ -269,11 +273,12 @@ function firstName(name: string | undefined): string {
 function BookingChip({
   booking,
   position,
-  swapHint,
+  dropHint,
 }: {
   booking: LineupBooking;
   position: number;
-  swapHint: boolean;
+  /** What dropping the current drag here does to this chip. */
+  dropHint: 'Swap' | 'Replace' | null;
 }) {
   const board = useBoard();
   const pending = isTempId(booking.id);
@@ -325,9 +330,9 @@ function BookingChip({
           {booking.overrideUnavailable && (
             <TriangleAlert aria-hidden className="size-3.5 shrink-0 text-awaiting" strokeWidth={2.25} />
           )}
-          {swapHint && (
+          {dropHint && (
             <span className="ml-auto shrink-0 rounded bg-surface/80 px-1 text-[10px] font-semibold tracking-wide text-accent uppercase">
-              Swap
+              {dropHint}
             </span>
           )}
         </div>

@@ -4,7 +4,8 @@
  *   GET  /api/settings                    any booker — never returns the SMTP password
  *   PUT  /api/settings                    any booker — partial update; blank smtpPass keeps it
  *   POST /api/settings/test-email         any booker — sends the test template via sendEmail
- *   GET  /api/email-log, /email-log/:id   any booker — how dev users read outbox sign-in codes
+ *   GET  /api/email-log, /email-log/:id   admin — holds comedians' sign-in codes and links (how
+ *                                         dev users read the outbox)
  *   GET/POST /api/users, PATCH/DELETE /api/users/:id, POST /api/users/:id/resend-invite   admin
  *   GET  /api/backup                      admin — VACUUM INTO a temp file, streamed as a download
  */
@@ -133,8 +134,12 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
 // Test email
 // ---------------------------------------------------------------------------
 
-/** How long the test-email request waits for the SMTP server before giving up. */
-export const TEST_EMAIL_TIMEOUT_MS = 20_000;
+/**
+ * How long the test-email request waits for the SMTP server before giving up. A backstop:
+ * the transport's own timeouts (`SMTP_TIMEOUTS`, 10s connect + 10s greeting, 20s idle)
+ * normally fail first with a more specific error, which gets a hint like any other failure.
+ */
+export const TEST_EMAIL_TIMEOUT_MS = 25_000;
 
 /** A plain-language next step for a raw SMTP error message. */
 export function smtpErrorHint(error: string, server: { host: string; port: number }): string {
@@ -230,7 +235,8 @@ function likePattern(q: string): string {
   return `%${q.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`;
 }
 
-settingsRoutes.get('/email-log', requireBooker, validate('query', emailLogQuerySchema), (c) => {
+// Admin only: the log holds comedians' sign-in codes and magic links.
+settingsRoutes.get('/email-log', requireAdmin, validate('query', emailLogQuerySchema), (c) => {
   const { q, kind, status, limit } = c.req.valid('query');
   const conditions: (SQL | undefined)[] = [];
   if (q) {
@@ -249,7 +255,7 @@ settingsRoutes.get('/email-log', requireBooker, validate('query', emailLogQueryS
   return c.json(rows.map(toEmailLogItem));
 });
 
-settingsRoutes.get('/email-log/:id', requireBooker, (c) => {
+settingsRoutes.get('/email-log/:id', requireAdmin, (c) => {
   const id = parseId(c.req.param('id'));
   const row = orNotFound(c.var.db.select().from(emailLog).where(eq(emailLog.id, id)).get(), 'Email');
   return c.json({ ...toEmailLogItem(row), bodyHtml: row.bodyHtml, bodyText: row.bodyText } satisfies EmailLogDetail);

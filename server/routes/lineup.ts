@@ -3,9 +3,11 @@
  *
  *   GET    /api/days/:date              every scheduled show that day with its lineup, plus the
  *                                       comedian pool (tags, availability, bookings that day)
- *   POST   /api/bookings                book a comedian into an empty slot
+ *   POST   /api/bookings                book a comedian into an empty slot, or replace the
+ *                                       slot's occupant (`replaceBookingId`); `restore`
+ *                                       re-creates a removed booking exactly (Undo)
  *   PATCH  /api/bookings/:id            move (swap when the target slot is occupied)
- *   DELETE /api/bookings/:id            unbook
+ *   DELETE /api/bookings/:id            unbook; returns the removed booking (for Undo)
  *   POST   /api/bookings/:id/confirm    booker marks a booking confirmed (F5's dashboard too)
  *
  * Availability (spec §3, `isAvailableFor`) is checked when booking and when moving to a
@@ -21,19 +23,22 @@ import { z } from 'zod';
 import {
   createBookingSchema,
   moveBookingSchema,
+  type BookingRestore,
+  type CreateBookingResponse,
   type DayComedian,
+  type DeleteBookingResponse,
   type DayResponse,
   type DayShow,
   type LineupBooking,
   type LineupTag,
   type MoveBookingResponse,
+  type RemovedBooking,
   type UnavailableConflict,
 } from '../../shared/api/lineup';
 import { isAvailableFor, type AvailabilityRange } from '../../shared/availability';
 import { bookingStatus } from '../../shared/bookingStatus';
 import { dateSchema } from '../../shared/schemas';
 import { formatTime, monthOf } from '../../shared/time';
-import type { OkResponse } from '../../shared/types';
 import { requireBooker } from '../auth/middleware';
 import type { AppEnv } from '../context';
 import type { DbOrTx } from '../db/client';
@@ -46,6 +51,7 @@ import {
   locations,
   shows,
   tags,
+  users,
   type Booking,
   type Show,
 } from '../db/schema';
@@ -74,6 +80,43 @@ export function toLineupBooking(booking: Booking, comedianName: string, showDate
     confirmedAt: booking.confirmedAt,
     confirmedBy: booking.confirmedBy,
     confirmationSentAt: booking.confirmationSentAt,
+  };
+}
+
+/** A booking that is being removed, with what `restore` needs to re-create it. */
+function toRemovedBooking(booking: Booking, comedianName: string, showDate: string, today: string): RemovedBooking {
+  return {
+    ...toLineupBooking(booking, comedianName, showDate, today),
+    bookedById: booking.bookedById,
+    createdAt: booking.createdAt,
+  };
+}
+
+/** A restored booking's stored fields; refuses times in the future (a minute of clock slack). */
+function restoredFields(db: DbOrTx, restore: BookingRestore, conflict: UnavailableConflict | null) {
+  const latest = Date.now() + 60_000;
+  for (const key of ['confirmationSentAt', 'confirmedAt', 'createdAt'] as const) {
+    const value = restore[key];
+    if (value != null && value > latest) {
+      throw httpError(400, `restore.${key} is in the future`, 'validation_error', {
+        issues: [{ path: `restore.${key}`, message: 'Must not be in the future' }],
+      });
+    }
+  }
+  // Who booked it, unless that booker has since been removed (as the foreign key would do).
+  const bookedById =
+    restore.bookedById != null &&
+    db.select({ id: users.id }).from(users).where(eq(users.id, restore.bookedById)).get()
+      ? restore.bookedById
+      : null;
+  return {
+    // Exactly as it was — but never hide a conflict that exists now.
+    overrideUnavailable: restore.overrideUnavailable || conflict != null,
+    confirmationSentAt: restore.confirmationSentAt,
+    confirmedAt: restore.confirmedAt,
+    confirmedBy: restore.confirmedBy,
+    bookedById,
+    createdAt: restore.createdAt,
   };
 }
 
@@ -300,8 +343,9 @@ lineupRoutes.post('/bookings', requireBooker, validate('json', createBookingSche
   const db = c.var.db;
   const input = c.req.valid('json');
   const bookedById = c.var.booker.id;
+  const today = clubToday(db);
 
-  const id = db.transaction((tx) => {
+  const { id, replaced } = db.transaction((tx) => {
     const show = findShow(tx, input.showId);
     assertBookable(show);
     const comedian = orNotFound(
@@ -320,8 +364,9 @@ lineupRoutes.post('/bookings', requireBooker, validate('json', createBookingSche
     const existing = bookingOf(tx, show.id, comedian.id);
     if (existing) throw alreadyInShow(existing, comedian.name, show);
 
+    // Only the occupant the client meant to replace may be replaced (it may have changed since).
     const occupant = bookingAt(tx, show.id, input.position);
-    if (occupant) {
+    if (occupant && occupant.booking.id !== input.replaceBookingId) {
       throw httpError(409, `Slot ${input.position + 1} is taken by ${occupant.comedianName}`, 'slot_taken', {
         bookingId: occupant.booking.id,
         comedianId: occupant.booking.comedianId,
@@ -333,20 +378,25 @@ lineupRoutes.post('/bookings', requireBooker, validate('json', createBookingSche
     const conflict = availabilityConflict(tx, comedian, show);
     if (conflict && !input.force) throw unavailableError([conflict]);
 
-    return tx
+    const fields = input.restore
+      ? restoredFields(tx, input.restore, conflict)
+      : { overrideUnavailable: conflict != null, bookedById };
+
+    // The replaced comedian goes back to the pool.
+    if (occupant) tx.delete(bookings).where(eq(bookings.id, occupant.booking.id)).run();
+
+    const newId = tx
       .insert(bookings)
-      .values({
-        showId: show.id,
-        comedianId: comedian.id,
-        position: input.position,
-        overrideUnavailable: conflict != null,
-        bookedById,
-      })
+      .values({ showId: show.id, comedianId: comedian.id, position: input.position, ...fields })
       .returning({ id: bookings.id })
       .get().id;
+    return {
+      id: newId,
+      replaced: occupant ? toRemovedBooking(occupant.booking, occupant.comedianName, show.date, today) : null,
+    };
   });
 
-  return c.json(bookingDto(db, id, clubToday(db)) satisfies LineupBooking, 201);
+  return c.json({ ...bookingDto(db, id, today), replaced } satisfies CreateBookingResponse, 201);
 });
 
 // ---------------------------------------------------------------------------
@@ -425,9 +475,11 @@ lineupRoutes.patch('/bookings/:id', requireBooker, validate('json', moveBookingS
 lineupRoutes.delete('/bookings/:id', requireBooker, (c) => {
   const db = c.var.db;
   const id = parseId(c.req.param('id'));
-  const deleted = db.delete(bookings).where(eq(bookings.id, id)).returning({ id: bookings.id }).get();
-  orNotFound(deleted, 'Booking');
-  return c.json({ ok: true } satisfies OkResponse);
+  const row = orNotFound(findBooking(db, id), 'Booking');
+  db.delete(bookings).where(eq(bookings.id, id)).run();
+  // Everything Undo needs to put it back exactly (POST /bookings with `restore`).
+  const booking = toRemovedBooking(row.booking, row.comedianName, row.show.date, clubToday(db));
+  return c.json({ ok: true, booking } satisfies DeleteBookingResponse);
 });
 
 // ---------------------------------------------------------------------------

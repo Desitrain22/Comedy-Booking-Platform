@@ -81,6 +81,7 @@ describe('planDrop', () => {
       comedianId: 2,
       showId: 11,
       position: 1,
+      replacing: null,
       conflicts: [],
     });
   });
@@ -93,9 +94,27 @@ describe('planDrop', () => {
     });
   });
 
-  it('rejects occupied slots and duplicates from the pool', () => {
-    expect(planDrop(day, { kind: 'comedian', comedianId: 5 }, slot(10, 0))).toMatchObject({ kind: 'reject' });
+  it('replaces the occupant of a taken slot, still checking the newcomer’s availability', () => {
+    // Fay (available) onto Bo's slot.
+    expect(planDrop(day, { kind: 'comedian', comedianId: 6 }, slot(10, 2))).toMatchObject({
+      kind: 'book',
+      comedianId: 6,
+      showId: 10,
+      position: 2,
+      replacing: { id: 101, comedianName: 'Bo Diaz' },
+    });
+    // Eve hasn't submitted: replacing Ann still asks first.
+    const plan = planDrop(day, { kind: 'comedian', comedianId: 5 }, slot(10, 0));
+    expect(plan).toMatchObject({ kind: 'book', replacing: { id: 100 }, conflicts: [{ comedianId: 5, submittedMonth: false }] });
+    // An occupant that hasn't saved yet can't be replaced.
+    const pending = makeDay();
+    pending.shows[1]!.bookings.push(booking(-3, 11, 1, 2, 'Bo Diaz'));
+    expect(planDrop(pending, { kind: 'comedian', comedianId: 6 }, slot(11, 1))).toMatchObject({ kind: 'reject' });
+  });
+
+  it('rejects duplicates from the pool', () => {
     expect(planDrop(day, { kind: 'comedian', comedianId: 1 }, slot(10, 3))).toMatchObject({ kind: 'reject' });
+    expect(planDrop(day, { kind: 'comedian', comedianId: 2 }, slot(10, 0))).toMatchObject({ kind: 'reject' }); // Bo is in it
     expect(planDrop(day, { kind: 'comedian', comedianId: 1 }, slot(10, 0))).toEqual({ kind: 'none' });
     expect(planDrop(day, { kind: 'comedian', comedianId: 5 }, slot(10, 4))).toEqual({ kind: 'none' }); // past slotCount
   });
@@ -144,6 +163,33 @@ describe('optimistic transforms', () => {
     ]);
     expect(indexDay(next).bookings.get(-1)).toMatchObject({ comedianName: 'Dee Park', overrideUnavailable: true, status: 'not_sent' });
     expect(indexDay(next).bookingsByComedian.get(4)!.map((b) => b.showId)).toEqual([10, 12]);
+  });
+
+  it('applyBook replacing an occupant drops them; restore brings back the confirmation', () => {
+    const replaced = applyBook(makeDay(), { tempId: -2, comedianId: 6, showId: 10, position: 0, replaceBookingId: 100 });
+    expect(replaced.shows[0]!.bookings.map((b) => [b.id, b.comedianName])).toEqual([
+      [-2, 'Fay Wu'],
+      [101, 'Bo Diaz'],
+    ]);
+
+    const restore = {
+      overrideUnavailable: false,
+      confirmationSentAt: 1,
+      confirmedAt: 5,
+      confirmedBy: 'comedian' as const,
+      bookedById: 9,
+      createdAt: 0,
+    };
+    const undone = applyBook(replaced, { tempId: -3, comedianId: 1, showId: 10, position: 0, replaceBookingId: -2, restore });
+    expect(indexDay(undone).bookings.has(-2)).toBe(false);
+    expect(indexDay(undone).bookings.get(-3)).toMatchObject({
+      comedianName: 'Ann Lee',
+      status: 'confirmed',
+      confirmedAt: 5,
+      confirmedBy: 'comedian',
+      confirmationSentAt: 1,
+      overrideUnavailable: false,
+    });
   });
 
   it('applyMove within a show keeps confirmation; across shows resets it', () => {

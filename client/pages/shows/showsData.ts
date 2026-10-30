@@ -77,6 +77,7 @@ export function invalidateShowData(queryClient: QueryClient, deletedId?: number)
     }),
     queryClient.invalidateQueries({ queryKey: ['days'] }),
     queryClient.invalidateQueries({ queryKey: ['dashboard'] }),
+    queryClient.invalidateQueries({ queryKey: ['comedians'] }), // profiles' upcoming spots
   ]);
 }
 

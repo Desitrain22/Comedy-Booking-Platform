@@ -5,6 +5,7 @@
  *   weekday button, drag-paint "All night" across a week (a real finger drag on mobile,
  *   which must paint, not scroll), erase a night, Save, reload → it persisted.
  * - Confirm link: loading it changes nothing; "Confirm my spots" confirms + signs in.
+ * - Back/Forward with unsaved changes asks Save / Keep editing / Discard, like a link click.
  */
 import { expect, test, type Page } from '@playwright/test';
 import Database from 'better-sqlite3';
@@ -47,6 +48,20 @@ async function signInWithCode(page: Page, email: string) {
   await page.getByRole('button', { name: 'Send me a code' }).click();
   await expect(page.getByRole('heading', { name: 'Check your email' })).toBeVisible();
   await page.getByLabel('6-digit code').fill(await latestCode(email)); // submits at 6 digits
+}
+
+/** Insert a sign-in link token (what an availability-request email contains). */
+function createMagicToken(comedianEmail: string, redirectTo: string): string {
+  const token = randomBytes(32).toString('base64url');
+  withDb((db) => {
+    const comedian = db.prepare('SELECT id FROM comedians WHERE email = ?').get(comedianEmail) as { id: number };
+    const now = Date.now();
+    db.prepare(
+      `INSERT INTO tokens (token_hash, comedian_id, purpose, redirect_to, expires_at, created_at)
+       VALUES (?, ?, 'login', ?, ?, ?)`,
+    ).run(createHash('sha256').update(token).digest('hex'), comedian.id, redirectTo, now + 86_400_000, now);
+  });
+  return token;
 }
 
 const WEEKDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -176,4 +191,62 @@ test('a confirm link is read-only until "Confirm my spots"', async ({ page }) =>
 
   await page.reload();
   await expect(page.getByRole('heading', { name: "You're already confirmed" })).toBeVisible();
+});
+
+test('Back/Forward with unsaved changes asks first: keep editing, then discard', async ({ page }, testInfo) => {
+  const email = testInfo.project.name === 'mobile' ? 'devon@example.com' : 'priya@example.com';
+  await page.goto(`/portal/magic/${createMagicToken(email, '/portal/spots')}`);
+  await expect(page).toHaveURL(/\/portal\/spots$/);
+
+  // In-app history: My spots → Availability → next month.
+  await page.getByRole('navigation', { name: 'Portal' }).getByRole('link', { name: 'Availability' }).click();
+  const status = page.getByTestId('availability-status');
+  await expect(status).toBeVisible();
+  const start = page.url();
+  await page.getByRole('button', { name: /^Next month/ }).click();
+  await expect(page).not.toHaveURL(start);
+  await expect(status).toBeVisible();
+  const editing = page.url();
+
+  // An unsaved change (a range nobody in the seed uses).
+  await page.getByLabel('Free from').selectOption('990');
+  await page.getByLabel('Free until').selectOption('1050');
+  await page.getByRole('button', { name: 'Mark every Saturday' }).click();
+  await expect(status).toContainText('Unsaved changes');
+
+  const dialog = page.getByRole('dialog', { name: 'Save your availability?' });
+  await page.evaluate('history.back()');
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Keep editing' }).click();
+  await expect(dialog).toBeHidden();
+  await expect(page).toHaveURL(editing);
+  await expect(status).toContainText('Unsaved changes');
+
+  await page.evaluate('history.back()');
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Discard changes' }).click();
+  await expect(page).toHaveURL(start);
+
+  // Forward again: nothing unsaved now, so no question — and the change was discarded.
+  await page.evaluate('history.forward()');
+  await expect(page).toHaveURL(editing);
+  await expect(status).not.toContainText('Unsaved changes');
+  await expect(dialog).toBeHidden();
+
+  // Back again with a change: Save keeps it, then goes.
+  await page.getByRole('button', { name: 'Mark every Saturday' }).click();
+  await expect(status).toContainText('Unsaved changes');
+  await page.evaluate('history.back()');
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(page).toHaveURL(start);
+
+  // Forward with unsaved changes (on the first month) asks too.
+  await page.getByRole('button', { name: 'Mark every Saturday' }).click();
+  await expect(status).toContainText('Unsaved changes');
+  await page.evaluate('history.forward()');
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole('button', { name: 'Discard changes' }).click();
+  await expect(page).toHaveURL(editing);
+  await expect(status).toContainText('Saved'); // what Save stored above
 });

@@ -84,13 +84,32 @@ export function isEmailConfigured(db: DbOrTx): boolean {
 
 type TransportFactory = (config: MailConfig) => Pick<Transporter, 'sendMail'>;
 
-const defaultFactory: TransportFactory = (config) =>
-  nodemailer.createTransport({
+/**
+ * SMTP timeouts (ms). nodemailer's defaults wait up to 2 minutes to connect, so one wrong
+ * host would stall a whole weekly confirmation run; these fail each message fast instead.
+ * The test-email route (server/routes/settings.ts) races its own longer timeout on top.
+ */
+export const SMTP_TIMEOUTS = {
+  /** Opening the TCP/TLS connection. */
+  connectionTimeout: 10_000,
+  /** Waiting for the server's greeting once connected. */
+  greetingTimeout: 10_000,
+  /** Silence on an open connection. */
+  socketTimeout: 20_000,
+} as const;
+
+/** nodemailer transport options for a config (exported for tests). */
+export function smtpTransportOptions(config: MailConfig) {
+  return {
     host: config.host,
     port: config.port,
     secure: config.secure,
     auth: config.user ? { user: config.user, pass: config.pass } : undefined,
-  });
+    ...SMTP_TIMEOUTS,
+  };
+}
+
+const defaultFactory: TransportFactory = (config) => nodemailer.createTransport(smtpTransportOptions(config));
 
 let transportFactory: TransportFactory = defaultFactory;
 const transportCache = new Map<string, Pick<Transporter, 'sendMail'>>();

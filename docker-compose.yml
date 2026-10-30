@@ -13,7 +13,7 @@ services:
       # this is only a fallback (e.g. https://booking.yourclub.com).
       APP_URL: ${APP_URL:-}
       # Optional SMTP fallback. Settings → Email in the app takes precedence.
-      # With neither, emails land in the outbox (Settings → Email log, and the container log).
+      # With neither, emails land in the outbox (Settings → Email log for admins, and the container log).
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-}
       SMTP_SECURE: ${SMTP_SECURE:-}

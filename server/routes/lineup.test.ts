@@ -1,13 +1,16 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type {
-  DayResponse,
-  LineupBooking,
-  MoveBookingResponse,
-  UnavailableErrorBody,
+import {
+  restoreOf,
+  type CreateBookingResponse,
+  type DayResponse,
+  type DeleteBookingResponse,
+  type LineupBooking,
+  type MoveBookingResponse,
+  type UnavailableErrorBody,
 } from '../../shared/api/lineup';
 import type { ApiErrorBody } from '../../shared/types';
-import { bookings, shows } from '../db/schema';
+import { bookings, shows, users } from '../db/schema';
 import { clubToday } from '../lib/settings';
 import {
   createAvailability,
@@ -17,6 +20,7 @@ import {
   createShow,
   createSubmission,
   createTag,
+  createUser,
   loginAsBooker,
   loginAsComedian,
   makeTestApp,
@@ -49,7 +53,12 @@ function bookingRow(id: number) {
 
 async function book(json: Record<string, unknown>) {
   const res = await t.request('/api/bookings', { method: 'POST', headers, json });
-  return { status: res.status, body: await readJson<LineupBooking & ApiErrorBody>(res) };
+  return { status: res.status, body: await readJson<CreateBookingResponse & ApiErrorBody>(res) };
+}
+
+async function unbook(id: number) {
+  const res = await t.request(`/api/bookings/${id}`, { method: 'DELETE', headers });
+  return { status: res.status, body: await readJson<DeleteBookingResponse & ApiErrorBody>(res) };
 }
 
 async function move(id: number, json: Record<string, unknown>) {
@@ -504,15 +513,211 @@ describe('PATCH /api/bookings/:id', () => {
 // ---------------------------------------------------------------------------
 
 describe('DELETE /api/bookings/:id', () => {
-  it('unbooks', async () => {
+  it('unbooks and returns the removed booking in full', async () => {
     const show = createShow(t.db, { date: DATE });
-    const b = createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id });
+    const comic = createComedian(t.db, { name: 'Maria Delgado' });
+    const b = createBooking(t.db, {
+      showId: show.id,
+      comedianId: comic.id,
+      position: 2,
+      overrideUnavailable: true,
+      bookedById: bookerId,
+      confirmationSentAt: 1_000,
+      confirmedAt: 2_000,
+      confirmedBy: 'comedian',
+    });
     const res = await t.request(`/api/bookings/${b.id}`, { method: 'DELETE', headers });
     expect(res.status).toBe(200);
-    expect(await readJson(res)).toEqual({ ok: true });
+    expect(await readJson(res)).toEqual({
+      ok: true,
+      booking: {
+        id: b.id,
+        showId: show.id,
+        position: 2,
+        comedianId: comic.id,
+        comedianName: 'Maria Delgado',
+        status: 'confirmed',
+        overrideUnavailable: true,
+        confirmationSentAt: 1_000,
+        confirmedAt: 2_000,
+        confirmedBy: 'comedian',
+        bookedById: bookerId,
+        createdAt: b.createdAt,
+      },
+    });
     expect(bookingRow(b.id)).toBeUndefined();
     expect((await t.request(`/api/bookings/${b.id}`, { method: 'DELETE', headers })).status).toBe(404);
     expect((await t.request('/api/bookings/abc', { method: 'DELETE', headers })).status).toBe(400);
+  });
+});
+
+describe('Undo: restoring a removed booking', () => {
+  it('re-creates a removed booking exactly: confirmation, override, who booked it and when', async () => {
+    const show = createShow(t.db, { date: DATE, startMin: 1380 });
+    const comic = createComedian(t.db); // never marked available → needs force
+    const otherBooker = createUser(t.db);
+    const original = createBooking(t.db, {
+      showId: show.id,
+      comedianId: comic.id,
+      position: 3,
+      overrideUnavailable: true,
+      bookedById: otherBooker.id,
+      confirmationSentAt: 1_000,
+      confirmedAt: 2_000,
+      confirmedBy: 'comedian',
+      createdAt: 500,
+    });
+    const { body: removed } = await unbook(original.id);
+
+    // Without force it still asks (they aren't available).
+    const asked = await book({ showId: show.id, position: 3, comedianId: comic.id, restore: restoreOf(removed.booking) });
+    expect(asked.body.code).toBe('unavailable');
+
+    const res = await book({ showId: show.id, position: 3, comedianId: comic.id, force: true, restore: restoreOf(removed.booking) });
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      showId: show.id,
+      position: 3,
+      comedianId: comic.id,
+      status: 'confirmed',
+      overrideUnavailable: true,
+      confirmationSentAt: 1_000,
+      confirmedAt: 2_000,
+      confirmedBy: 'comedian',
+      replaced: null,
+    });
+    const { id: _oldId, ...originalFields } = original;
+    const { id: _newId, ...restoredFields } = bookingRow(res.body.id)!;
+    expect(restoredFields).toEqual(originalFields);
+  });
+
+  it('keeps the original booker only while they still exist', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const comic = availableComic();
+    const gone = createUser(t.db);
+    const b = createBooking(t.db, { showId: show.id, comedianId: comic.id, bookedById: gone.id });
+    const { body } = await unbook(b.id);
+    t.db.delete(users).where(eq(users.id, gone.id)).run();
+    const res = await book({ showId: show.id, position: b.position, comedianId: comic.id, restore: restoreOf(body.booking) });
+    expect(res.status).toBe(201);
+    expect(bookingRow(res.body.id)?.bookedById).toBeNull();
+  });
+
+  it('validates the restore object', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const comic = availableComic();
+    const valid = {
+      overrideUnavailable: false,
+      confirmationSentAt: null,
+      confirmedAt: null,
+      confirmedBy: null,
+      bookedById: bookerId,
+      createdAt: 1_000,
+    };
+    for (const restore of [
+      { ...valid, confirmedAt: 5 }, // confirmedAt without confirmedBy
+      { ...valid, confirmedBy: 'booker' }, // and the other way round
+      { ...valid, confirmedBy: 'someone', confirmedAt: 5 },
+      { ...valid, createdAt: -1 },
+      { ...valid, createdAt: Date.now() + 86_400_000 }, // in the future
+      { ...valid, confirmedAt: Date.now() + 86_400_000, confirmedBy: 'booker' },
+      { overrideUnavailable: false },
+    ]) {
+      const res = await book({ showId: show.id, position: 0, comedianId: comic.id, restore });
+      expect(res.status, JSON.stringify(restore)).toBe(400);
+      expect(res.body.code).toBe('validation_error');
+    }
+    expect(t.db.select().from(bookings).all()).toHaveLength(0);
+    expect((await book({ showId: show.id, position: 0, comedianId: comic.id, restore: valid })).status).toBe(201);
+  });
+});
+
+describe('Replacing a slot’s occupant from the pool', () => {
+  it('replaceBookingId books into an occupied slot; the occupant goes back to the pool', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const occupant = availableComic(DATE, 'Maria Delgado');
+    const taken = createBooking(t.db, {
+      showId: show.id,
+      comedianId: occupant.id,
+      position: 1,
+      confirmationSentAt: 1_000,
+      confirmedAt: 2_000,
+      confirmedBy: 'booker',
+    });
+    const incoming = availableComic(DATE, 'Jason Park');
+
+    const res = await book({ showId: show.id, position: 1, comedianId: incoming.id, replaceBookingId: taken.id });
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({
+      showId: show.id,
+      position: 1,
+      comedianId: incoming.id,
+      confirmedAt: null,
+      replaced: {
+        id: taken.id,
+        comedianId: occupant.id,
+        comedianName: 'Maria Delgado',
+        position: 1,
+        confirmedAt: 2_000,
+        confirmedBy: 'booker',
+        confirmationSentAt: 1_000,
+        createdAt: taken.createdAt,
+      },
+    });
+    expect(bookingRow(taken.id)).toBeUndefined();
+    const day = await getDay();
+    expect(day.shows[0]!.bookings.map((b) => b.comedianName)).toEqual(['Jason Park']);
+    expect(day.comedians.find((c) => c.id === occupant.id)?.bookings).toEqual([]);
+
+    // Undo: put the occupant back exactly, replacing the newcomer.
+    const undo = await book({
+      showId: show.id,
+      position: 1,
+      comedianId: occupant.id,
+      force: true,
+      replaceBookingId: res.body.id,
+      restore: restoreOf(res.body.replaced!),
+    });
+    expect(undo.status).toBe(201);
+    expect(undo.body).toMatchObject({ comedianId: occupant.id, status: 'confirmed', confirmedAt: 2_000, confirmedBy: 'booker' });
+    expect(undo.body.replaced).toMatchObject({ id: res.body.id, comedianId: incoming.id });
+    const { id: _a, ...before } = taken;
+    const { id: _b, ...after } = bookingRow(undo.body.id)!;
+    expect(after).toEqual(before);
+    expect(bookingRow(res.body.id)).toBeUndefined();
+  });
+
+  it('still asks about an unavailable newcomer, leaving the occupant in place', async () => {
+    const show = createShow(t.db, { date: DATE, startMin: 1380 });
+    const taken = createBooking(t.db, { showId: show.id, comedianId: availableComic().id, position: 0 });
+    const notMarked = createComedian(t.db, { name: 'Omar Haddad' });
+
+    const asked = await book({ showId: show.id, position: 0, comedianId: notMarked.id, replaceBookingId: taken.id });
+    expect(asked.status).toBe(409);
+    expect(asked.body).toMatchObject({ code: 'unavailable', comedianId: notMarked.id });
+    expect(bookingRow(taken.id)).toBeDefined();
+
+    const forced = await book({ showId: show.id, position: 0, comedianId: notMarked.id, replaceBookingId: taken.id, force: true });
+    expect(forced.status).toBe(201);
+    expect(forced.body).toMatchObject({ overrideUnavailable: true, replaced: { id: taken.id } });
+  });
+
+  it('409 slot_taken when someone else holds the slot now; an emptied slot just books', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const first = createBooking(t.db, { showId: show.id, comedianId: availableComic().id, position: 0 });
+    const other = createBooking(t.db, { showId: show.id, comedianId: availableComic().id, position: 1 });
+    const incoming = availableComic();
+
+    const wrong = await book({ showId: show.id, position: 0, comedianId: incoming.id, replaceBookingId: other.id });
+    expect(wrong.status).toBe(409);
+    expect(wrong.body).toMatchObject({ code: 'slot_taken', bookingId: first.id });
+    expect(bookingRow(other.id)).toBeDefined();
+
+    await unbook(first.id);
+    const empty = await book({ showId: show.id, position: 0, comedianId: incoming.id, replaceBookingId: first.id });
+    expect(empty.status).toBe(201);
+    expect(empty.body.replaced).toBeNull();
+    expect(bookingRow(other.id)).toBeDefined();
   });
 });
 

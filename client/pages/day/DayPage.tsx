@@ -2,8 +2,9 @@
  * /app/day/:date — the lineup board (spec §6 F2). Every scheduled show that night, grouped by
  * location then time, with numbered slots; the comedian pool on the right.
  *
- * Drag a comedian from the pool into an empty slot to book; drag a chip to another slot to
- * move (onto an occupied slot to swap); drag it back to the pool or click × to unbook. Or
+ * Drag a comedian from the pool into an empty slot to book (onto a booked slot to replace
+ * that comedian, with Undo); drag a chip to another slot to move (onto an occupied slot to
+ * swap); drag it back to the pool or click × to unbook (with Undo). Or
  * click to select, then click where it goes (keyboard / touch fallback). Booking someone who
  * isn't available asks first ("Book anyway?"). Every change is optimistic and persists
  * immediately.
@@ -168,7 +169,13 @@ function DayBoard({ date }: { date: string }) {
         case 'move': {
           const run = (force: boolean) =>
             plan.kind === 'book'
-              ? actions.book({ comedianId: plan.comedianId, showId: plan.showId, position: plan.position, force })
+              ? actions.book({
+                  comedianId: plan.comedianId,
+                  showId: plan.showId,
+                  position: plan.position,
+                  replaceBookingId: plan.replacing?.id,
+                  force,
+                })
               : actions.move({ bookingId: plan.bookingId, showId: plan.showId, position: plan.position, force });
           if (plan.conflicts.length) setPending({ conflicts: plan.conflicts, confirm: () => run(true) });
           else run(false);

@@ -4,9 +4,10 @@
  * - Closing/reloading the tab or following an external link: the browser's native
  *   "Leave site?" prompt (beforeunload).
  * - In-app navigation (the portal tabs, any same-origin link) and the layout's Sign out
- *   button: intercepted before React Router sees the click, and a dialog offers
- *   Save / Keep editing / Discard. The app uses a declarative <BrowserRouter>, so
- *   react-router's useBlocker isn't available; a capture-phase click listener is.
+ *   button: intercepted before React Router sees the click (a capture-phase click
+ *   listener), and a dialog offers Save / Keep editing / Discard.
+ * - Browser Back/Forward and programmatic navigation: react-router's `useBlocker` (the app
+ *   runs on a data router) stops it and shows the same dialog; Discard/Save carry on.
  * - In-page actions (e.g. switching months): call `confirmLeave(action)`.
  *
  *   const guard = useUnsavedChangesGuard({ dirty, onSave: save });
@@ -14,6 +15,7 @@
  *   {guard.dialog}
  */
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useBlocker, type BlockerFunction } from 'react-router';
 import { Button, Dialog } from '../../components/ui';
 import { errorMessage } from '../../lib/api';
 
@@ -61,6 +63,25 @@ export function useUnsavedChangesGuard({
   const [error, setError] = useState<string | null>(null);
   /** Set while replaying an intercepted click, and once the user chose to leave. */
   const bypass = useRef(false);
+  const dirtyRef = useRef(dirty);
+  dirtyRef.current = dirty;
+
+  // Back/Forward (and navigations the click listener didn't see) to another page or month.
+  const shouldBlock = useCallback<BlockerFunction>(
+    ({ currentLocation, nextLocation }) =>
+      dirtyRef.current &&
+      !bypass.current &&
+      (currentLocation.pathname !== nextLocation.pathname || currentLocation.search !== nextLocation.search),
+    [],
+  );
+  const blocker = useBlocker(shouldBlock);
+  const blockerRef = useRef(blocker);
+  blockerRef.current = blocker;
+  useEffect(() => {
+    if (blocker.state !== 'blocked') return;
+    setError(null);
+    setPending(() => () => blocker.proceed());
+  }, [blocker]);
 
   useEffect(() => {
     if (!dirty) return;
@@ -106,12 +127,16 @@ export function useUnsavedChangesGuard({
   );
 
   function close() {
-    if (!saving) setPending(null);
+    if (saving) return;
+    setPending(null);
+    // "Keep editing" after Back/Forward: stay here (the URL is already restored).
+    if (blockerRef.current.state === 'blocked') blockerRef.current.reset();
   }
 
   function discard() {
     const action = pending;
     setPending(null);
+    bypass.current = true; // the user chose to leave: don't ask again on the way out
     action?.();
   }
 
@@ -122,6 +147,7 @@ export function useUnsavedChangesGuard({
     try {
       await onSave();
       setPending(null);
+      bypass.current = true;
       action?.();
     } catch (err) {
       setError(errorMessage(err));

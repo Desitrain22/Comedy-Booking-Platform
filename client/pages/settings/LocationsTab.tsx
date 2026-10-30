@@ -32,8 +32,17 @@ export function LocationsTab() {
   const [archiving, setArchiving] = useState<Location | null>(null);
   const [showArchived, setShowArchived] = useState(false);
 
-  /** Refresh every locations query (calendar filters, create-shows form, …). */
-  const invalidate = () => queryClient.invalidateQueries({ queryKey: ['locations'] });
+  /**
+   * Refresh every locations query (calendar filters, create-shows form, …) and the screens
+   * that show a location's name, color or order: calendar pills, day board, dashboard,
+   * comedian profiles' upcoming spots.
+   */
+  const invalidate = () =>
+    Promise.all(
+      ['locations', 'shows', 'days', 'dashboard', 'comedians'].map((key) =>
+        queryClient.invalidateQueries({ queryKey: [key] }),
+      ),
+    );
 
   const reorder = useMutation({
     mutationFn: (ids: number[]) => api.post<Location[]>('/locations/reorder', { ids }),

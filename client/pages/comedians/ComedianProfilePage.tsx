@@ -28,6 +28,7 @@ import {
 } from '../../components/ui';
 import { api, errorMessage, isApiError } from '../../lib/api';
 import { usePageTitle } from '../../lib/usePageTitle';
+import { useBooker } from '../../lib/useMe';
 import { AvailabilityCard } from './AvailabilityCard';
 import { EditComedianDialog } from './EditComedianDialog';
 import { NotesPanel } from './NotesPanel';
@@ -69,6 +70,7 @@ function NotFound() {
 function Profile({ comedian }: { comedian: ComedianDetail }) {
   usePageTitle(comedian.name);
   const queryClient = useQueryClient();
+  const isAdmin = useBooker().role === 'admin';
   const [editOpen, setEditOpen] = useState(false);
   const [confirmArchive, setConfirmArchive] = useState(false);
 
@@ -78,7 +80,8 @@ function Profile({ comedian }: { comedian: ComedianDetail }) {
       if (res.status === 'sent') toast.success(`Sign-in link sent to ${comedian.email}`);
       else if (res.status === 'outbox') {
         toast.info('Email isn’t set up yet, so the link went to the outbox', {
-          description: 'Find it under Settings → Email log.',
+          // The email log is admin-only (it holds sign-in codes and links).
+          description: isAdmin ? 'Find it under Settings → Email log.' : 'An admin can find it under Settings → Email log.',
         });
       } else toast.error(`Couldn’t send the email${res.error ? `: ${res.error}` : ''}`);
     },

@@ -34,6 +34,7 @@ function invalidateBookingViews(queryClient: QueryClient) {
   void queryClient.invalidateQueries({ queryKey: DASHBOARD_KEY });
   void queryClient.invalidateQueries({ queryKey: ['days'] });
   void queryClient.invalidateQueries({ queryKey: ['shows'] });
+  void queryClient.invalidateQueries({ queryKey: ['comedians'] }); // profiles' upcoming spots
 }
 
 /** Where an email went, for toasts: real inbox, or the dev outbox. */
@@ -104,7 +105,8 @@ export function useResendConfirmation(emailConfigured: boolean) {
     onError: (err, input) => {
       toast.error(`Couldn't email ${firstNameOf(input.comedianName)}`, { description: errorMessage(err) });
     },
-    onSettled: () => queryClient.invalidateQueries({ queryKey: DASHBOARD_KEY }),
+    // Resending marks the week's spots as sent ("Awaiting"), here and on the day boards.
+    onSettled: () => invalidateBookingViews(queryClient),
   });
 }
 

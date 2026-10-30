@@ -1,9 +1,10 @@
 /**
  * Settings → Email: connect an SMTP server (with provider presets), see whether email is
- * set up, send a test email, and read the email log (outbox included).
+ * set up, send a test email, and (admins only) read the email log, outbox included. The log
+ * holds comedians' sign-in codes and links, so other bookers see a short note instead.
  */
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { Inbox, Mail, Send, Unplug } from 'lucide-react';
+import { Inbox, Lock, Mail, Send, Unplug } from 'lucide-react';
 import { useState, type FormEvent, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import type {
@@ -105,6 +106,7 @@ export interface TestEmailState {
 }
 
 export function EmailTab() {
+  const isAdmin = useBooker().role === 'admin';
   const settings = useSettings();
   const queryClient = useQueryClient();
   const [openEmailId, setOpenEmailId] = useState<number | null>(null);
@@ -152,11 +154,25 @@ export function EmailTab() {
         settings={{ ...settings.data, lastEmail }}
         saved={saved}
         test={testState}
-        onOpenEmail={setOpenEmailId}
+        onOpenEmail={isAdmin ? setOpenEmailId : null}
         onSaved={(s) => setStaleUpToId(s.lastEmail?.id ?? 0)}
       />
-      <EmailLogCard onOpen={setOpenEmailId} />
-      <EmailViewerDialog id={openEmailId} onClose={() => setOpenEmailId(null)} />
+      {isAdmin ? (
+        <>
+          <EmailLogCard onOpen={setOpenEmailId} />
+          <EmailViewerDialog id={openEmailId} onClose={() => setOpenEmailId(null)} />
+        </>
+      ) : (
+        <Card id="email-log" className="scroll-mt-4">
+          <CardHeader title="Email log" />
+          <CardBody>
+            <p className="flex items-center gap-2 text-sm text-fg-muted">
+              <Lock aria-hidden className="size-4 shrink-0" />
+              Only admins can view the email log, because it contains comedians’ sign-in codes and links.
+            </p>
+          </CardBody>
+        </Card>
+      )}
     </div>
   );
 }
@@ -167,7 +183,8 @@ interface EmailSettingsFormProps {
   settings: SettingsDto;
   saved: SavedEmail;
   test: TestEmailState;
-  onOpenEmail: (id: number) => void;
+  /** Opens a logged email; null for non-admins (the email log is admin-only). */
+  onOpenEmail: ((id: number) => void) | null;
   /** After any successful save (results of earlier sends no longer describe these settings). */
   onSaved: (settings: SettingsDto) => void;
 }
@@ -288,7 +305,7 @@ function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: Emai
           actions={<EmailBadge settings={settings} />}
         />
         <CardBody className="space-y-5">
-          <EmailStatus settings={settings} bookerEmail={booker.email} />
+          <EmailStatus settings={settings} bookerEmail={booker.email} canReadLog={onOpenEmail != null} />
 
           <fieldset>
             <legend className="mb-2 text-[13px] font-medium text-fg">Email provider</legend>
@@ -548,13 +565,22 @@ function EmailBadge({ settings }: { settings: SettingsDto }) {
   );
 }
 
-function EmailStatus({ settings, bookerEmail }: { settings: SettingsDto; bookerEmail: string }) {
+function EmailStatus({
+  settings,
+  bookerEmail,
+  canReadLog,
+}: {
+  settings: SettingsDto;
+  bookerEmail: string;
+  canReadLog: boolean;
+}) {
   if (!settings.emailConfigured) {
     return (
       <Callout tone="warning" icon={Inbox} title="Not configured — emails go to the outbox">
         Nothing reaches inboxes yet. Every email — sign-in codes, availability requests, confirmations, invites — is
-        saved in the <a href="#email-log">Email log</a> below, where you can open and read it. Pick your email provider to
-        start sending for real.
+        saved in the <a href="#email-log">Email log</a>
+        {canReadLog ? ' below, where you can open and read it' : ', which admins can open and read'}. Pick your email
+        provider to start sending for real.
       </Callout>
     );
   }
@@ -578,11 +604,21 @@ function EmailStatus({ settings, bookerEmail }: { settings: SettingsDto; bookerE
   );
 }
 
-function TestResultCallout({ result, onOpenEmail }: { result: TestResult; onOpenEmail: (id: number) => void }) {
+function TestResultCallout({
+  result,
+  onOpenEmail,
+}: {
+  result: TestResult;
+  onOpenEmail: ((id: number) => void) | null;
+}) {
   const openLink = (id: number, label: string) => (
-    <Button variant="link" className="text-sm" onClick={() => onOpenEmail(id)}>
-      {label}
-    </Button>
+    onOpenEmail ? (
+      <Button variant="link" className="text-sm" onClick={() => onOpenEmail(id)}>
+        {label}
+      </Button>
+    ) : (
+      'An admin can read it in the Email log.'
+    )
   );
   if (result.kind !== 'error') {
     if (result.kind === 'sent') {

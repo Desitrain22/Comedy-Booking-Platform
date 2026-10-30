@@ -96,14 +96,18 @@ describe('guards', () => {
     expect((await t.request('/api/settings', { headers })).status).toBe(401);
   });
 
-  it('lets any booker use settings and the email log, but only admins manage bookers and backups', async () => {
+  it('lets any booker use settings, but only admins read the email log, manage bookers and backups', async () => {
     const { headers } = await loginAsBooker(t, { role: 'booker' });
     expect((await t.request('/api/settings', { headers })).status).toBe(200);
     expect((await put({ clubName: 'Renamed' }, headers)).status).toBe(200);
-    expect((await t.request('/api/email-log', { headers })).status).toBe(200);
+    expect((await t.request('/api/settings/test-email', { method: 'POST', headers, json: {} })).status).toBe(200);
 
     const other = createUser(t.db);
+    const logId = latestEmail(t.db)!.id; // the test email just sent
     for (const [method, url] of [
+      // The email log holds comedians' sign-in codes and links.
+      ['GET', '/api/email-log'],
+      ['GET', `/api/email-log/${logId}`],
       ['GET', '/api/users'],
       ['POST', '/api/users'],
       ['PATCH', `/api/users/${other.id}`],

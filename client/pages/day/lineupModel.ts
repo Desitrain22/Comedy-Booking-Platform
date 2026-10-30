@@ -4,6 +4,7 @@
  * plain-text lineup for the clipboard. No React here, so it is unit-tested directly.
  */
 import type {
+  BookingRestore,
   DayComedian,
   DayResponse,
   DayShow,
@@ -35,7 +36,15 @@ export type LineupTarget = { kind: 'slot'; showId: number; position: number } | 
 export type DropPlan =
   | { kind: 'none' }
   | { kind: 'reject'; reason: string }
-  | { kind: 'book'; comedianId: number; showId: number; position: number; conflicts: UnavailableConflict[] }
+  | {
+      kind: 'book';
+      comedianId: number;
+      showId: number;
+      position: number;
+      /** The slot's occupant, who goes back to the pool (Undo restores them). */
+      replacing: LineupBooking | null;
+      conflicts: UnavailableConflict[];
+    }
   | {
       kind: 'move';
       bookingId: number;
@@ -162,11 +171,9 @@ export function planDrop(day: DayResponse, source: LineupSource, target: LineupT
         ? { kind: 'none' }
         : { kind: 'reject', reason: `${firstName(comedian.name)} is already in the ${showTitle(show)} lineup.` };
     }
-    if (occupant) {
-      return {
-        kind: 'reject',
-        reason: `Slot ${target.position + 1} is taken by ${occupant.comedianName}. Drop on an empty slot.`,
-      };
+    // An occupied slot: replace them (still saving → wait for the server's id first).
+    if (occupant && occupant.id < 0) {
+      return { kind: 'reject', reason: `Slot ${target.position + 1} is still saving. Try again in a moment.` };
     }
     const conflict = conflictFor(day, comedian, show);
     return {
@@ -174,6 +181,7 @@ export function planDrop(day: DayResponse, source: LineupSource, target: LineupT
       comedianId: comedian.id,
       showId: show.id,
       position: target.position,
+      replacing: occupant,
       conflicts: conflict ? [conflict] : [],
     };
   }
@@ -262,26 +270,40 @@ function freshStatus(day: DayResponse) {
   return bookingStatus({ confirmedAt: null, confirmationSentAt: null }, day.date, day.today);
 }
 
+/**
+ * A new (temp) booking; `replaceBookingId` drops that occupant first, and `restore` (Undo)
+ * brings back a removed booking's confirmation and override.
+ */
 export function applyBook(
   day: DayResponse,
-  input: { tempId: number; comedianId: number; showId: number; position: number },
+  input: {
+    tempId: number;
+    comedianId: number;
+    showId: number;
+    position: number;
+    replaceBookingId?: number;
+    restore?: BookingRestore;
+  },
 ): DayResponse {
   const index = indexDay(day);
   const comedian = index.comedians.get(input.comedianId);
   const show = index.shows.get(input.showId);
   if (!comedian || !show) return day;
-  return upsertBookings(day, [
+  const unavailable = !isAvailableFor(comedian.availability, show.startMin);
+  const { restore } = input;
+  const base = input.replaceBookingId != null ? removeBooking(day, input.replaceBookingId) : day;
+  return upsertBookings(base, [
     {
       id: input.tempId,
       showId: show.id,
       position: input.position,
       comedianId: comedian.id,
       comedianName: comedian.name,
-      status: freshStatus(day),
-      overrideUnavailable: !isAvailableFor(comedian.availability, show.startMin),
-      confirmedAt: null,
-      confirmedBy: null,
-      confirmationSentAt: null,
+      status: restore ? bookingStatus(restore, day.date, day.today) : freshStatus(day),
+      overrideUnavailable: restore ? restore.overrideUnavailable || unavailable : unavailable,
+      confirmedAt: restore?.confirmedAt ?? null,
+      confirmedBy: restore?.confirmedBy ?? null,
+      confirmationSentAt: restore?.confirmationSentAt ?? null,
     },
   ]);
 }

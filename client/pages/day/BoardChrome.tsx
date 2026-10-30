@@ -30,7 +30,9 @@ export function DragPreview({ day, source, plan }: { day: DayResponse; source: L
       ? { icon: TriangleAlert, text: 'Not available', className: 'text-awaiting-fg' }
       : plan.kind === 'move' && plan.swapWith
         ? { icon: Check, text: `Swap with ${plan.swapWith.comedianName.split(' ')[0]}`, className: 'text-accent' }
-        : { icon: Check, text: plan.kind === 'move' ? 'Move here' : 'Book', className: 'text-available-fg' };
+        : plan.kind === 'book' && plan.replacing
+          ? { icon: Check, text: `Replace ${plan.replacing.comedianName.split(' ')[0]}`, className: 'text-accent' }
+          : { icon: Check, text: plan.kind === 'move' ? 'Move here' : 'Book', className: 'text-available-fg' };
   } else if (plan?.kind === 'unbook') {
     hint = { icon: Undo2, text: 'Remove', className: 'text-unconfirmed-fg' };
   } else if (plan?.kind === 'reject') {
@@ -77,7 +79,7 @@ export function SelectionBar({
   let bookingId: number | null = null;
   if (selection?.kind === 'comedian') {
     const name = index.comedians.get(selection.comedianId)?.name;
-    if (name) message = `${name} selected. Click an empty slot to book.`;
+    if (name) message = `${name} selected. Click a slot to book (a booked slot is replaced).`;
   } else if (selection?.kind === 'booking') {
     const booking = index.bookings.get(selection.bookingId);
     if (booking) {
