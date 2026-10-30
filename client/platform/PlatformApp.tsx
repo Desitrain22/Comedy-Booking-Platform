@@ -4,12 +4,13 @@
  *   /          landing: what this is, Create your club, Sign in
  *   /signup    create a club → lands signed in on the club's own address
  *   /signin    find my club: emails the sign-in links of every club an address belongs to
- *   /admin/*   the owner console (hosted MVP PR 3) — mounts below
+ *   /admin/*   the owner console (client/platform/admin/AdminApp.tsx)
  */
 import { Route, Routes } from 'react-router';
 import type { HostContext } from '../../shared/api/platform';
 import { buttonClasses } from '../components/ui';
 import { useHost } from '../lib/host';
+import { AdminApp } from './admin/AdminApp';
 import { FindClubPage } from './FindClubPage';
 import { LandingPage } from './LandingPage';
 import { PlatformShell } from './PlatformShell';
@@ -39,9 +40,7 @@ export function PlatformApp() {
       <Route index element={<LandingPage />} />
       <Route path="signup" element={<SignupPage />} />
       <Route path="signin" element={<FindClubPage />} />
-      {/* ── Owner console (hosted MVP PR 3) ─────────────────────────────────────────────
-          <Route path="admin/*" element={<AdminApp />} />
-          ─────────────────────────────────────────────────────────────────────────────── */}
+      <Route path="admin/*" element={<AdminApp />} />
       <Route path="*" element={<PlatformNotFound />} />
     </Routes>
   );
