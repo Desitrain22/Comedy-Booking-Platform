@@ -105,6 +105,9 @@ export function platformRoutes(platform: Platform): Hono<AppEnv> {
     async (c) => {
       const input = c.req.valid('json');
       const ip = clientIp(c);
+      // Again, now the body is read: checked and counted in one go (no await in between).
+      const wait = limiter.retryAfter([['signupsPerIp', ip]]);
+      if (wait) return tooManyRequests(c, wait, 'Too many sign-ups from your network');
       const undoHit = limiter.hit('signupsPerIp', ip);
       // Bots fill every field; the form hides this one from people.
       if (input.website?.trim()) {

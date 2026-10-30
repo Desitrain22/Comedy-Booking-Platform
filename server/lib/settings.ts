@@ -5,6 +5,7 @@ import type { ClubInfo } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
 import { settings, type Settings, type SettingsUpdate } from '../db/schema';
 import { env } from '../env';
+import { getClubHosting } from './hosting';
 
 export type { Settings, SettingsUpdate };
 
@@ -27,31 +28,14 @@ export function isSetupComplete(db: DbOrTx): boolean {
 }
 
 /**
- * Hosted mode: each club database's address is fixed by its subdomain
- * (`<protocol>//<slug>.<domain>`), whatever its settings say. The registry pins it when it
- * opens the database (server/platform/registry.ts). Keyed by the db handle, so a transaction
- * handle falls back to settings.appUrl, which sign-up sets to the same address.
- */
-const fixedAppUrls = new WeakMap<object, string>();
-
-/** Pin this database's app URL (hosted mode). Pass null to unpin. */
-export function setFixedAppUrl(db: DbOrTx, url: string | null): void {
-  if (url) fixedAppUrls.set(db, url.replace(/\/+$/, ''));
-  else fixedAppUrls.delete(db);
-}
-
-/** The pinned app URL for this database (hosted mode), or null. */
-export function getFixedAppUrl(db: DbOrTx): string | null {
-  return fixedAppUrls.get(db) ?? null;
-}
-
-/**
- * Base URL for links in emails: the pinned club address (hosted mode) → settings.appUrl →
- * APP_URL env → http://localhost:$PORT.
+ * Base URL for links in emails: in hosted mode the club's own address
+ * (`<protocol>//<slug>.<domain>`, server/lib/hosting.ts), whatever its settings say; else
+ * settings.appUrl → APP_URL env → http://localhost:$PORT. (A hosted club's transaction handle
+ * falls back to settings.appUrl, which sign-up sets to the same address.)
  */
 export function getAppUrl(db: DbOrTx): string {
-  const fixed = fixedAppUrls.get(db);
-  if (fixed) return fixed;
+  const hosted = getClubHosting(db);
+  if (hosted) return hosted.clubUrl;
   const fromSettings = getSettings(db).appUrl.trim();
   const base = fromSettings || env.appUrl || `http://localhost:${env.port}`;
   return base.replace(/\/+$/, '');

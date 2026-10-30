@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { users } from '../db/schema';
+import { getClubHosting } from '../lib/hosting';
 import { DEFAULT_RATE_LIMITS, rateLimiter } from '../lib/rateLimit';
 import { getAppUrl, getSettings } from '../lib/settings';
 import { makeHostedTestApp, type HostedTestApp } from '../test/hosted';
@@ -111,6 +112,12 @@ describe('club registry', () => {
     expect(limitsA.rules.loginFailuresPerIp).toEqual(DEFAULT_RATE_LIMITS.loginFailuresPerIp);
     expect(getAppUrl(a.db)).toBe('http://alpha.localhost:3000');
     expect(getAppUrl(b.db)).toBe('http://bravo.localhost:3000');
+    expect(getClubHosting(a.db)).toEqual({
+      hosted: h.hosted,
+      clubId: a.club.id,
+      slug: 'alpha',
+      clubUrl: 'http://alpha.localhost:3000',
+    });
   });
 
   it('sets a status with a reason; archiving closes the database', () => {

@@ -74,6 +74,15 @@ describe('GET /api/host', () => {
     }
   });
 
+  it('never answers { mode: single } in hosted mode', async () => {
+    h.createClub({ slug: 'broadway' });
+    const head = await h.request(h.clubUrl('broadway', '/api/host'), { method: 'HEAD' });
+    expect(head.status).toBe(200);
+    const post = await h.request(h.clubUrl('broadway', '/api/host'), { method: 'POST', json: {} });
+    expect(post.status).toBe(404);
+    expect(await readJson(post)).not.toMatchObject({ mode: 'single' });
+  });
+
   it('in single-club mode: { mode: single }', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'cbp-single-'));
     const { createDb, closeDb } = await import('../db/client');

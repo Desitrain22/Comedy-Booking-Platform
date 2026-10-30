@@ -112,7 +112,9 @@ export function hostedTenancy(platform: Platform): MiddlewareHandler<AppEnv> {
     if (path === '/api/health') return next();
 
     const host = resolveHost(platform, c.req.url);
-    if (path === '/api/host' && c.req.method === 'GET') return hostContext(c, platform, host);
+    if (path === '/api/host' && (c.req.method === 'GET' || c.req.method === 'HEAD')) {
+      return hostContext(c, platform, host);
+    }
 
     if (host.kind === 'none') return clubNotFound(c, platform);
     if (host.kind === 'platform') {

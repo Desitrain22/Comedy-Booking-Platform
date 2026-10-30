@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { HostContext } from '../shared/api/platform';
 import type { MeResponse } from '../shared/types';
 import { env } from './env';
+import { getClubHosting } from './lib/hosting';
 import { getAppUrl } from './lib/settings';
 import { loginAsBooker, makeTestApp, readJson, TEST_APP_URL, type TestApp } from './test/helpers';
 
@@ -52,7 +53,8 @@ describe('single-club mode', () => {
     }
   });
 
-  it('keeps the app URL from settings (nothing pinned)', () => {
+  it('keeps the app URL from settings (the database is not a hosted club)', () => {
+    expect(getClubHosting(t.db)).toBeNull();
     expect(getAppUrl(t.db)).toBe(TEST_APP_URL);
   });
 });

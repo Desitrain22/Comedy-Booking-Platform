@@ -10,8 +10,9 @@
  * change applies at once without any cache to invalidate. Club databases stay open until the
  * club is archived or the registry is closed.
  *
- * Every club database gets its own sign-in rate limiter (like a single-club app) and its
- * app URL pinned to `<protocol>//<slug>.<domain>`, so email links always point at the club.
+ * Every club database gets its own sign-in rate limiter (like a single-club app) and is tagged
+ * as hosted (server/lib/hosting.ts: its id, slug, the platform settings), which pins its app URL
+ * to `<protocol>//<slug>.<domain>` so email links always point at the club.
  */
 import { and, asc, eq, inArray, type SQL } from 'drizzle-orm';
 import { existsSync, mkdirSync, renameSync, rmSync } from 'node:fs';
@@ -20,14 +21,14 @@ import { closeDb, createDb, type Db } from '../db/client';
 import type { HostedEnv } from '../env';
 import { RateLimiter, setRateLimiter, type RateLimitConfig } from '../lib/rateLimit';
 import { resolveRateLimits } from '../lib/rateLimitConfig';
-import { setFixedAppUrl } from '../lib/settings';
+import { setClubHosting } from '../lib/hosting';
 import type { PlatformDb } from './db';
 import { clubUrl } from './hosts';
 import { CLUB_STATUSES, clubs, type Club, type ClubStatus } from './schema';
 
 export interface ClubRegistryOptions {
   db: PlatformDb;
-  hosted: Pick<HostedEnv, 'protocol' | 'platformHost'>;
+  hosted: HostedEnv;
   /** `$DATA_DIR/clubs` */
   clubsDir: string;
   /** Sign-in rate limits for every club database (default: like a single-club app). */
@@ -64,7 +65,7 @@ function isUniqueViolation(err: unknown): boolean {
 export class ClubRegistry {
   readonly db: PlatformDb;
   readonly clubsDir: string;
-  private readonly hosted: Pick<HostedEnv, 'protocol' | 'platformHost'>;
+  readonly hosted: HostedEnv;
   private readonly clubRateLimits: RateLimitConfig;
   private readonly open = new Map<number, Db>();
 
@@ -180,7 +181,7 @@ export class ClubRegistry {
     mkdirSync(this.clubsDir, { recursive: true });
     const db = createDb(this.clubDbFile(row.id));
     setRateLimiter(db, new RateLimiter(this.clubRateLimits));
-    setFixedAppUrl(db, this.clubUrl(row));
+    setClubHosting(db, { hosted: this.hosted, clubId: row.id, slug: row.slug, clubUrl: this.clubUrl(row) });
     this.open.set(row.id, db);
     return db;
   }

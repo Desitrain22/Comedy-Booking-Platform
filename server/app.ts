@@ -178,7 +178,7 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   if (platform) app.use('/api/*', hostedTenancy(platform));
 
   app.get('/api/health', (c) => c.json({ ok: true as const }));
-  app.get('/api/host', (c) => c.json({ mode: 'single' } satisfies HostContext));
+  if (!platform) app.get('/api/host', (c) => c.json({ mode: 'single' } satisfies HostContext));
 
   // Hosted mode, platform host only (the tenancy middleware keeps club hosts out): sign-up
   // and find my club. The owner console (hosted MVP PR 3) mounts its routes here too.
