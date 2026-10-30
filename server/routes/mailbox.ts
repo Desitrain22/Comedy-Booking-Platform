@@ -32,7 +32,7 @@ import { bookerMailbox, previewSender, sendEmail } from '../email/mailer';
 import { testEmail } from '../email/templates';
 import { SMTP_HOST_NOT_ALLOWED_MESSAGE, smtpHostNotAllowed } from '../email/smtpHostGuard';
 import { awaitTestEmail } from '../email/testEmail';
-import { env } from '../env';
+import { getClubHosting } from '../lib/hosting';
 import { httpError, orNotFound } from '../lib/http';
 import { encryptSecret } from '../lib/secrets';
 import { getSettings } from '../lib/settings';
@@ -105,7 +105,7 @@ mailboxRoutes.put('/me/mailbox', requireBooker, validate('json', updateMailboxSc
   else if (CONNECTION_FIELDS.some((f) => next[f] !== current[f])) next.smtpPass = '';
 
   // Hosted mode: a public server only, never one inside our network.
-  if (env.hosted && smtpHostNotAllowed(next.smtpHost)) {
+  if (getClubHosting(db) && smtpHostNotAllowed(next.smtpHost)) {
     throw httpError(400, SMTP_HOST_NOT_ALLOWED_MESSAGE, 'smtp_host_not_allowed', {
       issues: [{ path: 'smtpHost', message: SMTP_HOST_NOT_ALLOWED_MESSAGE }],
     });

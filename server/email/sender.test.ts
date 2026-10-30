@@ -113,7 +113,7 @@ describe('company sends', () => {
   });
 
   it('row 1 in hosted mode: a connected company mailbox wins over the platform sender', async () => {
-    hostedMode();
+    hostedMode(t.db);
     const sent = captureMail();
     addAdmin();
     connectCompanyMailbox({ fromName: 'Bookings Desk', fromEmail: 'bookings@club.test' });
@@ -128,7 +128,7 @@ describe('company sends', () => {
   });
 
   it('row 2 — hosted platform sender: "<club>" <SMTP_FROM_EMAIL>, Reply-To the company email else the first admin', async () => {
-    hostedMode();
+    hostedMode(t.db);
     const sent = captureMail();
     addAdmin();
     createUser(t.db, { role: 'admin', email: 'later@bwaygroup.test', createdAt: 5 });
@@ -218,7 +218,7 @@ describe('booker sends (senderMode booker)', () => {
   });
 
   it('row 5 — neither, the platform sender: their name at SMTP_FROM_EMAIL', async () => {
-    hostedMode();
+    hostedMode(t.db);
     const sent = captureMail();
     await sendEmail(t.db, { ...message, senderUserId: rich.id });
     expect(sent[0]).toMatchObject({
@@ -229,7 +229,7 @@ describe('booker sends (senderMode booker)', () => {
     expect(latestEmail(t.db)).toMatchObject({ via: 'platform', senderUserId: rich.id });
 
     // Single-club mode's SMTP_* fallback doesn't override a booker's name either.
-    singleClubMode({ smtp: PLATFORM_SMTP });
+    singleClubMode({ smtp: PLATFORM_SMTP }, t.db);
     await sendEmail(t.db, { ...message, senderUserId: rich.id });
     expect(sent[1]).toMatchObject({
       from: '"Rich Brooks · Test Comedy Club" <bookings@mail.platform.test>',
@@ -306,7 +306,7 @@ describe('previews and "email configured"', () => {
     });
 
     updateSettings(t.db, { smtpHost: '', smtpUser: '', smtpPass: '' });
-    hostedMode();
+    hostedMode(t.db);
     addAdmin();
     expect(previewSender(t.db)).toEqual({
       via: 'platform',
@@ -318,7 +318,7 @@ describe('previews and "email configured"', () => {
 
   it('counts the platform sender as configured in hosted mode', () => {
     expect(isEmailConfigured(t.db)).toBe(false);
-    hostedMode();
+    hostedMode(t.db);
     expect(isEmailConfigured(t.db)).toBe(true);
     // Hosted, but the server has no platform sender (e.g. local dev): the outbox.
     setEnv({ smtp: null });
@@ -329,7 +329,7 @@ describe('previews and "email configured"', () => {
   });
 
   it('replyToWithAdminFallback: the company email, else the first admin (hosted too)', () => {
-    hostedMode();
+    hostedMode(t.db);
     expect(replyToWithAdminFallback(t.db)).toBe('');
     addAdmin();
     expect(replyToWithAdminFallback(t.db)).toBe('ada@bwaygroup.test');
@@ -392,7 +392,7 @@ describe('daily cap on the platform sender', () => {
   }
 
   it('stops at PLATFORM_DAILY_EMAIL_CAP and logs the rest as failed', async () => {
-    hostedMode({ dailyEmailCap: 2 });
+    hostedMode(t.db, { dailyEmailCap: 2 });
     const sent = captureMail();
     const results = [];
     for (let i = 0; i < 3; i++) results.push(await sendEmail(t.db, { ...message, to: `c${i}@example.test` }));
@@ -410,7 +410,7 @@ describe('daily cap on the platform sender', () => {
   });
 
   it('counts emails still in flight, so a blast stops exactly at the cap', async () => {
-    hostedMode({ dailyEmailCap: 3 });
+    hostedMode(t.db, { dailyEmailCap: 3 });
     const sent = captureMail(() => new Promise((resolve) => setTimeout(() => resolve({}), 5)));
     for (let i = 0; i < 5; i++) createComedian(t.db, { email: `blast${i}@example.test` });
     const result = await sendAvailabilityRequest(t.db, {
@@ -429,12 +429,12 @@ describe('daily cap on the platform sender', () => {
     captureMail();
     logged(5);
     expect((await sendEmail(t.db, message)).status).toBe('sent');
-    hostedMode({ dailyEmailCap: 6 });
+    hostedMode(t.db, { dailyEmailCap: 6 });
     expect((await sendEmail(t.db, message)).status).toBe('failed');
   });
 
   it('applies only to the platform sender: mailboxes the club connects are exempt', async () => {
-    hostedMode({ dailyEmailCap: 1 });
+    hostedMode(t.db, { dailyEmailCap: 1 });
     const sent = captureMail();
     logged(1);
     bookerMode();
@@ -455,7 +455,7 @@ describe('daily cap on the platform sender', () => {
   });
 
   it('counts only sent platform emails (not failed, outbox or mailbox ones)', async () => {
-    hostedMode({ dailyEmailCap: 1 });
+    hostedMode(t.db, { dailyEmailCap: 1 });
     captureMail();
     logged(3, { status: 'failed' });
     logged(3, { status: 'outbox', via: 'outbox' });
@@ -468,7 +468,7 @@ describe('daily cap on the platform sender', () => {
   });
 
   it("resets at midnight in the club's timezone, not UTC", async () => {
-    hostedMode({ dailyEmailCap: 1 });
+    hostedMode(t.db, { dailyEmailCap: 1 });
     captureMail();
     updateSettings(t.db, { timezone: 'America/Los_Angeles' }); // UTC-8 in November
     logged(1, { createdAt: Date.parse('2026-11-03T07:59:00Z') }); // Mon Nov 2, 11:59 PM in LA

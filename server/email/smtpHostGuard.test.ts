@@ -145,7 +145,7 @@ describe('vetSmtpHost', () => {
 
 describe('at send time (hosted mode)', () => {
   it('refuses a company mailbox whose name resolves to 127.0.0.1, never connecting', async () => {
-    hostedMode();
+    hostedMode(t.db);
     resolveSmtpHosts({ 'smtp.evil.test': ['127.0.0.1'] });
     const sent = captureMail();
     connectCompanyMailbox('smtp.evil.test');
@@ -159,7 +159,7 @@ describe('at send time (hosted mode)', () => {
   });
 
   it("refuses a booker's mailbox the same way", async () => {
-    hostedMode();
+    hostedMode(t.db);
     resolveSmtpHosts({ 'smtp.rich.test': ['192.168.0.20'] });
     const sent = captureMail();
     updateSettings(t.db, { senderMode: 'booker' });
@@ -171,7 +171,7 @@ describe('at send time (hosted mode)', () => {
   });
 
   it('connects to the vetted address, keeping the name for TLS', async () => {
-    hostedMode();
+    hostedMode(t.db);
     resolveSmtpHosts({ 'smtp.club.test': ['198.51.100.25'] });
     const sent = captureMail();
     connectCompanyMailbox('smtp.club.test');
@@ -181,7 +181,7 @@ describe('at send time (hosted mode)', () => {
   });
 
   it('the mailbox test says what is wrong', async () => {
-    hostedMode();
+    hostedMode(t.db);
     resolveSmtpHosts({ 'smtp.evil.test': ['127.0.0.1'] });
     captureMail();
     await t.request('/api/me/mailbox', {
@@ -197,7 +197,7 @@ describe('at send time (hosted mode)', () => {
   });
 
   it("exempts the platform's own sender", async () => {
-    hostedMode({}, { smtp: { ...PLATFORM_SMTP, host: '127.0.0.1' } });
+    hostedMode(t.db, {}, { smtp: { ...PLATFORM_SMTP, host: '127.0.0.1' } });
     const seen = trackLookups();
     const sent = captureMail();
     expect((await sendEmail(t.db, message)).status).toBe('sent');
@@ -226,7 +226,7 @@ describe('on save', () => {
   const mailbox = (smtpHost: string) => ({ smtpHost, smtpPort: 587, smtpSecure: false, smtpUser: 'me@club.test', smtpPass: 'x' });
 
   it('refuses local and private company mailbox hosts with 400 smtp_host_not_allowed (hosted)', async () => {
-    hostedMode();
+    hostedMode(t.db);
     for (const smtpHost of ['127.0.0.1', 'localhost', 'smtp.localhost', 'mail.internal', '10.0.0.5', '169.254.169.254']) {
       const res = await t.request('/api/settings', { method: 'PUT', headers: admin.headers, json: mailbox(smtpHost) });
       expect(res.status, smtpHost).toBe(400);
@@ -243,7 +243,7 @@ describe('on save', () => {
   });
 
   it('refuses them for per-booker mailboxes too', async () => {
-    hostedMode();
+    hostedMode(t.db);
     for (const smtpHost of ['192.168.1.10', 'localhost', 'metadata.google.internal', '127.1']) {
       const res = await t.request('/api/me/mailbox', { method: 'PUT', headers: rich.headers, json: mailbox(smtpHost) });
       expect(res.status, smtpHost).toBe(400);
@@ -260,7 +260,7 @@ describe('on save', () => {
   });
 
   it('is checked before anything is saved', async () => {
-    hostedMode();
+    hostedMode(t.db);
     await t.request('/api/settings', { method: 'PUT', headers: admin.headers, json: { ...mailbox('10.0.0.5'), fromName: 'Desk' } });
     await t.request('/api/me/mailbox', { method: 'PUT', headers: rich.headers, json: mailbox('10.0.0.5') });
     expect(t.db.select().from(users).where(eq(users.id, rich.user.id)).get()?.smtpHost).toBe('');

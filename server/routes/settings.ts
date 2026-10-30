@@ -55,6 +55,7 @@ import { getMailConfig, previewSender, sendEmail } from '../email/mailer';
 import { testEmail } from '../email/templates';
 import { awaitTestEmail } from '../email/testEmail';
 import { env } from '../env';
+import { getClubHosting } from '../lib/hosting';
 import { httpError, orNotFound, parseId } from '../lib/http';
 import { SMTP_HOST_NOT_ALLOWED_MESSAGE, smtpHostNotAllowed } from '../email/smtpHostGuard';
 import { encryptSecret } from '../lib/secrets';
@@ -80,6 +81,7 @@ settingsRoutes.route('/', mailboxRoutes);
  */
 export function toSettingsDto(db: DbOrTx, viewerId: number | null = null): SettingsDto {
   const s = getSettings(db);
+  const hosting = getClubHosting(db);
   const mail = getMailConfig(db);
   // The company sender's latest real send (a booker's own mailbox failing isn't the company's).
   const last = db
@@ -118,10 +120,10 @@ export function toSettingsDto(db: DbOrTx, viewerId: number | null = null): Setti
     emailHost: mail?.host ?? null,
     emailFrom: mail?.from || null,
     lastEmail: last && last.status !== 'outbox' ? { ...last, status: last.status } : null,
-    platformSender: env.hosted && env.smtp ? { name: env.hosted.platformName, fromEmail: env.smtp.fromEmail } : null,
+    platformSender: hosting && env.smtp ? { name: hosting.hosted.platformName, fromEmail: env.smtp.fromEmail } : null,
     senderPreview: previewSender(db, { senderMode: 'company' }),
     bookerSenderPreview: viewerId == null ? null : previewSender(db, { senderUserId: viewerId, senderMode: 'booker' }),
-    appUrlLocked: env.hosted !== null,
+    appUrlLocked: hosting !== null,
     confirmationsEnabled: s.confirmationsEnabled,
     confirmationDay: s.confirmationDay,
     confirmationTimeMin: s.confirmationTimeMin,
@@ -161,13 +163,13 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
   const input = c.req.valid('json');
   const { smtpPass, clearSmtpPass, ...fields } = input;
   const current = getSettings(db);
+  const hosting = getClubHosting(db);
 
-  // Hosted mode: the club's address was set at sign-up (its subdomain) and every emailed link
+  // Hosted mode: the club's address is its subdomain (set at sign-up) and every emailed link
   // starts with it. Sending it back unchanged is fine.
-  if (env.hosted && input.appUrl !== undefined && input.appUrl !== current.appUrl) {
-    throw httpError(400, "This club's web address is set by the platform and can't be changed", 'app_url_locked', {
-      issues: [{ path: 'appUrl', message: "The web address can't be changed" }],
-    });
+  if (hosting && input.appUrl !== undefined && input.appUrl !== hosting.clubUrl && input.appUrl !== current.appUrl) {
+    const message = `Your club's address is ${hosting.clubUrl} and can't be changed`;
+    throw httpError(400, message, 'app_url_locked', { issues: [{ path: 'appUrl', message }] });
   }
 
   // Email settings decide where sign-in links, codes and confirmations go (and hold the SMTP
@@ -195,7 +197,7 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
   }
 
   // Hosted mode: the company mailbox must be a public server, never inside our network.
-  if (env.hosted && patch.smtpHost && smtpHostNotAllowed(patch.smtpHost)) {
+  if (hosting && patch.smtpHost && smtpHostNotAllowed(patch.smtpHost)) {
     throw invalid('smtpHost', SMTP_HOST_NOT_ALLOWED_MESSAGE, 'smtp_host_not_allowed');
   }
 

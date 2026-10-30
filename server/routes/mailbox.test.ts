@@ -213,7 +213,7 @@ describe('POST /api/me/mailbox/test', () => {
   });
 
   it('sends the test email to yourself through your own mailbox, whatever the sender mode', async () => {
-    hostedMode(); // a platform sender and company mode: the test still uses Rich's mailbox
+    hostedMode(t.db); // a platform sender and company mode: the test still uses Rich's mailbox
     const sent = captureMail();
     await put(RICH_BOX);
     const res = await t.request('/api/me/mailbox/test', { method: 'POST', headers: rich.headers, json: {} });
@@ -272,7 +272,7 @@ describe('POST /api/me/mailbox/test', () => {
   });
 
   it('is not held back by the daily cap (a mailbox you connect yourself)', async () => {
-    hostedMode({ dailyEmailCap: 0 });
+    hostedMode(t.db, { dailyEmailCap: 0 });
     captureMail();
     await put(RICH_BOX);
     const res = await t.request('/api/me/mailbox/test', { method: 'POST', headers: rich.headers, json: {} });

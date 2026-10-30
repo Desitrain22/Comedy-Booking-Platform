@@ -90,21 +90,6 @@ export function hostContext(c: Context, platform: Platform, host: ResolvedHost):
 
 const isPlatformApi = (path: string) => path === '/api/platform' || path.startsWith('/api/platform/');
 
-/**
- * Hosted mode: a club's app address is its subdomain, so `PUT /api/settings` may not change
- * `appUrl` (the same address again is fine; Settings → Club no longer sends it).
- */
-async function refuseAppUrlChange(c: Context<AppEnv>, clubUrl: string): Promise<Response | null> {
-  if (c.req.method !== 'PUT' || c.req.path !== '/api/settings') return null;
-  // Parsed once and cached by Hono, so the route's validator reads the same body.
-  const body: unknown = await c.req.json().catch(() => null);
-  if (!body || typeof body !== 'object' || !('appUrl' in body)) return null;
-  const value = (body as { appUrl: unknown }).appUrl;
-  if (typeof value === 'string' && value.trim().replace(/\/+$/, '') === clubUrl) return null;
-  const message = `Your club's address is ${clubUrl} and can't be changed`;
-  return jsonError(c, 400, message, 'validation_error', { issues: [{ path: 'appUrl', message }] });
-}
-
 export function hostedTenancy(platform: Platform): MiddlewareHandler<AppEnv> {
   return async (c, next) => {
     c.set('platform', platform);
@@ -126,9 +111,9 @@ export function hostedTenancy(platform: Platform): MiddlewareHandler<AppEnv> {
     if (club.status !== 'active') return clubSuspended(c, platform);
     if (isPlatformApi(path)) return jsonError(c, 404, 'Not found', 'not_found');
     c.set('club', club);
+    // Its app address can't be changed: PUT /api/settings refuses (app_url_locked,
+    // server/routes/settings.ts), going by the hosting info the registry tags this db with.
     c.set('db', platform.registry.openClubDb(club));
-    const refused = await refuseAppUrlChange(c, platform.registry.clubUrl(club));
-    if (refused) return refused;
     return next();
   };
 }

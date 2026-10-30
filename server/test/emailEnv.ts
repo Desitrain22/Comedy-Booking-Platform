@@ -1,25 +1,36 @@
 /**
- * Test toolkit for email senders: switch the process env between single-club and hosted
- * mode, and capture what the mailer hands to SMTP.
+ * Test toolkit for email senders: run a test club database as a single club or as a hosted
+ * club, set the email env, and capture what the mailer hands to SMTP.
  *
- * `env` (server/env.ts) is read once at startup, but it's a plain object that the mailer
- * and routes read on every call, so tests set its fields directly. Each vitest file runs
- * in its own worker; restore in `afterEach` anyway so tests stay independent:
+ * Whether a club is hosted comes from its database (server/lib/hosting.ts: the registry tags
+ * each club database it opens), never from `env.hosted`, which stays null here as it does in
+ * hosted test apps. `hostedMode(db)` tags a `makeTestApp()` database the way the registry
+ * would, so its routes and the mailer behave as a hosted club's. For the full hosted stack
+ * (host routing, registry, sign-up), use `makeHostedTestApp()` (./hosted.ts).
+ *
+ * `env.smtp` is the platform sender in both cases (production passes the same SMTP_* config
+ * to the platform), and `env.appSecret` encrypts mailbox passwords: `env` is a plain object
+ * read on every call, so tests set those fields directly. Restore in `afterEach`:
  *
  *   beforeEach(() => singleClubMode());           // no SMTP_* env, no APP_SECRET
  *   afterEach(() => restoreEnv());
  *
- *   hostedMode({ dailyEmailCap: 3 });             // PLATFORM_URL set, platform sender, APP_SECRET
+ *   hostedMode(t.db, { dailyEmailCap: 3 });       // a hosted club, the platform sender, APP_SECRET
  *   const sent = captureMail();                   // every sendMail call, with the server it used
  *   resolveSmtpHosts({ 'smtp.evil.test': ['127.0.0.1'] });  // what mailbox hosts resolve to
  *
- * In hosted mode mailbox hosts are resolved before sending (the SMTP host guard). Tests never
- * touch real DNS: `hostedMode` resolves every host to PUBLIC_TEST_ADDRESS unless told otherwise.
+ * For a hosted club, mailbox hosts are resolved before sending (the SMTP host guard). Tests
+ * never touch real DNS: `hostedMode` resolves every host to PUBLIC_TEST_ADDRESS unless told
+ * otherwise (call `resolveSmtpHosts` after it).
  */
 import type { SendMailOptions } from 'nodemailer';
-import { env, type Env, type HostedEnv, type SmtpEnv } from '../env';
+import type { Db } from '../db/client';
 import { setTransportFactory, type SmtpServer } from '../email/mailer';
 import { setSmtpHostLookup } from '../email/smtpHostGuard';
+import { env, type Env, type HostedEnv, type SmtpEnv } from '../env';
+import { setClubHosting } from '../lib/hosting';
+import { updateSettings } from '../lib/settings';
+import { TEST_HOSTED } from './hosted';
 
 type EmailEnv = Pick<Env, 'hosted' | 'smtp' | 'appSecret'>;
 
@@ -66,31 +77,29 @@ export const PLATFORM_SMTP: SmtpEnv = {
 
 export const TEST_APP_SECRET = 'test-app-secret-0123456789';
 
-export function testHostedEnv(overrides: Partial<HostedEnv> = {}): HostedEnv {
-  return {
-    platformUrl: 'https://comedy.test',
-    platformHost: 'comedy.test',
-    protocol: 'https:',
-    platformName: 'Comedy Booking',
-    adminEmails: ['owner@comedy.test'],
-    supportEmail: 'owner@comedy.test',
-    signupsOpen: true,
-    dailyEmailCap: 2000,
-    ...overrides,
-  };
-}
+/** The slug `hostedMode` gives a test club: its address is TEST_CLUB_URL. */
+export const TEST_CLUB_SLUG = 'club';
+/** `http://club.localhost:3000` (http keeps the tests' plain session cookies). */
+export const TEST_CLUB_URL = `${TEST_HOSTED.protocol}//${TEST_CLUB_SLUG}.${TEST_HOSTED.platformHost}`;
 
-/** Single-club mode with nothing in the env: no SMTP_* fallback, no APP_SECRET (plus `patch`). */
-export function singleClubMode(patch: Partial<EmailEnv> = {}): void {
+/**
+ * Single-club mode with nothing in the env: no SMTP_* fallback, no APP_SECRET (plus `patch`).
+ * Pass `db` to turn a database `hostedMode` tagged back into a single club.
+ */
+export function singleClubMode(patch: Partial<EmailEnv> = {}, db?: Db): void {
   setEnv({ hosted: null, smtp: null, appSecret: null, ...patch });
+  if (db) setClubHosting(db, null);
 }
 
 /**
- * Hosted mode: PLATFORM_URL set, the platform sender configured, APP_SECRET set (plus
+ * A hosted club: `db` tagged as the registry tags a club database (its app URL set to
+ * TEST_CLUB_URL, as sign-up does), the platform sender configured, APP_SECRET set (plus
  * `patch`), and mailbox hosts resolving to a public address (see `resolveSmtpHosts`).
  */
-export function hostedMode(hosted: Partial<HostedEnv> = {}, patch: Partial<EmailEnv> = {}): void {
-  setEnv({ hosted: testHostedEnv(hosted), smtp: PLATFORM_SMTP, appSecret: TEST_APP_SECRET, ...patch });
+export function hostedMode(db: Db, hosted: Partial<HostedEnv> = {}, patch: Partial<EmailEnv> = {}): void {
+  setClubHosting(db, { hosted: { ...TEST_HOSTED, ...hosted }, clubId: 1, slug: TEST_CLUB_SLUG, clubUrl: TEST_CLUB_URL });
+  updateSettings(db, { appUrl: TEST_CLUB_URL });
+  setEnv({ hosted: null, smtp: PLATFORM_SMTP, appSecret: TEST_APP_SECRET, ...patch });
   resolveSmtpHosts();
 }
 

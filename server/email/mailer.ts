@@ -14,8 +14,9 @@
  *   booker U   neither, platform sender            "<U.name> · <club>" <SMTP_FROM_EMAIL>         U.email
  *   any        nothing configured                  outbox: stored in email_log, printed to the console
  *
- * The SMTP_* env sender is "the platform sender" in hosted mode (PLATFORM_URL set): there
- * its SMTP_FROM_NAME and SMTP_REPLY_TO never override the club's names or company email,
+ * The SMTP_* env sender is "the platform sender" for a hosted club (its database is tagged
+ * with hosting info, server/lib/hosting.ts): there its SMTP_FROM_NAME and SMTP_REPLY_TO
+ * never override the club's names or company email,
  * company sends always carry a Reply-To that reaches a person, and a club may send at most
  * PLATFORM_DAILY_EMAIL_CAP of them per club-local day (mailboxes a club connects itself
  * don't count). In single-club mode the env sender is the club's own fallback and keeps its
@@ -33,6 +34,7 @@ import type { EmailKind, EmailStatus } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
 import { emailLog, users, type Settings, type User } from '../db/schema';
 import { env } from '../env';
+import { getClubHosting } from '../lib/hosting';
 import { decryptSecret } from '../lib/secrets';
 import { clubToday, getSettings } from '../lib/settings';
 import { vetSmtpHost } from './smtpHostGuard';
@@ -176,9 +178,10 @@ function envSender(db: DbOrTx, s: Settings): MailConfig | null {
   const smtp = env.smtp;
   if (!smtp) return null;
   const server = { host: smtp.host, port: smtp.port, secure: smtp.secure, user: smtp.user, pass: smtp.pass };
-  if (env.hosted) {
+  const hosting = getClubHosting(db);
+  if (hosting) {
     // The platform sender: the club's own name and company email, never the platform's.
-    const fromName = s.clubName || env.hosted.platformName;
+    const fromName = s.clubName || hosting.hosted.platformName;
     return {
       source: 'platform',
       via: 'platform',
@@ -365,8 +368,9 @@ function adjustInFlight(db: DbOrTx, delta: number): void {
 
 /** The cap error when this club can't send another platform email today, else null. */
 function platformCapReached(db: DbOrTx): string | null {
-  if (!env.hosted) return null;
-  const cap = env.hosted.dailyEmailCap;
+  const hosting = getClubHosting(db);
+  if (!hosting) return null;
+  const cap = hosting.hosted.dailyEmailCap;
   const used = platformEmailsSentToday(db) + (platformInFlight.get(db) ?? 0);
   return used >= cap ? dailyCapError(cap) : null;
 }
@@ -494,7 +498,7 @@ export async function sendEmail(db: DbOrTx, input: SendEmailInput): Promise<Send
   let server = sender.server;
   // Hosted mode: a mailbox someone connected must resolve to public addresses only (the
   // platform's own sender is trusted). Refused hosts never get a connection.
-  if (env.hosted && (sender.via === 'company-mailbox' || sender.via === 'booker-mailbox')) {
+  if (getClubHosting(db) && (sender.via === 'company-mailbox' || sender.via === 'booker-mailbox')) {
     const vetted = await vetSmtpHost(server.host);
     if ('error' in vetted) return failed(db, input, sender, vetted.error);
     server = { ...server, address: vetted.address };

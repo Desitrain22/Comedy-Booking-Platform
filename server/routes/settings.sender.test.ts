@@ -14,6 +14,7 @@ import { getSettings, updateSettings } from '../lib/settings';
 import {
   PLATFORM_SMTP,
   TEST_APP_SECRET,
+  TEST_CLUB_URL,
   captureMail,
   hostedMode,
   restoreEnv,
@@ -121,7 +122,7 @@ describe('what comedians see', () => {
   });
 
   it('hosted mode: emails already go out through the platform sender, no setup', async () => {
-    hostedMode();
+    hostedMode(t.db);
     const dto = await getDto();
     expect(dto).toMatchObject({
       emailConfigured: true,
@@ -147,7 +148,7 @@ describe('what comedians see', () => {
   });
 
   it("the company email status ignores a booker's own mailbox", async () => {
-    hostedMode();
+    hostedMode(t.db);
     t.db.insert(emailLog).values({ toEmail: 'a@x.test', subject: 'Company', kind: 'test', status: 'sent', via: 'platform' }).run();
     t.db
       .insert(emailLog)
@@ -158,27 +159,29 @@ describe('what comedians see', () => {
 });
 
 describe('the app URL in hosted mode', () => {
-  // (http app URLs keep the tests' plain session cookies: over https they're `__Host-` cookies.)
   it('rejects a change with 400 app_url_locked; the same value is fine', async () => {
-    hostedMode();
-    updateSettings(t.db, { appUrl: 'http://broadway.comedy.test' });
+    hostedMode(t.db); // the club's address: TEST_CLUB_URL
     for (const appUrl of ['https://evil.example', '']) {
       const res = await put({ appUrl, clubName: 'Renamed' });
       expect(res.status, appUrl).toBe(400);
-      const body = await readJson<ApiErrorBody>(res);
-      expect(body.code).toBe('app_url_locked');
+      expect(await readJson<ApiErrorBody>(res)).toMatchObject({
+        code: 'app_url_locked',
+        error: `Your club's address is ${TEST_CLUB_URL} and can't be changed`,
+        issues: [{ path: 'appUrl' }],
+      });
     }
     // Bookers get the same answer.
     expect(await readJson(await put({ appUrl: 'https://evil.example' }, rich.headers))).toMatchObject({ code: 'app_url_locked' });
-    expect(getSettings(t.db)).toMatchObject({ appUrl: 'http://broadway.comedy.test', clubName: 'Test Comedy Club' });
+    expect(getSettings(t.db)).toMatchObject({ appUrl: TEST_CLUB_URL, clubName: 'Test Comedy Club' });
 
     // Unchanged (after normalising) or omitted: saved as usual.
-    expect((await put({ appUrl: 'http://broadway.comedy.test/', clubName: 'Renamed' })).status).toBe(200);
+    expect((await put({ appUrl: `${TEST_CLUB_URL}/`, clubName: 'Renamed' })).status).toBe(200);
     expect((await put({ timezone: 'America/Chicago' })).status).toBe(200);
-    expect(getSettings(t.db)).toMatchObject({ clubName: 'Renamed', timezone: 'America/Chicago' });
+    expect(getSettings(t.db)).toMatchObject({ clubName: 'Renamed', timezone: 'America/Chicago', appUrl: TEST_CLUB_URL });
   });
 
   it('stays editable in single-club mode', async () => {
+    // (http app URLs keep the tests' plain session cookies: over https they're `__Host-` cookies.)
     const res = await put({ appUrl: 'http://booking.laughtrack.test' });
     expect(res.status).toBe(200);
     expect(getSettings(t.db).appUrl).toBe('http://booking.laughtrack.test');
@@ -217,7 +220,7 @@ describe('company mailbox password at rest', () => {
 
 describe('the company test email in hosted mode', () => {
   it('goes out through the platform sender and counts toward the daily cap', async () => {
-    hostedMode({ dailyEmailCap: 1 });
+    hostedMode(t.db, { dailyEmailCap: 1 });
     const sent = captureMail();
     const first = await t.request('/api/settings/test-email', { method: 'POST', headers: admin.headers, json: {} });
     expect(first.status).toBe(200);
@@ -234,7 +237,7 @@ describe('the company test email in hosted mode', () => {
   });
 
   it("explains a platform failure as the platform's, not the club's SMTP settings", async () => {
-    hostedMode();
+    hostedMode(t.db);
     captureMail(async () => {
       throw new Error('Invalid login: 535 Authentication failed');
     });
@@ -248,7 +251,7 @@ describe('the company test email in hosted mode', () => {
 
 describe('email log', () => {
   it('shows how each email went out and the booker it was sent for', async () => {
-    hostedMode();
+    hostedMode(t.db);
     captureMail();
     updateSettings(t.db, { senderMode: 'booker' });
     await t.request('/api/settings/test-email', { method: 'POST', headers: admin.headers, json: {} });
