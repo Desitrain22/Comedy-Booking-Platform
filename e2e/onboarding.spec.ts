@@ -1,6 +1,7 @@
 /**
  * The setup guide on a FRESH, unseeded club, then the welcome tour for an invited booker
- * (onboarding design §2, §5). Desktop only.
+ * (onboarding design §2, §5). Runs in the `fresh` project: `npm run e2e` gives it its own
+ * server on an empty data folder (playwright.config.ts).
  *
  *   /setup → the guide lands on Create shows (step 2 of 3) and survives a reload → one show,
  *   then the weekday chips until there are 3 ("Add a couple more" in between) → Next →
@@ -11,31 +12,19 @@
  *   Invited booker: invite via the API, accept the link → the 4-stop welcome tour → Done →
  *   it doesn't come back.
  *
- * The fresh-club tests need a server on an unseeded data dir; against a seeded club (plain
- * `npm run e2e`) they skip and only the welcome tour runs:
+ * Against a server you started yourself it needs a fresh one (against a club that's already
+ * set up, the setup-guide tests skip):
  *
  *   rm -rf .data/guide && DATA_DIR=.data/guide PORT=3520 VITE_PORT=5520 npm run dev
- *   E2E_BASE_URL=http://localhost:5520 E2E_DATA_DIR=.data/guide npx playwright test e2e/onboarding.spec.ts
+ *   E2E_BASE_URL=http://localhost:5520 E2E_DATA_DIR=.data/guide npx playwright test --project=fresh
  */
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
-import path from 'node:path';
+import { clubDbFile, withClubDb as withDb } from './db';
 
-const DB_FILE = path.resolve(process.env.E2E_DATA_DIR ?? '.data/e2e', 'club.db');
 const FOUNDER = { name: 'Rich Brooks', email: 'rich@guide.example', password: 'laughs-1234' };
 const SEEDED_ADMIN = { email: 'admin@example.com', password: 'comedy123' };
 const COMEDIAN = { name: 'Jason Lee', email: 'jason@guide.example' };
-
-function withDb<T>(fn: (db: Database.Database) => T): T {
-  const db = new Database(DB_FILE);
-  db.pragma('busy_timeout = 5000');
-  try {
-    return fn(db);
-  } finally {
-    db.close();
-  }
-}
 
 /** The coach card: a labelled, non-modal dialog. */
 const coach = (page: Page, title: string | RegExp) => page.locator('[data-guide-card]').and(page.getByRole('dialog', { name: title }));
@@ -62,13 +51,19 @@ test.beforeAll(async ({ request }) => {
   freshClub = !status.setupComplete;
 });
 
+/**
+ * The guide tests set the club up, so they need a server nobody has set up yet. `npm run e2e`
+ * always starts one; only a server you started yourself may not be.
+ */
+function requireFreshClub() {
+  test.skip(!freshClub && Boolean(process.env.E2E_BASE_URL), 'needs a fresh, unseeded club (see the file comment)');
+  expect(freshClub, 'the `fresh` project starts its server on an empty data folder').toBe(true);
+}
+
 test.describe.serial('setup guide on a fresh club', () => {
-  test.beforeEach(({}, testInfo) => {
-    test.skip(testInfo.project.name !== 'desktop', 'desktop guide');
-  });
 
   test('/setup hands over to the guide, which walks the shows step', async ({ page }) => {
-    test.skip(!freshClub, 'needs a fresh, unseeded club (see the file comment)');
+    requireFreshClub();
     test.setTimeout(90_000);
 
     // Step 1 of 3: the setup wizard.
@@ -135,7 +130,7 @@ test.describe.serial('setup guide on a fresh club', () => {
   });
 
   test('skip the guide, then resume it from the user menu; Esc minimizes it', async ({ page }) => {
-    test.skip(!freshClub, 'needs a fresh, unseeded club (see the file comment)');
+    requireFreshClub();
 
     // Signing in again resumes at the current step (comedians), wherever the booker lands.
     await signIn(page, FOUNDER);
@@ -174,7 +169,7 @@ test.describe.serial('setup guide on a fresh club', () => {
   });
 
   test('comedians → request availability (outbox) → "You’re set up"', async ({ page }) => {
-    test.skip(!freshClub, 'needs a fresh, unseeded club (see the file comment)');
+    requireFreshClub();
     test.setTimeout(60_000);
 
     await signIn(page, FOUNDER);
@@ -243,9 +238,9 @@ test.describe.serial('setup guide on a fresh club', () => {
   });
 });
 
-test('an invited booker sees the welcome tour once', async ({ page, browser }, testInfo) => {
-  test.skip(testInfo.project.name !== 'desktop', 'desktop guide');
-  const admin = existsSync(DB_FILE) && withDb((db) => db.prepare('SELECT 1 FROM users WHERE email = ?').get(FOUNDER.email))
+test('an invited booker sees the welcome tour once', async ({ page, browser }) => {
+  // The founder from the tests above (or the demo admin on a seeded server).
+  const admin = existsSync(clubDbFile()) && withDb((db) => db.prepare('SELECT 1 FROM users WHERE email = ?').get(FOUNDER.email))
     ? FOUNDER
     : SEEDED_ADMIN;
   await signIn(page, admin);

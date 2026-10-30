@@ -15,6 +15,7 @@ import {
 } from 'lucide-react';
 import { useEffect, useRef, type ReactNode } from 'react';
 import { Navigate, useNavigate, useParams } from 'react-router';
+import { GuideDockSlot } from '../../components/guide';
 import { Card, PageHeader, Tabs, TabsContent, TabsList, TabsTrigger } from '../../components/ui';
 import { useBooker } from '../../lib/useMe';
 import { AccountTab } from './AccountTab';
@@ -86,6 +87,8 @@ export function SettingsPage() {
             </TabsTrigger>
           ))}
         </TabsList>
+        {/* The setup guide's card while it waits on this page (Add a location, Connect email). */}
+        <GuideDockSlot />
         {visible.map((t) => (
           <TabsContent key={t.id} value={t.id} className="animate-fade-in">
             {t.adminOnly && !isAdmin ? (

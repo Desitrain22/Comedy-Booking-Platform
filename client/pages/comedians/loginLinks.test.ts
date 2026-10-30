@@ -28,6 +28,11 @@ describe('sign-in link toasts (ux#A6)', () => {
       title: 'Sent 1 sign-in link',
       description: `Skipped 2 archived comedians. ${outboxHint(true)}`,
     });
+    // Several in the outbox: "they're", and a booker is told an admin can find them.
+    expect(outboxHint(true, 3)).toBe("Email isn't set up yet, so they're in the outbox (Settings → Email log).");
+    expect(outboxHint(false, 3)).toBe(
+      "Email isn't set up yet, so they're in the outbox. An admin can find them under Settings → Email log.",
+    );
     expect(bulkLinksToast('Added 4 comedians', { sent: 3, outbox: 0, failed: 1, skipped: 0 }, true)).toEqual({
       tone: 'warning',
       title: 'Added 4 comedians',

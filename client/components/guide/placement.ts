@@ -1,8 +1,10 @@
 /**
  * Where the coach card goes (pure; unit-tested in placement.test.ts): next to its target on the
  * first side where it fits whole, flipping to the other sides when it doesn't, aligned with the
- * target and clamped onto the screen. A target too big to sit beside (a whole calendar on a
- * small screen) gets the screen corner that covers it least. No target → centered.
+ * target and clamped onto the screen. It never covers the other lit elements (`avoid`): above or
+ * below its target it slides sideways to clear them. A target too big to sit beside (a whole
+ * calendar on a small screen) gets the screen corner that covers it least, keeping clear of the
+ * target's heading (its top band). No target → centered.
  */
 
 export type Side = 'right' | 'left' | 'bottom' | 'top';
@@ -34,6 +36,10 @@ export interface Placement {
 export const CARD_GAP = 16;
 /** Minimum space between the card and the screen edge. */
 export const SCREEN_MARGIN = 12;
+/** The top of a target that holds its heading ("November 2026"): a corner card avoids it. */
+export const HEADING_BAND = 72;
+/** How much worse covering the heading band is than covering the rest of the target. */
+const HEADING_WEIGHT = 4;
 
 const ALL_SIDES: Side[] = ['right', 'bottom', 'left', 'top'];
 
@@ -45,6 +51,17 @@ export function unionBox(boxes: readonly Box[]): Box | null {
   const bottom = Math.max(...boxes.map((b) => b.top + b.height));
   const right = Math.max(...boxes.map((b) => b.left + b.width));
   return { top, left, width: right - left, height: bottom - top };
+}
+
+/** Whether two boxes overlap (touching edges don't count). */
+export function intersects(a: Box, b: Box): boolean {
+  return a.left < b.left + b.width && b.left < a.left + a.width && a.top < b.top + b.height && b.top < a.top + a.height;
+}
+
+function overlapArea(a: Box, b: Box): number {
+  const w = Math.min(a.left + a.width, b.left + b.width) - Math.max(a.left, b.left);
+  const h = Math.min(a.top + a.height, b.top + b.height) - Math.max(a.top, b.top);
+  return Math.max(0, w) * Math.max(0, h);
 }
 
 function nearby(a: Box, b: Box, slack: number): boolean {
@@ -87,11 +104,17 @@ export function centerCard(card: Size, viewport: Viewport): Placement {
   };
 }
 
+/**
+ * @param target  the lit element's ring (null → centered)
+ * @param avoid   other lit elements the card must not cover (e.g. the calendar lit beside the
+ *                weekday chips)
+ */
 export function placeCard(
   target: Box | null,
   card: Size,
   viewport: Viewport,
   prefer: readonly Side[] = ALL_SIDES,
+  avoid: readonly Box[] = [],
 ): Placement {
   if (!target) return centerCard(card, viewport);
 
@@ -110,29 +133,43 @@ export function placeCard(
   const aboveBelowLeft = () =>
     clampLeft(target.left + card.width <= viewport.width - SCREEN_MARGIN ? target.left : right - card.width);
 
+  const cardAt = (left: number, top: number): Box => ({ left, top, width: card.width, height: card.height });
+  const clear = (left: number, top: number) => !avoid.some((a) => intersects(cardAt(left, top), a));
+  // Above/below: if the card would cover another lit element, slide it sideways just clear of it
+  // (still overlapping its own target, still on screen).
+  const slideClear = (left: number, top: number): number | null => {
+    if (clear(left, top)) return left;
+    for (const a of avoid) {
+      for (const next of [a.left - CARD_GAP / 2 - card.width, a.left + a.width + CARD_GAP / 2]) {
+        const onScreen = next >= SCREEN_MARGIN && next + card.width <= viewport.width - SCREEN_MARGIN;
+        const besideTarget = next < right && next + card.width > target.left;
+        if (onScreen && besideTarget && clear(next, top)) return next;
+      }
+    }
+    return null;
+  };
+
   const candidates = [...prefer, ...ALL_SIDES.filter((s) => !prefer.includes(s))].map((side) => {
     switch (side) {
       case 'right': {
         const left = right + CARD_GAP;
-        return { side, left, top: besideTop(), fits: left + card.width <= viewport.width - SCREEN_MARGIN, room: viewport.width - right };
+        const top = besideTop();
+        return { side, left, top, fits: left + card.width <= viewport.width - SCREEN_MARGIN && clear(left, top) };
       }
       case 'left': {
         const left = target.left - CARD_GAP - card.width;
-        return { side, left, top: besideTop(), fits: left >= SCREEN_MARGIN, room: target.left };
+        const top = besideTop();
+        return { side, left, top, fits: left >= SCREEN_MARGIN && clear(left, top) };
       }
       case 'bottom': {
         const top = bottom + CARD_GAP;
-        return {
-          side,
-          left: aboveBelowLeft(),
-          top,
-          fits: top + card.height <= viewport.height - SCREEN_MARGIN,
-          room: viewport.height - bottom,
-        };
+        const left = slideClear(aboveBelowLeft(), top);
+        return { side, left: left ?? 0, top, fits: left !== null && top + card.height <= viewport.height - SCREEN_MARGIN };
       }
       case 'top': {
         const top = target.top - CARD_GAP - card.height;
-        return { side, left: aboveBelowLeft(), top, fits: top >= minTop, room: target.top - minTop };
+        const left = slideClear(aboveBelowLeft(), top);
+        return { side, left: left ?? 0, top, fits: left !== null && top >= minTop };
       }
     }
   });
@@ -140,17 +177,19 @@ export function placeCard(
   const fit = candidates.find((c) => c.fits);
   if (fit) return { side: fit.side, left: clampLeft(fit.left), top: clampTop(fit.top) };
 
-  // Nowhere beside it: the screen corner that hides the least of the target.
+  // Nowhere beside it: the screen corner that hides the least of the target (and of the other
+  // lit elements), where covering the target's heading counts several times over.
   const corners = [
     { left: SCREEN_MARGIN, top: minTop },
     { left: maxLeft, top: minTop },
     { left: SCREEN_MARGIN, top: maxTop },
     { left: maxLeft, top: maxTop },
   ];
+  const heading: Box = { ...target, height: Math.min(HEADING_BAND, target.height) };
   const covered = (c: { left: number; top: number }) => {
-    const w = Math.min(c.left + card.width, right) - Math.max(c.left, target.left);
-    const h = Math.min(c.top + card.height, bottom) - Math.max(c.top, target.top);
-    return Math.max(0, w) * Math.max(0, h);
+    const box = cardAt(c.left, c.top);
+    const others = avoid.reduce((sum, a) => sum + overlapArea(box, a), 0);
+    return overlapArea(box, target) + HEADING_WEIGHT * overlapArea(box, heading) + others;
   };
   const best = corners.reduce((a, c) => (covered(c) < covered(a) ? c : a));
   return { side: 'corner', left: Math.round(best.left), top: Math.round(best.top) };

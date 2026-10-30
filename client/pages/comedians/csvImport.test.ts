@@ -124,7 +124,7 @@ describe('import toast', () => {
     expect(toast).toEqual({
       tone: 'success',
       title: 'Imported 3 comedians · skipped 1',
-      description: `Sent 3 sign-in links. ${outboxHint(false)}`,
+      description: `Sent 3 sign-in links. ${outboxHint(false, 3)}`,
     });
   });
 });

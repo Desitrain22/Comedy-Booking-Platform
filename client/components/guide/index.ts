@@ -7,7 +7,7 @@
  *   useGuideAction('request-availability', openDialog);       // what the coach card can trigger
  *   const { data } = useOnboarding();                         // GET /api/onboarding
  */
-export { GuideOverlay } from './GuideOverlay';
+export { GuideDockSlot, GuideOverlay } from './GuideOverlay';
 export { autoStarts, GuideProvider, useGuide, useGuideAction, useGuideSignal, type GuideContextValue } from './GuideProvider';
 export { GUIDE_RAIL_HEIGHT, GuideRail, useGuideRailVisible } from './GuideRail';
 export { ONBOARDING_KEY, useOnboarding } from './onboardingQuery';

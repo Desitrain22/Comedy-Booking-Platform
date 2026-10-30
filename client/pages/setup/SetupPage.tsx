@@ -31,19 +31,22 @@ interface SetupForm {
 
 type Errors = Partial<Record<keyof SetupForm, string>>;
 
-const STEPS: { title: string; description: string; fields: (keyof SetupForm)[] }[] = [
+const STEPS: { title: string; label: string; description: string; fields: (keyof SetupForm)[] }[] = [
   {
     title: 'Set up your club',
+    label: 'Name & timezone',
     description: 'This shows up in emails and on the comedian portal.',
     fields: ['clubName', 'timezone'],
   },
   {
     title: 'Your first location',
+    label: 'Location',
     description: 'A room or venue where shows happen. You can add more later in Settings.',
     fields: ['locationName', 'locationAddress'],
   },
   {
     title: 'Your admin account',
+    label: 'Your login',
     description: 'You will sign in with this email and password.',
     fields: ['adminName', 'adminEmail', 'adminPassword'],
   },
@@ -143,20 +146,20 @@ export function SetupPage() {
       className="max-w-md"
       footer={<GuideSteps />}
     >
-      <ol className="mb-5 flex items-center gap-2" aria-label="Setup progress">
+      {/* The wizard's own pages: labelled bars, not numbers (the 1-2-3 under the card is the guide). */}
+      <ol className="mb-5 grid grid-cols-3 gap-2" aria-label="Setup progress">
         {STEPS.map((s, i) => (
-          <li key={s.title} className="flex flex-1 items-center gap-2" aria-current={i === step ? 'step' : undefined}>
+          <li key={s.title} aria-current={i === step ? 'step' : undefined}>
+            <span aria-hidden className={cn('block h-1 rounded-full', i <= step ? 'bg-accent-solid' : 'bg-border')} />
             <span
               className={cn(
-                'flex size-6 shrink-0 items-center justify-center rounded-full text-xs font-semibold',
-                i < step && 'bg-accent-solid text-accent-solid-fg',
-                i === step && 'border-2 border-accent text-accent',
-                i > step && 'border border-border-strong text-fg-subtle',
+                'mt-1.5 flex items-center gap-1 text-xs',
+                i === step ? 'font-semibold text-fg' : i < step ? 'text-fg-muted' : 'text-fg-subtle',
               )}
             >
-              {i < step ? <Check className="size-3.5" aria-label="Done" /> : i + 1}
+              {i < step && <Check className="size-3 text-accent" aria-label="Done:" />}
+              {s.label}
             </span>
-            {i < STEPS.length - 1 && <span className={cn('h-px flex-1', i < step ? 'bg-accent' : 'bg-border')} />}
           </li>
         ))}
       </ol>

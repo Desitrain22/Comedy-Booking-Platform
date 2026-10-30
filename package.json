@@ -2,7 +2,28 @@
   "name": "comedy-booking-platform",
   "version": "0.1.0",
   "private": true,
-  "description": "Open-source, self-hosted booking tool for comedy clubs: shows, lineups, comedian availability and weekly confirmations.",
+  "description": "Open-source, self-hosted booking tool for comedy clubs: shows, lineups, comedian availability, CSV roster import and weekly confirmations.",
+  "keywords": [
+    "comedy",
+    "comedy-club",
+    "booking",
+    "lineup",
+    "scheduling",
+    "availability",
+    "self-hosted",
+    "open-source",
+    "sqlite",
+    "hono",
+    "react"
+  ],
+  "homepage": "https://github.com/Desitrain22/Comedy-Booking-Platform#readme",
+  "bugs": {
+    "url": "https://github.com/Desitrain22/Comedy-Booking-Platform/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Desitrain22/Comedy-Booking-Platform.git"
+  },
   "license": "MIT",
   "type": "module",
   "engines": {

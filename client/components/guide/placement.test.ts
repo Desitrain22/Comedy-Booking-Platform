@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { CARD_GAP, centerCard, mergeNearby, placeCard, SCREEN_MARGIN, unionBox, type Box } from './placement';
+import { CARD_GAP, centerCard, intersects, mergeNearby, placeCard, SCREEN_MARGIN, unionBox, type Box } from './placement';
 
 const viewport = { width: 1440, height: 900 };
 const card = { width: 320, height: 180 };
@@ -54,20 +54,44 @@ describe('placeCard', () => {
     expect(placeCard({ top: 150, left: 500, width: 100, height: 30 }, card, { ...viewport, insetTop: 44 }, ['top']).side).not.toBe('top');
   });
 
-  it('falls back to the screen corner that covers the target least when nothing fits', () => {
-    // A calendar filling most of a 1024×768 screen, sidebar on the left.
+  it('falls back to the screen corner that covers the target least when nothing fits, clear of its heading', () => {
+    // A calendar filling most of a 1024×768 screen, sidebar on the left. The top-left corner
+    // covers less of it, but that's where "November 2026" is: bottom-left instead.
     const laptop = { width: 1024, height: 768, insetTop: 44 };
     const calendar: Box = { top: 174, left: 242, width: 764, height: 576 };
-    expect(placeCard(calendar, { width: 320, height: 170 }, laptop, ['left', 'top', 'bottom'])).toEqual({
-      side: 'corner',
-      left: SCREEN_MARGIN,
-      top: 44 + SCREEN_MARGIN,
-    });
+    const cardSize = { width: 320, height: 170 };
+    const placed = placeCard(calendar, cardSize, laptop, ['left', 'top', 'bottom']);
+    expect(placed).toEqual({ side: 'corner', left: SCREEN_MARGIN, top: 768 - 170 - SCREEN_MARGIN });
+    const heading: Box = { top: calendar.top, left: calendar.left, width: calendar.width, height: 60 };
+    expect(intersects({ ...placed, ...cardSize }, heading)).toBe(false);
     const huge: Box = { top: 20, left: 20, width: 1400, height: 860 };
-    const placed = placeCard(huge, card, viewport, ['right']);
-    expect(placed.side).toBe('corner');
-    expect(placed.left + card.width).toBeLessThanOrEqual(viewport.width - SCREEN_MARGIN);
-    expect(placed.top + card.height).toBeLessThanOrEqual(viewport.height - SCREEN_MARGIN);
+    const inCorner = placeCard(huge, card, viewport, ['right']);
+    expect(inCorner.side).toBe('corner');
+    expect(inCorner.left + card.width).toBeLessThanOrEqual(viewport.width - SCREEN_MARGIN);
+    expect(inCorner.top + card.height).toBeLessThanOrEqual(viewport.height - SCREEN_MARGIN);
+  });
+});
+
+describe('placeCard with other lit elements', () => {
+  // Create shows at 1440: the weekday chips (in the 300px form column) lit together with the
+  // calendar to their right.
+  const chips: Box = { top: 423, left: 253, width: 288, height: 80 };
+  const calendar: Box = { top: 151, left: 557, width: 870, height: 586 };
+
+  it('slides a card below its target sideways so it does not cover the other lit element', () => {
+    const placed = placeCard(chips, card, viewport, ['left', 'bottom', 'right'], [calendar]);
+    expect(placed.side).toBe('bottom');
+    expect(placed.top).toBe(423 + 80 + CARD_GAP);
+    expect(placed.left).toBe(557 - CARD_GAP / 2 - 320);
+    expect(intersects({ ...placed, ...card }, calendar)).toBe(false);
+    // Without it, start-aligned with the chips (and over the calendar's edge).
+    expect(placeCard(chips, card, viewport, ['left', 'bottom', 'right']).left).toBe(253);
+  });
+
+  it('skips a side whose card would cover another lit element', () => {
+    const button: Box = { top: 300, left: 400, width: 120, height: 36 };
+    const beside: Box = { top: 250, left: 540, width: 400, height: 200 };
+    expect(placeCard(button, card, viewport, ['right', 'bottom'], [beside]).side).toBe('bottom');
   });
 });
 

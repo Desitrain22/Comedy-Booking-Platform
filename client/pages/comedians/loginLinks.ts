@@ -14,11 +14,12 @@ function n(count: number, one: string, many = `${one}s`): string {
   return `${count} ${count === 1 ? one : many}`;
 }
 
-/** Where outbox emails can be found; the email log is admin-only. */
-export function outboxHint(isAdmin: boolean): string {
+/** Where outbox emails can be found (`count` of them); the email log is admin-only. */
+export function outboxHint(isAdmin: boolean, count = 1): string {
+  const [it, them] = count === 1 ? ["it's", 'it'] : ["they're", 'them'];
   return isAdmin
-    ? "Email isn't set up yet, so it's in the outbox (Settings → Email log)."
-    : "Email isn't set up yet, so it's in the outbox. An admin can find it under Settings → Email log.";
+    ? `Email isn't set up yet, so ${it} in the outbox (Settings → Email log).`
+    : `Email isn't set up yet, so ${it} in the outbox. An admin can find ${them} under Settings → Email log.`;
 }
 
 /** After adding one comedian (with or without the invite). */
@@ -38,7 +39,7 @@ export function bulkLinksToast(lead: string | null, result: BulkLoginLinkResult,
   const emailed = result.sent + result.outbox;
   const parts: string[] = [];
   if (result.skipped) parts.push(`Skipped ${n(result.skipped, 'archived comedian')}.`);
-  if (result.outbox) parts.push(outboxHint(isAdmin));
+  if (result.outbox) parts.push(outboxHint(isAdmin, result.outbox));
   if (result.failed) {
     return {
       tone: 'warning',

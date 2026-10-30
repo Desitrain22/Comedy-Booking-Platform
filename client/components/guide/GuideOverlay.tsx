@@ -7,6 +7,9 @@
  *   (`pointer-events: none`): the whole page stays usable. The lit element is also raised above
  *   the dim.
  * - < 768px: no spotlight; the coach card docks as a bottom sheet.
+ * - Docked marks (a form to fill in underneath, e.g. Connect your email): no dim, and the card
+ *   sits in the page flow where the page renders a `GuideDockSlot` (Settings), so it never covers
+ *   the form; on a page without a slot it floats top-right.
  * - Minimized (Esc): a "Setup guide · Step 2 of 3 — Resume" pill.
  * - While a dialog is open (Radix, z-50, above all of this) the card steps aside and a small
  *   hint above the dialog's overlay says what to do (below the dialog on wider screens, where
@@ -32,7 +35,7 @@ import { createPortal } from 'react-dom';
 import { Button } from '../ui/Button';
 import { cn } from '../../lib/cn';
 import { useGuide, type GuideContextValue } from './GuideProvider';
-import { mergeNearby, placeCard, unionBox, type Box, type Placement, type Size } from './placement';
+import { intersects, mergeNearby, placeCard, unionBox, type Box, type Placement, type Size } from './placement';
 import type { GuideMark } from './script';
 import { useTargetLayout, type TargetLayout } from './useTargetLayout';
 
@@ -168,6 +171,34 @@ function useEscapeToMinimize(minimize: (() => void) | undefined, enabled: boolea
   }, [enabled, minimize]);
 }
 
+const DOCK_SLOT = '[data-guide-dock]';
+
+/**
+ * Where a docked mark's card goes on wider screens: in the page flow, above the page's content,
+ * so it never covers the form it's about. Pages with docked marks (Settings → Locations, Email)
+ * render one; without it the card floats top-right.
+ */
+export function GuideDockSlot({ className }: { className?: string }) {
+  return <div data-guide-dock="" className={cn('empty:hidden', className)} />;
+}
+
+/** The page's `GuideDockSlot`, tracked as pages mount and unmount. */
+function useDockSlot(enabled: boolean): HTMLElement | null {
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (!enabled) {
+      setSlot(null);
+      return;
+    }
+    const find = () => setSlot(document.querySelector<HTMLElement>(DOCK_SLOT));
+    find();
+    const observer = new MutationObserver(find);
+    observer.observe(document.body, { childList: true, subtree: true });
+    return () => observer.disconnect();
+  }, [enabled]);
+  return slot;
+}
+
 /** Card size, measured before paint and whenever its content reflows. */
 function useElementSize(ref: RefObject<HTMLElement | null>): Size | null {
   const [size, setSize] = useState<Size | null>(null);
@@ -228,18 +259,21 @@ function Spotlight({ guide, mark, rootRef }: { guide: GuideContextValue; mark: G
 
   const holes = layout.rects;
   const anchor: Box | null = mark.anchor === 'union' ? unionBox(holes) : (holes[0] ?? null);
+  const anchorRing = anchor && ringBox(anchor);
   // Targets side by side (Import CSV + Add comedian) share one spotlight.
   const lit = mergeNearby(holes.map(ringBox), 12);
+  // The card sits by its anchor and never covers the other lit element (chips + calendar).
+  const avoid = anchorRing ? lit.filter((b) => !intersects(b, anchorRing)) : [];
   const viewport = layout.viewport.width ? layout.viewport : { width: window.innerWidth, height: window.innerHeight, insetTop: 0 };
   const corner = mark.targets.length === 0 && mark.dock === 'corner';
+  const dockSlot = useDockSlot(corner);
 
   let placement: Placement | null = null;
   if (size) {
-    // Docked top-right: on settings pages that is the empty space beside the title, clear of
-    // the form and its Save button.
+    // Docked without a slot on the page: top-right, undimmed.
     placement = corner
       ? { side: 'corner', left: viewport.width - size.width - 24, top: (viewport.insetTop ?? 0) + 12 }
-      : placeCard(anchor && ringBox(anchor), size, viewport, mark.placement);
+      : placeCard(anchorRing, size, viewport, mark.placement, avoid);
   }
 
   // Glide between positions, but appear in place the first time.
@@ -247,6 +281,18 @@ function Spotlight({ guide, mark, rootRef }: { guide: GuideContextValue; mark: G
   useEffect(() => {
     if (placement) placed.current = true;
   });
+
+  if (corner && dockSlot) {
+    return createPortal(
+      <CoachCard
+        guide={guide}
+        mark={mark}
+        cardRef={cardRef}
+        className="animate-fade-in rounded-xl border border-accent/40 bg-surface p-4 shadow-sm ring-4 ring-accent-soft"
+      />,
+      dockSlot,
+    );
+  }
 
   return (
     <>
