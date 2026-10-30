@@ -59,6 +59,12 @@ export const settings = sqliteTable(
      * confirmation email. Off = all-or-nothing "confirm the week".
      */
     allowDeclines: bool('allow_declines').notNull().default(false),
+    /**
+     * Who emails come from (hosted MVP spec §5): `company` = every email from the company
+     * (Reply-To = `replyTo`, shown as "Company email"); `booker` = availability requests and
+     * single-booker confirmations come from that booker.
+     */
+    senderMode: text('sender_mode', { enum: ['company', 'booker'] }).notNull().default('company'),
     setupComplete: bool('setup_complete').notNull().default(false),
     createdAt: createdAt(),
   },
@@ -86,6 +92,17 @@ export const users = sqliteTable('users', {
   guideDismissedAt: integer('guide_dismissed_at'),
   /** Setup guide / welcome tour: when this booker finished it (never auto-starts again). */
   guideCompletedAt: integer('guide_completed_at'),
+  /**
+   * This booker's own mailbox (senderMode `booker`). Empty host = not connected. The password
+   * is encrypted at rest when APP_SECRET is set (`enc:v1:…`) and never leaves the server.
+   */
+  smtpHost: text('smtp_host').notNull().default(''),
+  smtpPort: integer('smtp_port').notNull().default(587),
+  smtpSecure: bool('smtp_secure').notNull().default(false),
+  smtpUser: text('smtp_user').notNull().default(''),
+  smtpPass: text('smtp_pass').notNull().default(''),
+  /** Address this booker's mailbox sends as ('' = smtpUser). */
+  smtpFromEmail: text('smtp_from_email').notNull().default(''),
 });
 
 export const sessions = sqliteTable(
@@ -347,6 +364,15 @@ export const emailLog = sqliteTable(
     comedianId: integer('comedian_id').references(() => comedians.id, { onDelete: 'set null' }),
     bodyHtml: text('body_html').notNull().default(''),
     bodyText: text('body_text').notNull().default(''),
+    /**
+     * How it went out: the company's connected mailbox, a booker's own mailbox, the
+     * platform sender (SMTP_* env) or the outbox. '' for rows logged before this existed.
+     */
+    via: text('via', { enum: ['', 'company-mailbox', 'booker-mailbox', 'platform', 'outbox'] })
+      .notNull()
+      .default(''),
+    /** The booker it was sent as (senderMode `booker`), else null = the company. */
+    senderUserId: integer('sender_user_id').references(() => users.id, { onDelete: 'set null' }),
     createdAt: createdAt(),
   },
   (t) => [index('email_log_created_idx').on(t.createdAt), index('email_log_comedian_idx').on(t.comedianId)],
