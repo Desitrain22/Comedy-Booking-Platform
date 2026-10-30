@@ -254,10 +254,16 @@ describe('platform host only', () => {
     for (const [method, path] of [
       ['GET', '/overview'],
       ['GET', `/clubs/${club.id}`],
+      ['POST', `/clubs/${club.id}/suspend`],
+      ['POST', `/clubs/${club.id}/reactivate`],
+      ['POST', `/clubs/${club.id}/archive`],
+      ['POST', `/clubs/${club.id}/restore`],
+      ['GET', `/clubs/${club.id}/backup`],
     ] as const) {
-      const res = await h.request(admin(path), { method });
+      const res = await h.request(admin(path), { method, ...(method === 'POST' ? { json: {} } : {}) });
       expect(res.status, path).toBe(401);
     }
+    expect(h.platform.registry.getClubById(club.id)!.status).toBe('active');
   });
 });
 

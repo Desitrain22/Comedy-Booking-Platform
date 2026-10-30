@@ -1,6 +1,12 @@
+import Database from 'better-sqlite3';
 import { existsSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { AdminClubDetail, AdminOverview } from '../../shared/api/platformAdmin';
+import type {
+  AdminActionResponse,
+  AdminClubDetail,
+  AdminInvalidTransitionBody,
+  AdminOverview,
+} from '../../shared/api/platformAdmin';
 import { addDays } from '../../shared/time';
 import type { Db } from '../db/client';
 import { emailLog, users } from '../db/schema';
@@ -15,6 +21,7 @@ import {
 } from '../test/helpers';
 import { makeHostedTestApp, type HostedTestApp } from '../test/hosted';
 import { createAdminSession } from './adminAuth';
+import { adminEvents } from './schema';
 
 const OWNER = 'owner@platform.test';
 /** Wednesday 4 Nov 2026, 12:00 in New York (club time). */
@@ -39,6 +46,7 @@ afterEach(() => {
 
 const admin = (path: string) => h.platformUrl(`/api/platform/admin${path}`);
 const get = (path: string) => h.request(admin(path), { headers });
+const post = (path: string, json: unknown = {}) => h.request(admin(path), { method: 'POST', json, headers });
 
 async function overview(query = ''): Promise<AdminOverview> {
   const res = await get(`/overview${query}`);
@@ -322,5 +330,156 @@ describe('GET /clubs/:id', () => {
     expect((await get('/clubs/999')).status).toBe(404);
     expect((await readJson<{ code: string }>(await get('/clubs/999'))).code).toBe('not_found');
     expect((await get('/clubs/abc')).status).toBe(400);
+  });
+});
+
+// ---------------------------------------------------------------------------
+
+describe('actions', () => {
+  const events = () =>
+    h.platform.db
+      .select()
+      .from(adminEvents)
+      .all()
+      .map((e) => [e.action, e.clubId, e.adminEmail, e.reason]);
+
+  async function expectConflict(res: Response, status: string) {
+    expect(res.status).toBe(409);
+    const body = await readJson<AdminInvalidTransitionBody>(res);
+    expect(body.code).toBe('invalid_transition');
+    expect(body.status).toBe(status);
+    expect(body.error).toBeTruthy();
+  }
+
+  it('suspend → reactivate → archive → restore, each logged; the club’s site follows', async () => {
+    const { club } = h.createClub({ slug: 'broadway', name: 'Broadway Comedy' });
+    const { headers: booker } = h.loginAsBooker('broadway');
+    const clubApi = () => h.request(h.clubUrl('broadway', '/api/comedians'), { headers: booker });
+    expect((await clubApi()).status).toBe(200);
+
+    // Suspend, with a reason.
+    let res = await post(`/clubs/${club.id}/suspend`, { reason: '  Unpaid  ' });
+    expect(res.status).toBe(200);
+    expect((await readJson<AdminActionResponse>(res)).club).toMatchObject({
+      status: 'suspended',
+      statusReason: 'Unpaid',
+      statusChangedAt: NOW,
+      stats: { bookers: 2 },
+    });
+    expect((await clubApi()).status).toBe(403);
+    await expectConflict(await post(`/clubs/${club.id}/suspend`), 'suspended');
+
+    // Reactivate.
+    res = await post(`/clubs/${club.id}/reactivate`);
+    expect((await readJson<AdminActionResponse>(res)).club).toMatchObject({ status: 'active', statusReason: '' });
+    expect((await clubApi()).status).toBe(200);
+    await expectConflict(await post(`/clubs/${club.id}/reactivate`), 'active');
+    await expectConflict(await post(`/clubs/${club.id}/restore`), 'active');
+
+    // Archive: needs the address typed.
+    res = await post(`/clubs/${club.id}/archive`, {});
+    expect(res.status).toBe(400);
+    res = await post(`/clubs/${club.id}/archive`, { confirmSlug: 'broadwa' });
+    expect(res.status).toBe(400);
+    expect((await readJson<{ code: string }>(res)).code).toBe('confirm_slug_mismatch');
+    expect(h.platform.registry.getClubById(club.id)!.status).toBe('active');
+
+    expect(h.platform.registry.openClubIds()).toContain(club.id);
+    res = await post(`/clubs/${club.id}/archive`, { confirmSlug: ' BROADWAY ', reason: 'Closed down' });
+    expect(res.status).toBe(200);
+    expect((await readJson<AdminActionResponse>(res)).club).toMatchObject({ status: 'archived', statusReason: 'Closed down' });
+    // Archiving closed its database, and reading it for the response didn't reopen it.
+    expect(h.platform.registry.openClubIds()).not.toContain(club.id);
+    const gone = await clubApi();
+    expect(gone.status).toBe(404);
+    expect((await readJson<{ code: string }>(gone)).code).toBe('club_not_found');
+    expect(h.platform.registry.openClubIds()).not.toContain(club.id);
+
+    await expectConflict(await post(`/clubs/${club.id}/archive`, { confirmSlug: 'broadway' }), 'archived');
+    await expectConflict(await post(`/clubs/${club.id}/suspend`), 'archived');
+    await expectConflict(await post(`/clubs/${club.id}/reactivate`), 'archived');
+
+    // Restore: back as active, data intact.
+    res = await post(`/clubs/${club.id}/restore`);
+    expect((await readJson<AdminActionResponse>(res)).club).toMatchObject({ status: 'active', statusReason: '' });
+    expect((await clubApi()).status).toBe(200);
+
+    expect(events()).toEqual([
+      ['suspend', club.id, OWNER, 'Unpaid'],
+      ['reactivate', club.id, OWNER, ''],
+      ['archive', club.id, OWNER, 'Closed down'],
+      ['restore', club.id, OWNER, ''],
+    ]);
+    const history = (await detail(club.id)).events;
+    expect(history.map((e) => e.action)).toEqual(['restore', 'archive', 'reactivate', 'suspend']);
+  });
+
+  it('a suspended club can be archived; refused actions write no event', async () => {
+    const { club } = h.createClub({ slug: 'paused', status: 'suspended' });
+    await expectConflict(await post(`/clubs/${club.id}/suspend`, { reason: 'again' }), 'suspended');
+    expect(events()).toEqual([]);
+    const res = await post(`/clubs/${club.id}/archive`, { confirmSlug: 'paused' });
+    expect(res.status).toBe(200);
+    expect(events()).toEqual([['archive', club.id, OWNER, '']]);
+  });
+
+  it('404 for an unknown club', async () => {
+    for (const action of ['suspend', 'reactivate', 'restore']) {
+      expect((await post(`/clubs/999/${action}`)).status).toBe(404);
+    }
+    expect((await post('/clubs/999/archive', { confirmSlug: 'x' })).status).toBe(404);
+    expect((await get('/clubs/999/backup')).status).toBe(404);
+  });
+
+  it('a reason is at most 500 characters', async () => {
+    const { club } = h.createClub({ slug: 'broadway' });
+    expect((await post(`/clubs/${club.id}/suspend`, { reason: 'x'.repeat(501) })).status).toBe(400);
+  });
+});
+
+describe('GET /clubs/:id/backup', () => {
+  async function download(id: number) {
+    const res = await get(`/clubs/${id}/backup`);
+    expect(res.status).toBe(200);
+    return { res, bytes: Buffer.from(await res.arrayBuffer()) };
+  }
+
+  function openCopy(bytes: Buffer) {
+    return new Database(bytes);
+  }
+
+  it('a consistent .db snapshot of an active club, logged', async () => {
+    const { club, db } = h.createClub({ slug: 'broadway' });
+    createComedian(db, { name: 'Backed Up', email: 'backed@up.test' });
+    const { res, bytes } = await download(club.id);
+    expect(res.headers.get('content-type')).toBe('application/vnd.sqlite3');
+    expect(res.headers.get('content-disposition')).toBe('attachment; filename="broadway-backup-2026-11-04.db"');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(Number(res.headers.get('content-length'))).toBe(bytes.length);
+    expect(bytes.subarray(0, 15).toString()).toBe('SQLite format 3');
+    const copy = openCopy(bytes);
+    expect(copy.prepare('SELECT name FROM comedians').all()).toEqual([{ name: 'Backed Up' }]);
+    copy.close();
+
+    const [event] = h.platform.db.select().from(adminEvents).all();
+    expect(event).toMatchObject({ action: 'backup_download', clubId: club.id, adminEmail: OWNER });
+  });
+
+  it('works for a suspended or archived club, which stays closed', async () => {
+    const { club, db } = h.createClub({ slug: 'gone' });
+    createComedian(db, { name: 'Archived Comic', email: 'a@gone.test' });
+    expect((await post(`/clubs/${club.id}/archive`, { confirmSlug: 'gone' })).status).toBe(200);
+
+    const { bytes } = await download(club.id);
+    const copy = openCopy(bytes);
+    expect(copy.prepare('SELECT name FROM comedians').all()).toEqual([{ name: 'Archived Comic' }]);
+    copy.close();
+    expect(h.platform.registry.openClubIds()).not.toContain(club.id);
+    const file = h.platform.registry.clubDbFile(club.id);
+    expect(existsSync(`${file}-wal`)).toBe(false);
+    expect(h.platform.db.select().from(adminEvents).all().map((e) => e.action)).toEqual(['archive', 'backup_download']);
+
+    const paused = h.createClub({ slug: 'paused', status: 'suspended' });
+    await download(paused.club.id);
   });
 });

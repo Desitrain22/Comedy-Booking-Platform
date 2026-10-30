@@ -9,15 +9,23 @@
  *   POST /api/platform/admin/logout
  *   GET  /api/platform/admin/overview           totals + clubs (?status=active|suspended|archived|all&search=)
  *   GET  /api/platform/admin/clubs/:id          one club in depth
+ *   POST /api/platform/admin/clubs/:id/suspend | reactivate | archive | restore
+ *   GET  /api/platform/admin/clubs/:id/backup   the club's database as a .db download
  *
  * Sign-in is rate limited per IP and per email (server/platform/limits.ts). An address that
  * isn't an owner's gets the same answers as one that is (no email, and its codes never work).
  */
 import { Hono } from 'hono';
+import { createReadStream } from 'node:fs';
+import { Readable } from 'node:stream';
 import {
+  adminArchiveSchema,
+  adminEmptySchema,
   adminOverviewQuerySchema,
   adminRequestCodeSchema,
+  adminSuspendSchema,
   adminVerifyCodeSchema,
+  type AdminActionResponse,
   type AdminClubDetail,
   type AdminMeResponse,
   type AdminOverview,
@@ -30,6 +38,7 @@ import { jsonError, parseId } from '../lib/http';
 import { isDevServer } from '../lib/rateLimitConfig';
 import { tooManyRequests } from '../lib/rateLimit';
 import { validate } from '../lib/validate';
+import { changeClubStatus, findClubOr404, recordAdminEvent, snapshotClubDb, type StatusAction } from './adminActions';
 import {
   adminLoginCodeEmail,
   endAdminSession,
@@ -40,8 +49,12 @@ import {
   startAdminSession,
   verifyAdminCode,
 } from './adminAuth';
-import { buildAdminClubDetail, buildAdminOverview } from './adminStats';
+import { buildAdminClubDetail, buildAdminOverview, readClub, toAdminClubRow } from './adminStats';
 import type { Platform } from './index';
+import type { Club } from './schema';
+
+/** Safety net: remove a backup temp file even if the download is never read. */
+const BACKUP_TEMP_TTL_MS = 10 * 60_000;
 
 export function platformAdminRoutes(platform: Platform): Hono<AppEnv> {
   const routes = new Hono<AppEnv>();
@@ -114,9 +127,72 @@ export function platformAdminRoutes(platform: Platform): Hono<AppEnv> {
   });
 
   routes.get('/platform/admin/clubs/:id', requireOwner, (c) => {
-    const club = platform.registry.getClubById(parseId(c.req.param('id')));
-    if (!club) return jsonError(c, 404, 'Club not found', 'not_found');
+    const club = findClubOr404(platform, parseId(c.req.param('id')));
     return c.json(buildAdminClubDetail(platform, club) satisfies AdminClubDetail);
+  });
+
+  // -------------------------------------------------------------------------
+  // Actions
+  // -------------------------------------------------------------------------
+
+  const actionResponse = (club: Club): AdminActionResponse => ({
+    club: toAdminClubRow(platform, club, readClub(platform, club)),
+  });
+
+  routes.post('/platform/admin/clubs/:id/suspend', requireOwner, validate('json', adminSuspendSchema), (c) => {
+    const club = changeClubStatus(platform, {
+      clubId: parseId(c.req.param('id')),
+      action: 'suspend',
+      adminEmail: c.var.platformAdmin.email,
+      reason: c.req.valid('json').reason,
+    });
+    return c.json(actionResponse(club));
+  });
+
+  for (const action of ['reactivate', 'restore'] as const satisfies readonly StatusAction[]) {
+    routes.post(`/platform/admin/clubs/:id/${action}`, requireOwner, validate('json', adminEmptySchema), (c) => {
+      const club = changeClubStatus(platform, {
+        clubId: parseId(c.req.param('id')),
+        action,
+        adminEmail: c.var.platformAdmin.email,
+      });
+      return c.json(actionResponse(club));
+    });
+  }
+
+  routes.post('/platform/admin/clubs/:id/archive', requireOwner, validate('json', adminArchiveSchema), (c) => {
+    const target = findClubOr404(platform, parseId(c.req.param('id')));
+    const { confirmSlug, reason } = c.req.valid('json');
+    if (confirmSlug !== target.slug) {
+      const message = `Type ${target.slug} to confirm`;
+      return jsonError(c, 400, message, 'confirm_slug_mismatch', { issues: [{ path: 'confirmSlug', message }] });
+    }
+    const club = changeClubStatus(platform, {
+      clubId: target.id,
+      action: 'archive',
+      adminEmail: c.var.platformAdmin.email,
+      reason,
+    });
+    return c.json(actionResponse(club));
+  });
+
+  routes.get('/platform/admin/clubs/:id/backup', requireOwner, async (c) => {
+    const club = findClubOr404(platform, parseId(c.req.param('id')));
+    const snapshot = await snapshotClubDb(platform, club);
+    recordAdminEvent(platform.db, { adminEmail: c.var.platformAdmin.email, clubId: club.id, action: 'backup_download' });
+
+    const stream = createReadStream(snapshot.file);
+    stream.once('close', snapshot.cleanup);
+    setTimeout(snapshot.cleanup, BACKUP_TEMP_TTL_MS).unref();
+    const filename = `${club.slug}-backup-${new Date().toISOString().slice(0, 10)}.db`;
+    return new Response(Readable.toWeb(stream) as unknown as ReadableStream<Uint8Array>, {
+      headers: {
+        'content-type': 'application/vnd.sqlite3',
+        'content-length': String(snapshot.size),
+        'content-disposition': `attachment; filename="${filename}"`,
+        'cache-control': 'no-store',
+      },
+    });
   });
 
   return routes;
