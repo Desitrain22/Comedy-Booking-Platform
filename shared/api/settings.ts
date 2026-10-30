@@ -6,6 +6,13 @@
  *                                        ADMIN_ONLY_SETTINGS field as a non-admin → 403 admin_only
  *   POST /api/settings/test-email        { to? } → TestEmailResponse | 502 email_failed | 504 email_timeout
  *                                        (non-admins: only to themselves, else 403 forbidden)
+ *                                        Hosted mode: changing appUrl → 400 app_url_locked
+ *   GET    /api/me/mailbox               MailboxDto (the signed-in booker's own mailbox; never the password)
+ *   PUT    /api/me/mailbox               UpdateMailboxInput → MailboxDto (blank smtpPass keeps the saved one)
+ *                                        | 400 from_email_required
+ *   DELETE /api/me/mailbox               → MailboxDto (disconnected)
+ *   POST   /api/me/mailbox/test          → TestEmailResponse (to yourself, through your mailbox)
+ *                                        | 409 mailbox_not_connected | 502 email_failed | 504 email_timeout
  *   POST /api/auth/password              ChangePasswordInput → { ok: true } (signed-in booker; signs
  *                                        out their other sessions) | 400 wrong_password | 429 rate_limited
  *   GET  /api/email-log?q&kind&status&limit   EmailLogItem[] (newest first, default 100)
@@ -81,7 +88,10 @@ export interface SettingsDto {
   smtpPassSet: boolean;
   fromName: string;
   fromEmail: string;
+  /** The company email ("Company email" in the UI): replies to company emails go here. */
   replyTo: string;
+  /** Who emails come from: the company, or each booker (spec §5). Admin-only to change. */
+  senderMode: SenderMode;
   /**
    * Some SMTP server is in effect for company emails (the company mailbox, SMTP_* env vars or
    * the hosted platform sender). False → outbox.
@@ -99,6 +109,21 @@ export interface SettingsDto {
   emailFrom: string | null;
   /** The most recent email actually handed to an SMTP server (outbox ignored), or null. */
   lastEmail: { id: number; status: 'sent' | 'failed'; error: string | null; createdAt: number } | null;
+  /**
+   * Hosted mode: the platform sender every club can use without setup (null in single-club
+   * mode, or when the server has no SMTP_* sender). Emails go out through it when no mailbox
+   * is connected.
+   */
+  platformSender: { fromEmail: string } | null;
+  /** What comedians see on company emails (sign-in links, invites, company mode), or null (outbox). */
+  senderPreview: SenderPreview | null;
+  /**
+   * What comedians would see on emails from the signed-in booker with "Each booker" chosen
+   * (whatever the saved senderMode), or null (outbox). Lets the form preview the choice.
+   */
+  bookerSenderPreview: SenderPreview | null;
+  /** Hosted mode: the app address is the club's own and can't be changed here. */
+  appUrlLocked: boolean;
 
   confirmationsEnabled: boolean;
   /** 0 = Sunday … 6 = Saturday. */
@@ -174,6 +199,7 @@ export const updateSettingsSchema = z
     fromName: z.string().trim().max(100),
     fromEmail: optionalEmailSchema,
     replyTo: optionalEmailSchema,
+    senderMode: z.enum(SENDER_MODES),
 
     confirmationsEnabled: z.boolean(),
     confirmationDay: z.number().int().min(0).max(6),
@@ -206,6 +232,7 @@ export const ADMIN_ONLY_SETTINGS = [
   'fromName',
   'fromEmail',
   'replyTo',
+  'senderMode',
 ] as const satisfies readonly (keyof UpdateSettingsInput)[];
 export type AdminOnlySetting = (typeof ADMIN_ONLY_SETTINGS)[number];
 
@@ -236,6 +263,55 @@ export interface ChangePasswordResponse {
   /** How many other sessions (devices) were signed out. */
   signedOut: number;
 }
+
+// ---------------------------------------------------------------------------
+// Your mailbox (each booker's own SMTP, Settings → Account)
+// ---------------------------------------------------------------------------
+
+/**
+ * `GET /api/me/mailbox`: the signed-in booker's own mailbox. With senderMode `booker`,
+ * emails sent as them go out through it (else through the company's). Only they can see
+ * or change it; the password is write-only (`smtpPassSet`).
+ */
+export interface MailboxDto {
+  /** A server is saved (smtpHost isn't blank). */
+  connected: boolean;
+  smtpHost: string;
+  smtpPort: number;
+  smtpSecure: boolean;
+  smtpUser: string;
+  /** A password is saved (it is never sent back). */
+  smtpPassSet: boolean;
+  /** Address it sends as ('' = smtpUser). */
+  smtpFromEmail: string;
+  /** The club's setting: in `booker` mode your availability requests and confirmations come from you. */
+  senderMode: SenderMode;
+  /** What comedians see on emails from you (as with "Each booker"), or null (outbox). */
+  preview: SenderPreview | null;
+  /** The latest email that went out through this mailbox (sent or failed), or null. */
+  lastEmail: { id: number; status: 'sent' | 'failed'; error: string | null; createdAt: number } | null;
+}
+
+/**
+ * `PUT /api/me/mailbox`: connect or change your mailbox. `smtpPass` blank or omitted keeps
+ * the saved one, unless the server, port, security or username changed (then it's removed,
+ * so it's never sent to a server it wasn't entered for); `clearSmtpPass` removes it.
+ */
+export const updateMailboxSchema = z.object({
+  smtpHost: z
+    .string()
+    .trim()
+    .min(1, 'Enter the SMTP server, like smtp.yourprovider.com')
+    .max(255)
+    .refine((v) => v === '' || HOSTNAME_RE.test(v), 'Enter just the server name, like smtp.gmail.com'),
+  smtpPort: z.number().int().min(1, 'Enter a port like 465 or 587').max(65535, 'Enter a port like 465 or 587'),
+  smtpSecure: z.boolean(),
+  smtpUser: z.string().trim().max(255),
+  smtpPass: z.string().max(500).optional(),
+  clearSmtpPass: z.boolean().optional(),
+  smtpFromEmail: optionalEmailSchema.optional(),
+});
+export type UpdateMailboxInput = z.input<typeof updateMailboxSchema>;
 
 // ---------------------------------------------------------------------------
 // Test email
@@ -288,6 +364,10 @@ export interface EmailLogItem {
   error: string | null;
   comedianId: number | null;
   createdAt: number;
+  /** How it went out; null for emails logged before this was recorded. */
+  via: EmailVia | null;
+  /** The booker it was sent for (who sent the request, or booked every spot); null = the company. */
+  senderName: string | null;
 }
 
 export interface EmailLogDetail extends EmailLogItem {
