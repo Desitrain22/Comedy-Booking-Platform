@@ -371,7 +371,11 @@ export const emailLog = sqliteTable(
     via: text('via', { enum: ['', 'company-mailbox', 'booker-mailbox', 'platform', 'outbox'] })
       .notNull()
       .default(''),
-    /** The booker it was sent as (senderMode `booker`), else null = the company. */
+    /**
+     * The booker this email is attributed to (who sent the availability request, or who
+     * booked every spot in a confirmation), recorded in either sender mode; null = the
+     * company. Whether it actually went out as that booker depends on `via` and senderMode.
+     */
     senderUserId: integer('sender_user_id').references(() => users.id, { onDelete: 'set null' }),
     createdAt: createdAt(),
   },
