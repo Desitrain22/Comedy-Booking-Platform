@@ -9,12 +9,19 @@
  *   POST /api/platform/find-club            FindClubRequest → OkResponse (always ok; emails a list)
  *
  * Club host only (`<slug>.<domain>`):
- *   POST /api/auth/handoff                  HandoffRequest → { ok: true } + booker session cookie
+ *   POST /api/auth/handoff                  HandoffRequest → HandoffResponse + booker session cookie
+ *                                           (400 `invalid_handoff`: unknown, another club's, used or expired)
+ *
+ * Errors: 404 `club_not_found` (ClubNotFoundBody) on an unknown or archived club's host, for
+ * every API call but /api/health; 403 `club_suspended` (ClubSuspendedBody) for every club API
+ * call but /api/host and /api/health; 403 `signups_closed` (SIGNUPS=closed); 409 `slug_taken`;
+ * 400 `signup_rejected` (the honeypot); 429 `rate_limited`.
  *
  * The owner console (`/api/platform/admin/*`) has its own contract: shared/api/platformAdmin.ts.
  */
 import { z } from 'zod';
-import { emailSchema } from '../schemas';
+import { emailSchema, passwordSchema, timeZoneSchema } from '../schemas';
+import type { MeBooker } from '../types';
 
 /** What the SPA should render on this host. */
 export type HostContext =
@@ -35,6 +42,21 @@ export type HostContext =
       platformUrl: string;
       supportEmail: string;
     };
+
+/** 404 body on an unknown or archived club's host, so the SPA can link to the platform. */
+export interface ClubNotFoundBody {
+  error: string;
+  code: 'club_not_found';
+  platformName: string;
+  platformUrl: string;
+}
+
+/** 403 body of every club API call but /api/host and /api/health while the club is suspended. */
+export interface ClubSuspendedBody {
+  error: string;
+  code: 'club_suspended';
+  supportEmail: string;
+}
 
 export const SLUG_MIN = 3;
 export const SLUG_MAX = 30;
@@ -76,20 +98,21 @@ export interface SlugCheckResponse {
   reason?: string;
 }
 
+/** The same limits as first-run setup (shared/schemas.ts `setupSchema`) and Settings → Club. */
 export const signupSchema = z.object({
-  clubName: z.string().trim().min(1).max(120),
+  clubName: z.string().trim().min(1, 'Enter your company name').max(100),
   slug: slugSchema,
-  timezone: z.string().trim().min(1).max(64),
+  timezone: timeZoneSchema,
   location: z.object({
-    name: z.string().trim().min(1).max(120),
-    address: z.string().trim().max(300).default(''),
+    name: z.string().trim().min(1, 'Enter a location name').max(100),
+    address: z.string().trim().max(200).default(''),
   }),
   admin: z.object({
-    name: z.string().trim().min(1).max(120),
+    name: z.string().trim().min(1, 'Enter your name').max(100),
     email: emailSchema,
-    password: z.string().min(8).max(200),
+    password: passwordSchema,
   }),
-  /** Honeypot: humans leave it empty. */
+  /** Honeypot: humans leave it empty (the field is hidden). */
   website: z.string().max(200).optional(),
 });
 export type SignupRequest = z.input<typeof signupSchema>;
@@ -103,6 +126,11 @@ export interface SignupResponse {
 
 export const handoffSchema = z.object({ token: z.string().min(16).max(200) });
 export type HandoffRequest = z.infer<typeof handoffSchema>;
+
+export interface HandoffResponse {
+  ok: true;
+  booker: MeBooker;
+}
 
 export const findClubSchema = z.object({ email: emailSchema });
 export type FindClubRequest = z.infer<typeof findClubSchema>;

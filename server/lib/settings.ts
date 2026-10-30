@@ -26,8 +26,32 @@ export function isSetupComplete(db: DbOrTx): boolean {
   return getSettings(db).setupComplete;
 }
 
-/** Base URL for links in emails: settings.appUrl → APP_URL env → http://localhost:$PORT. */
+/**
+ * Hosted mode: each club database's address is fixed by its subdomain
+ * (`<protocol>//<slug>.<domain>`), whatever its settings say. The registry pins it when it
+ * opens the database (server/platform/registry.ts). Keyed by the db handle, so a transaction
+ * handle falls back to settings.appUrl, which sign-up sets to the same address.
+ */
+const fixedAppUrls = new WeakMap<object, string>();
+
+/** Pin this database's app URL (hosted mode). Pass null to unpin. */
+export function setFixedAppUrl(db: DbOrTx, url: string | null): void {
+  if (url) fixedAppUrls.set(db, url.replace(/\/+$/, ''));
+  else fixedAppUrls.delete(db);
+}
+
+/** The pinned app URL for this database (hosted mode), or null. */
+export function getFixedAppUrl(db: DbOrTx): string | null {
+  return fixedAppUrls.get(db) ?? null;
+}
+
+/**
+ * Base URL for links in emails: the pinned club address (hosted mode) → settings.appUrl →
+ * APP_URL env → http://localhost:$PORT.
+ */
 export function getAppUrl(db: DbOrTx): string {
+  const fixed = fixedAppUrls.get(db);
+  if (fixed) return fixed;
   const fromSettings = getSettings(db).appUrl.trim();
   const base = fromSettings || env.appUrl || `http://localhost:${env.port}`;
   return base.replace(/\/+$/, '');
