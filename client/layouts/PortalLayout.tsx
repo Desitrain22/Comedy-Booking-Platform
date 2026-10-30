@@ -5,6 +5,9 @@
  * Also wraps /portal/confirm/:token, which works without a session: with no comedian
  * signed in it shows just the club header (no tabs, no sign out).
  *
+ * The My spots tab shows how many spots are waiting to be confirmed (declined spots don't
+ * count), so a comedian sees it from any tab without scrolling.
+ *
  * Content column is max-w-3xl; pages that need a sticky footer (Availability) can use
  * `sticky bottom-0` inside it.
  */
@@ -14,6 +17,7 @@ import { ErrorBoundary } from '../components/ErrorBoundary';
 import { Button } from '../components/ui/Button';
 import { cn } from '../lib/cn';
 import { useMe, useSignOut } from '../lib/useMe';
+import { usePortalMe } from '../pages/portal/portalQueries';
 
 const TABS = [
   { to: '/portal', label: 'Availability', icon: CalendarDays, end: true },
@@ -30,6 +34,7 @@ export function PortalLayout() {
   const comedian = me?.comedian ?? null;
   const signOut = useSignOut('comedian');
   const { pathname } = useLocation();
+  const toConfirm = usePortalMe({ enabled: comedian != null }).data?.spots.unconfirmed ?? 0;
 
   return (
     <div className="flex min-h-dvh flex-col">
@@ -56,13 +61,22 @@ export function PortalLayout() {
                 end={tab.end}
                 className={({ isActive }) =>
                   cn(
-                    '-mb-px flex min-h-11 flex-1 items-center justify-center gap-1.5 border-b-2 px-2 text-sm font-medium transition-colors sm:flex-none sm:px-0.5',
+                    '-mb-px flex min-h-11 min-w-0 flex-1 items-center justify-center gap-1 border-b-2 px-1 text-sm font-medium whitespace-nowrap transition-colors sm:flex-none sm:gap-1.5 sm:px-0.5',
                     isActive ? 'border-accent text-fg' : 'border-transparent text-fg-muted hover:text-fg',
                   )
                 }
               >
                 <tab.icon className="size-4 shrink-0" aria-hidden />
                 {tab.label}
+                {tab.to === '/portal/spots' && toConfirm > 0 && (
+                  <span
+                    className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-awaiting px-1.5 text-[11px] leading-none font-semibold text-white tabular-nums dark:text-zinc-950"
+                    data-testid="spots-to-confirm"
+                  >
+                    {toConfirm}
+                    <span className="sr-only"> to confirm</span>
+                  </span>
+                )}
               </NavLink>
             ))}
           </nav>

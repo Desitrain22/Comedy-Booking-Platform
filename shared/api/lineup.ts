@@ -16,18 +16,36 @@
  *   PATCH  /api/bookings/:id            MoveBookingInput → MoveBookingResponse
  *                                       (swaps with the occupant of the target slot; moving to
  *                                       a different show resets confirmation and re-checks
- *                                       availability → 409 `unavailable` unless `force`)
+ *                                       availability → 409 `unavailable` unless `force`. An
+ *                                       occupant in another show who declined is replaced, not
+ *                                       swapped: unbooked and returned as `replaced`)
+ *                                       409 `comedian_archived` (moving an archived comedian —
+ *                                       or swapping one — into a different show)
  *   DELETE /api/bookings/:id            DeleteBookingResponse (the removed booking, for Undo)
- *   POST   /api/bookings/:id/confirm    LineupBooking (booker marks it confirmed manually)
+ *   POST   /api/bookings/:id/confirm    ConfirmBookingResponse (booker marks it confirmed
+ *                                       manually; also clears a decline; `previous` is the
+ *                                       state before, for Undo)
+ *   POST   /api/bookings/:id/unconfirm  BookingConfirmationState → LineupBooking (Undo of
+ *                                       "Mark confirmed": puts `previous` back)
  */
 import { z } from 'zod';
 import type { AvailabilityRange } from '../availability';
 import type { BookingStatus } from '../bookingStatus';
 import { idSchema } from '../schemas';
 import { CONFIRMED_BY, type ConfirmedBy, type ShowStatus } from '../types';
+import { DECLINE_NOTE_MAX } from './portal';
 
 /** Highest slot index + 1 a show can have (matches F1's slot count limit). */
 export const LINEUP_MAX_SLOTS = 30;
+
+/**
+ * Two of one comedian's bookings that start less than this many minutes apart on the same
+ * night are flagged ("Also booked 7 PM · Cellar"): a soft warning, never a block.
+ */
+export const BOOKING_OVERLAP_MIN = 90;
+
+/** Longest note excerpt (`DayComedian.latestNote`) sent with the day. */
+export const NOTE_EXCERPT_MAX = 120;
 
 // ---------------------------------------------------------------------------
 // Requests
@@ -39,9 +57,11 @@ const positionSchema = z.number().int().min(0, 'Slots are numbered from 0').max(
 /** Epoch milliseconds. The server also refuses times in the future. */
 const timestampSchema = z.number().int().min(0);
 
+const declineNoteSchema = z.string().trim().max(DECLINE_NOTE_MAX);
+
 /**
  * A removed booking's state, sent back to re-create it exactly (Undo after removing or
- * replacing someone): confirmation, "booked anyway", who booked it and when.
+ * replacing someone): confirmation, decline, "booked anyway", who booked it and when.
  */
 export const bookingRestoreSchema = z
   .object({
@@ -49,6 +69,9 @@ export const bookingRestoreSchema = z
     confirmationSentAt: timestampSchema.nullable(),
     confirmedAt: timestampSchema.nullable(),
     confirmedBy: z.enum(CONFIRMED_BY).nullable(),
+    /** Optional for older clients: a restore without them is not declined. */
+    declinedAt: timestampSchema.nullable().optional().default(null),
+    declineNote: declineNoteSchema.optional().default(''),
     bookedById: idSchema.nullable(),
     createdAt: timestampSchema,
   })
@@ -57,6 +80,24 @@ export const bookingRestoreSchema = z
     path: ['confirmedBy'],
   });
 export type BookingRestore = z.infer<typeof bookingRestoreSchema>;
+
+/**
+ * `POST /api/bookings/:id/unconfirm` — put a booking's confirmation (and decline) back the way
+ * it was before "Mark confirmed" (`ConfirmBookingResponse.previous`). `declinedAt` omitted =
+ * leave the decline as it is now. `{}` simply unconfirms.
+ */
+export const unconfirmBookingSchema = z
+  .object({
+    confirmedAt: timestampSchema.nullable().default(null),
+    confirmedBy: z.enum(CONFIRMED_BY).nullable().default(null),
+    declinedAt: timestampSchema.nullable().optional(),
+    declineNote: declineNoteSchema.optional(),
+  })
+  .refine((r) => (r.confirmedAt == null) === (r.confirmedBy == null), {
+    message: 'confirmedAt and confirmedBy go together',
+    path: ['confirmedBy'],
+  });
+export type UnconfirmBookingInput = z.input<typeof unconfirmBookingSchema>;
 
 /**
  * `POST /api/bookings` — `force` books even when the comedian isn't available.
@@ -115,6 +156,9 @@ export interface LineupBooking {
   confirmedAt: number | null;
   confirmedBy: ConfirmedBy | null;
   confirmationSentAt: number | null;
+  /** The comedian said "Can't make it" (status `declined`): the slot needs a replacement. */
+  declinedAt: number | null;
+  declineNote: string;
 }
 
 export interface DayShow {
@@ -150,12 +194,29 @@ export interface DayComedian {
   submittedMonth: boolean;
   /** Their bookings in this date's (scheduled) shows, by start time. */
   bookings: DayComedianBooking[];
+  /** Private booker notes about them (count) and the first line of the newest one. */
+  noteCount: number;
+  latestNote: string | null;
+}
+
+/**
+ * This week's spots (tonight → Sunday, scheduled shows, active comedians) booked after the
+ * confirmations went out and never emailed (`isUnsent`): the "N booked this week haven't been
+ * emailed yet – Send" nudge (`POST /api/confirmations/send { weekStart, onlyUnsent: true }`).
+ */
+export interface UnsentThisWeek {
+  /** Monday of the club night's week. */
+  weekStart: string;
+  /** Its Sunday. */
+  weekEnd: string;
+  /** Bookings never emailed. */
+  count: number;
 }
 
 /** `GET /api/days/:date` */
 export interface DayResponse {
   date: string;
-  /** Today in the club timezone (for the red "unconfirmed today" status). */
+  /** The club's current night (`clubNightDate`; for "tonight" and the red status). */
   today: string;
   /** Scheduled shows only, by location (sort order) then start time. */
   shows: DayShow[];
@@ -163,6 +224,8 @@ export interface DayResponse {
   comedians: DayComedian[];
   /** Every tag, by name. */
   tags: LineupTag[];
+  /** This week's never-emailed spots (whatever date is being viewed). */
+  unsentThisWeek: UnsentThisWeek;
 }
 
 /** A booking that was just removed, with everything needed to restore it (`BookingRestore`). */
@@ -189,15 +252,32 @@ export function restoreOf(removed: RemovedBooking): BookingRestore {
     confirmationSentAt: removed.confirmationSentAt,
     confirmedAt: removed.confirmedAt,
     confirmedBy: removed.confirmedBy,
+    declinedAt: removed.declinedAt,
+    declineNote: removed.declineNote,
     bookedById: removed.bookedById,
     createdAt: removed.createdAt,
   };
+}
+
+/** A booking's confirmation and decline, as "Mark confirmed" found it. */
+export interface BookingConfirmationState {
+  confirmedAt: number | null;
+  confirmedBy: ConfirmedBy | null;
+  declinedAt: number | null;
+  declineNote: string;
+}
+
+/** `POST /api/bookings/:id/confirm` — `previous` goes back to `/unconfirm` for Undo. */
+export interface ConfirmBookingResponse extends LineupBooking {
+  previous: BookingConfirmationState;
 }
 
 /** `PATCH /api/bookings/:id` — `swapped` is the booking that traded places, if any. */
 export interface MoveBookingResponse {
   booking: LineupBooking;
   swapped: LineupBooking | null;
+  /** The declined occupant of the target slot (another show), unbooked; for Undo. */
+  replaced: RemovedBooking | null;
 }
 
 /** One comedian who isn't available for the show they would land in. */

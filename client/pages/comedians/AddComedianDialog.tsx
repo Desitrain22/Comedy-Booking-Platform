@@ -2,10 +2,13 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { useState, type FormEvent } from 'react';
 import { useNavigate } from 'react-router';
 import { toast } from 'sonner';
-import { createComedianSchema, type ComedianDetail, type EmailTakenErrorExtra } from '../../../shared/api/comedians';
+import { createComedianSchema, type CreateComedianResponse, type EmailTakenErrorExtra } from '../../../shared/api/comedians';
 import { Button, Dialog, Field, Input } from '../../components/ui';
 import { api, errorMessage, isApiError } from '../../lib/api';
+import { useBooker } from '../../lib/useMe';
+import { addedToast } from './loginLinks';
 import { invalidateComedians } from './queries';
+import { SendLinkCheckbox } from './SendLinkCheckbox';
 
 export interface AddComedianDialogProps {
   open: boolean;
@@ -18,19 +21,27 @@ interface FieldErrors {
   form?: string;
 }
 
-/** Name + email is all it takes; comedians add their own bio and headshot in the portal. */
+/**
+ * Name + email is all it takes; comedians add their own bio and headshot in the portal.
+ * "Email them a sign-in link" (on by default) invites them to the portal right away.
+ */
 export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps) {
   const queryClient = useQueryClient();
   const navigate = useNavigate();
+  const isAdmin = useBooker().role === 'admin';
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
+  const [sendLink, setSendLink] = useState(true);
   const [errors, setErrors] = useState<FieldErrors>({});
 
   const create = useMutation({
-    mutationFn: (input: { name: string; email: string }) => api.post<ComedianDetail>('/comedians', input),
+    mutationFn: (input: { name: string; email: string; sendLoginLink: boolean }) =>
+      api.post<CreateComedianResponse>('/comedians', input),
     onSuccess: (comedian) => {
       invalidateComedians(queryClient);
-      toast.success(`Added ${comedian.name}`, {
+      const t = addedToast(comedian.name, comedian.email, comedian.loginLink, isAdmin);
+      toast[t.tone](t.title, {
+        description: t.description,
         action: { label: 'Open profile', onClick: () => void navigate(`/app/comedians/${comedian.id}`) },
       });
       close(false);
@@ -51,6 +62,7 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
     if (!next) {
       setName('');
       setEmail('');
+      setSendLink(true);
       setErrors({});
       create.reset();
     }
@@ -70,7 +82,7 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
       return;
     }
     setErrors({});
-    create.mutate(parsed.data);
+    create.mutate({ name: parsed.data.name, email: parsed.data.email, sendLoginLink: sendLink });
   }
 
   return (
@@ -104,6 +116,7 @@ export function AddComedianDialog({ open, onOpenChange }: AddComedianDialogProps
             placeholder="jason@example.com"
           />
         </Field>
+        <SendLinkCheckbox checked={sendLink} onChange={setSendLink} />
         {errors.form && <p className="text-sm text-danger">{errors.form}</p>}
       </form>
     </Dialog>

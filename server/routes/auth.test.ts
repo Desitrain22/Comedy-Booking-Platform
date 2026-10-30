@@ -1,14 +1,24 @@
 import { eq } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type { InviteInfo, MagicLinkResponse, MeResponse } from '../../shared/types';
+import type { ChangePasswordResponse } from '../../shared/api/settings';
+import type { ApiErrorBody, InviteInfo, MagicLinkResponse, MeResponse } from '../../shared/types';
 import { CODE_MAX_ATTEMPTS, CODE_RATE_LIMIT } from '../auth/codes';
 import { createInvite } from '../auth/invites';
 import { requireAdmin, requireBooker } from '../auth/middleware';
-import { SESSION_COOKIES } from '../auth/sessions';
-import { confirmTokenExpiry, createConfirmLink, createLoginLink, findConfirmToken } from '../auth/tokens';
+import { timingDummyHash, verifyPassword } from '../auth/password';
+import { SECURE_COOKIE_PREFIX, SESSION_COOKIES } from '../auth/sessions';
+import {
+  EXPIRED_CONFIRM_RETENTION_MS,
+  confirmTokenExpiry,
+  createConfirmLink,
+  createLoginLink,
+  deleteExpiredTokens,
+  findConfirmToken,
+} from '../auth/tokens';
 import type { AppEnv } from '../context';
 import { comedians, loginCodes, sessions, tokens, users } from '../db/schema';
+import { DEFAULT_RATE_LIMITS, RateLimiter, rateLimiter, setRateLimiter, type RateLimitConfig } from '../lib/rateLimit';
 import {
   TEST_APP_URL,
   TEST_PASSWORD,
@@ -33,6 +43,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  delete process.env.TRUST_PROXY;
   t.close();
 });
 
@@ -87,7 +98,12 @@ describe('booker login', () => {
     expect(me.booker).toEqual({ id: user.id, email: 'dana@example.test', name: 'Dana', role: 'admin' });
     expect(me.comedian).toBeNull();
     expect(me.setupComplete).toBe(true);
-    expect(me.club).toEqual({ name: 'Test Comedy Club', timezone: 'America/New_York', allNight: { startMin: 1140, endMin: 1380 } });
+    expect(me.club).toEqual({
+      name: 'Test Comedy Club',
+      timezone: 'America/New_York',
+      allNight: { startMin: 1140, endMin: 1380 },
+      allowDeclines: false,
+    });
 
     const row = t.db.select().from(users).where(eq(users.id, user.id)).get()!;
     expect(row.lastLoginAt).toBeTypeOf('number');
@@ -126,6 +142,56 @@ describe('booker login', () => {
     createUser(t.db, { email: 'dana@example.test' });
     const res = await post('/api/auth/login', { email: 'dana@example.test', password: TEST_PASSWORD });
     expect(res.headers.getSetCookie().join('\n')).toMatch(/Secure/);
+  });
+
+  it('over https the cookie is __Host- prefixed, and only that cookie counts', async () => {
+    t.close();
+    t = makeTestApp({ settings: { appUrl: 'https://booking.example.com' } });
+    const user = createUser(t.db, { email: 'dana@example.test' });
+    const res = await post('/api/auth/login', { email: 'dana@example.test', password: TEST_PASSWORD });
+    const setCookie = res.headers.getSetCookie().join('\n');
+    expect(setCookie).toMatch(new RegExp(`^${SECURE_COOKIE_PREFIX}${SESSION_COOKIES.booker}=[\\w-]+;`, 'm'));
+    expect(setCookie).toMatch(/Secure/);
+    expect(setCookie).toMatch(/Path=\//);
+    expect(setCookie).not.toMatch(/Domain=/i);
+    expect(setCookie).toMatch(/HttpOnly/);
+
+    const cookie = cookieFrom(res);
+    expect((await getMe({ cookie })).booker?.id).toBe(user.id);
+    // The same token under the plain name (e.g. planted by a sibling subdomain) is ignored.
+    const plain = cookie.replace(`${SECURE_COOKIE_PREFIX}${SESSION_COOKIES.booker}`, SESSION_COOKIES.booker);
+    expect((await getMe({ cookie: plain })).booker).toBeNull();
+
+    // Sign-out clears it.
+    const out = await post('/api/auth/logout', {}, { cookie });
+    expect(out.headers.getSetCookie().join('\n')).toMatch(
+      new RegExp(`${SECURE_COOKIE_PREFIX}${SESSION_COOKIES.booker}=;.*Secure`),
+    );
+    expect((await getMe({ cookie })).booker).toBeNull();
+  });
+
+  it('uses secure cookies for https requests behind a trusted proxy, even with an http app URL', async () => {
+    createUser(t.db, { email: 'dana@example.test' });
+    const login = (headers: Record<string, string>) =>
+      t.request('/api/auth/login', {
+        method: 'POST',
+        headers,
+        json: { email: 'dana@example.test', password: TEST_PASSWORD },
+      });
+    // X-Forwarded-Proto is ignored unless TRUST_PROXY is set (anyone can send it).
+    expect((await login({ 'x-forwarded-proto': 'https' })).headers.getSetCookie().join('\n')).not.toMatch(/Secure/);
+    process.env.TRUST_PROXY = '1';
+    const res = await login({ 'x-forwarded-proto': 'https' });
+    expect(res.headers.getSetCookie().join('\n')).toMatch(new RegExp(`^${SECURE_COOKIE_PREFIX}.*Secure`, 'm'));
+    const me = await t.request('/api/auth/me', { headers: { cookie: cookieFrom(res), 'x-forwarded-proto': 'https' } });
+    expect((await readJson<MeResponse>(me)).booker?.email).toBe('dana@example.test');
+  });
+
+  it('checks unknown emails against a decoy hash made with the configured bcrypt cost', async () => {
+    // vitest runs with BCRYPT_ROUNDS=4: the decoy must use the same cost as real hashes.
+    expect(await timingDummyHash()).toMatch(/^\$2[aby]\$04\$/);
+    expect(await timingDummyHash()).toBe(await timingDummyHash());
+    expect(await verifyPassword(TEST_PASSWORD, await timingDummyHash())).toBe(false);
   });
 
   it('logs out: deletes the session and clears the cookie', async () => {
@@ -332,7 +398,7 @@ describe('comedian sign-in codes', () => {
     expect((await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code })).status).toBe(200);
   });
 
-  it(`locks a code after ${CODE_MAX_ATTEMPTS} wrong attempts; a fresh code works`, async () => {
+  it(`locks a code after ${CODE_MAX_ATTEMPTS} wrong attempts (answering like any wrong code); a fresh code works`, async () => {
     createComedian(t.db, { email: 'john@example.test' });
     await post('/api/auth/comedian/request-code', { email: 'john@example.test' });
     const code = latestCode('john@example.test');
@@ -342,15 +408,28 @@ describe('comedian sign-in codes', () => {
       const res = await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code: wrongCode(code) });
       statuses.push(res.status);
     }
-    expect(statuses).toEqual([...Array<number>(CODE_MAX_ATTEMPTS - 1).fill(400), 429]);
+    // Same 400 as an unknown email gets (security#5): no "too many attempts" only real comedians see.
+    expect(statuses).toEqual(Array<number>(CODE_MAX_ATTEMPTS).fill(400));
 
     const locked = await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code });
-    expect(locked.status).toBe(429);
-    expect(await readJson(locked)).toMatchObject({ code: 'too_many_attempts' });
+    expect(locked.status).toBe(400);
+    expect(await readJson(locked)).toEqual({ error: "That code isn't right or has expired", code: 'invalid_code' });
 
     await post('/api/auth/comedian/request-code', { email: 'john@example.test' });
     const fresh = latestCode('john@example.test');
     expect((await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code: fresh })).status).toBe(200);
+  });
+
+  it('only the newest code works: asking again retires the older codes (security#3)', async () => {
+    createComedian(t.db, { email: 'john@example.test' });
+    await post('/api/auth/comedian/request-code', { email: 'john@example.test' });
+    const first = latestCode('john@example.test');
+    await post('/api/auth/comedian/request-code', { email: 'john@example.test' });
+    const second = latestCode('john@example.test');
+    if (first !== second) {
+      expect((await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code: first })).status).toBe(400);
+    }
+    expect((await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code: second })).status).toBe(200);
   });
 
   it('rejects expired codes', async () => {
@@ -496,26 +575,543 @@ describe('CSRF protection', () => {
   });
 
   it('allows same-origin posts, including through the Vite dev proxy (Host is preserved)', async () => {
+    // No content type: hono/csrf treats it like a form post and checks Origin / Sec-Fetch-Site.
     const viaProxy = await t.app.request('http://localhost:5173/api/auth/logout', {
       method: 'POST',
-      headers: { ...form, origin: 'http://localhost:5173' },
-      body: 'x=1',
+      headers: { origin: 'http://localhost:5173' },
     });
     expect(viaProxy.status).toBe(200);
 
     const secFetch = await t.app.request('http://club.example/api/auth/logout', {
       method: 'POST',
-      headers: { ...form, 'sec-fetch-site': 'same-origin' },
-      body: 'x=1',
+      headers: { 'sec-fetch-site': 'same-origin' },
     });
     expect(secFetch.status).toBe(200);
 
     // Behind a TLS-terminating proxy the scheme differs but the host matches.
     const tls = await t.app.request('http://booking.example.com/api/auth/logout', {
       method: 'POST',
-      headers: { ...form, origin: 'https://booking.example.com' },
-      body: 'x=1',
+      headers: { origin: 'https://booking.example.com' },
     });
     expect(tls.status).toBe(200);
+  });
+
+  it('blocks a sibling subdomain (Sec-Fetch-Site: same-site) — security#8', async () => {
+    const { headers } = await loginAsBooker(t, { role: 'admin' });
+    const target = createUser(t.db, {
+      passwordHash: null,
+      email: 'pending@club.test',
+      inviteTokenHash: 'x',
+      inviteExpiresAt: Date.now() + 1e9,
+    });
+    const send = (extra: Record<string, string>) =>
+      t.app.request(`http://club.example/api/users/${target.id}/resend-invite`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'text/plain', ...extra },
+        body: 'x',
+      });
+    expect((await send({ origin: 'https://evil.com', 'sec-fetch-site': 'cross-site' })).status).toBe(403);
+    const sibling = await send({ origin: 'https://evil.club.example', 'sec-fetch-site': 'same-site' });
+    expect(sibling.status).toBe(403);
+    expect(await readJson(sibling)).toMatchObject({ code: 'forbidden' });
+    expect(emailsTo(t.db, 'pending@club.test')).toHaveLength(0);
+  });
+
+  it('only accepts JSON bodies on writes, even same-origin (no form/text body silently parsed as {})', async () => {
+    const { headers } = await loginAsBooker(t, { role: 'admin' });
+    for (const type of ['text/plain', 'application/x-www-form-urlencoded', 'multipart/form-data; boundary=x']) {
+      const res = await t.app.request('http://club.example/api/auth/logout', {
+        method: 'POST',
+        headers: { ...headers, 'content-type': type, 'sec-fetch-site': 'same-origin' },
+        body: 'x=1',
+      });
+      expect(res.status, type).toBe(415);
+      expect(await readJson(res)).toMatchObject({ code: 'unsupported_media_type' });
+    }
+    // Still signed in: the logout above never ran.
+    expect((await getMe(headers)).booker).not.toBeNull();
+    const json = await t.request('/api/auth/logout', {
+      method: 'POST',
+      headers: { ...headers, 'content-type': 'application/json; charset=utf-8' },
+      body: '{}',
+    });
+    expect(json.status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting (security#3, #4, #5)
+// ---------------------------------------------------------------------------
+
+describe('rate limiting', () => {
+  const L = DEFAULT_RATE_LIMITS;
+
+  /** A limiter on a clock the test controls. */
+  function fakeClock(rules: Partial<RateLimitConfig> = {}) {
+    const clock = { now: Date.now() };
+    setRateLimiter(t.db, new RateLimiter(rules, () => clock.now));
+    return clock;
+  }
+
+  function login(email: string, password: string, ip?: string) {
+    return t.request('/api/auth/login', {
+      method: 'POST',
+      headers: ip ? { 'x-forwarded-for': ip } : undefined,
+      json: { email, password },
+    });
+  }
+
+  it(`locks one booker account on one IP after ${L.loginFailuresPerAccountIp.limit} wrong passwords — the right one waits too (security#4)`, async () => {
+    const clock = fakeClock();
+    createUser(t.db, { email: 'admin@club.test', role: 'admin' });
+    createUser(t.db, { email: 'other@club.test' });
+    for (let i = 0; i < L.loginFailuresPerAccountIp.limit; i++) {
+      expect((await login('admin@club.test', `wrong-${i}`)).status).toBe(401);
+    }
+    const locked = await login('admin@club.test', TEST_PASSWORD);
+    expect(locked.status).toBe(429);
+    const body = await readJson<ApiErrorBody & { retryAfter: number }>(locked);
+    expect(body).toMatchObject({ code: 'rate_limited', retryAfter: 15 * 60 });
+    expect(body.error).toBe('Too many sign-in attempts. Try again in 15 minutes.');
+    expect(locked.headers.get('retry-after')).toBe(String(15 * 60));
+    expect(locked.headers.getSetCookie()).toEqual([]);
+
+    // Another account isn't affected…
+    expect((await login('other@club.test', TEST_PASSWORD)).status).toBe(200);
+    // …and an unknown email locks exactly the same way (no account enumeration).
+    for (let i = 0; i < L.loginFailuresPerAccountIp.limit; i++) await login('ghost@club.test', `wrong-${i}`);
+    expect((await login('ghost@club.test', 'whatever')).status).toBe(429);
+
+    // The window slides: once the oldest failures age out, the right password works again.
+    clock.now += L.loginFailuresPerAccountIp.windowMs + 1;
+    expect((await login('admin@club.test', TEST_PASSWORD)).status).toBe(200);
+  });
+
+  it('a successful sign-in clears that account\'s failures from that IP', async () => {
+    fakeClock();
+    createUser(t.db, { email: 'admin@club.test' });
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < L.loginFailuresPerAccountIp.limit - 1; i++) await login('admin@club.test', 'typo-typo');
+      expect((await login('admin@club.test', TEST_PASSWORD)).status).toBe(200);
+    }
+  });
+
+  it('the old proof of concept: 200 wrong passwords no longer leave the right one open', async () => {
+    createUser(t.db, { email: 'admin@club.test', role: 'admin' });
+    const statuses = new Set<number>();
+    for (let i = 0; i < 200; i++) statuses.add((await login('admin@club.test', `wrong${i}`)).status);
+    expect([...statuses].sort()).toEqual([401, 429]);
+    expect((await login('admin@club.test', TEST_PASSWORD)).status).toBe(429);
+  });
+
+  it('counts parallel guesses before checking the password (no burst past the limit)', async () => {
+    createUser(t.db, { email: 'admin@club.test' });
+    const results = await Promise.all(
+      Array.from({ length: 40 }, (_, i) => login('admin@club.test', `wrong-${i}`).then((r) => r.status)),
+    );
+    expect(results.filter((s) => s === 401)).toHaveLength(L.loginFailuresPerAccountIp.limit);
+    expect(results.filter((s) => s === 429)).toHaveLength(40 - L.loginFailuresPerAccountIp.limit);
+  });
+
+  it('someone else\'s wrong guesses don\'t lock the owner out of their own IP (lockout DoS)', async () => {
+    fakeClock();
+    process.env.TRUST_PROXY = '1';
+    createUser(t.db, { email: 'admin@club.test', role: 'admin' });
+    for (let i = 0; i < L.loginFailuresPerAccountIp.limit; i++) {
+      expect((await login('admin@club.test', `wrong-${i}`, '203.0.113.9')).status).toBe(401);
+    }
+    expect((await login('admin@club.test', TEST_PASSWORD, '203.0.113.9')).status).toBe(429);
+    // The owner, from their own address, gets straight in…
+    expect((await login('admin@club.test', TEST_PASSWORD, '192.0.2.50')).status).toBe(200);
+    // …which clears only their own address: the guesser stays locked.
+    expect((await login('admin@club.test', TEST_PASSWORD, '203.0.113.9')).status).toBe(429);
+  });
+
+  it(`stops guessing spread over many IPs at ${L.loginFailuresPerAccount.limit} wrong passwords per account, known email or not`, async () => {
+    const clock = fakeClock();
+    process.env.TRUST_PROXY = '1';
+    createUser(t.db, { email: 'admin@club.test', role: 'admin' });
+    const perIp = L.loginFailuresPerAccountIp.limit - 1;
+    for (const email of ['admin@club.test', 'ghost@club.test']) {
+      for (let i = 0; i < L.loginFailuresPerAccount.limit; i++) {
+        const ip = `198.51.100.${Math.floor(i / perIp)}`;
+        expect((await login(email, `wrong-${i}`, ip)).status).toBe(401);
+      }
+      // A fresh address with the right password waits too (else the 429 would stop nothing).
+      const res = await login(email, email === 'ghost@club.test' ? 'whatever' : TEST_PASSWORD, '192.0.2.50');
+      expect(res.status).toBe(429);
+      expect(await readJson(res)).toMatchObject({ code: 'rate_limited', retryAfter: 15 * 60 });
+    }
+    clock.now += L.loginFailuresPerAccount.windowMs + 1;
+    expect((await login('admin@club.test', TEST_PASSWORD, '192.0.2.50')).status).toBe(200);
+  });
+
+  it('keys IPv6 clients by their /64: a fresh address in the same /64 is the same client', async () => {
+    fakeClock();
+    process.env.TRUST_PROXY = '1';
+    for (let i = 0; i < L.loginFailuresPerIp.limit; i++) {
+      const res = await login(`user${i}@club.test`, 'nope-nope', `2001:db8:1:2::${(i + 1).toString(16)}`);
+      expect(res.status).toBe(401);
+    }
+    expect((await login('fresh@club.test', 'nope-nope', '2001:db8:1:2:ffff:ffff:ffff:ffff')).status).toBe(429);
+    expect((await login('fresh@club.test', 'nope-nope', '2001:db8:1:3::1')).status).toBe(401);
+  });
+
+  it('a flood of fresh addresses can\'t push an account\'s lock or the email cap out of the limiter', async () => {
+    const maxKeysPerRule = 50;
+    setRateLimiter(t.db, new RateLimiter({ codeEmailsGlobal: { limit: 1, windowMs: 60 * 60_000 } }, Date.now, maxKeysPerRule));
+    process.env.TRUST_PROXY = '1';
+    createUser(t.db, { email: 'admin@club.test', role: 'admin' });
+    createComedian(t.db, { email: 'a@comic.test' });
+    createComedian(t.db, { email: 'b@comic.test' });
+    for (let i = 0; i < L.loginFailuresPerAccountIp.limit; i++) await login('admin@club.test', `wrong-${i}`, '203.0.113.7');
+    await t.request('/api/auth/comedian/request-code', {
+      method: 'POST',
+      headers: { 'x-forwarded-for': '203.0.113.8' },
+      json: { email: 'a@comic.test' },
+    });
+    const sent = () => emailsTo(t.db).filter((e) => e.kind === 'login_code').length;
+    expect(sent()).toBe(1);
+
+    // Wrong codes from many addresses for many emails: far more keys than the limiter keeps.
+    const statuses = new Set<number>();
+    for (let i = 0; i < maxKeysPerRule * 3; i++) {
+      const res = await t.request('/api/auth/comedian/verify-code', {
+        method: 'POST',
+        headers: { 'x-forwarded-for': `10.${i >> 8}.${i & 255}.1` },
+        json: { email: `junk${i}@x.test`, code: '000000' },
+      });
+      statuses.add(res.status);
+    }
+    // Past the cap new addresses are turned away rather than older entries forgotten.
+    expect([...statuses].sort()).toEqual([400, 429]);
+    // Memory stays bounded: the three verify-code rules are full, plus the 5 keys from before.
+    expect(rateLimiter(t.db).size).toBe(3 * maxKeysPerRule + 5);
+    expect((await login('admin@club.test', TEST_PASSWORD, '203.0.113.7')).status).toBe(429);
+    await t.request('/api/auth/comedian/request-code', {
+      method: 'POST',
+      headers: { 'x-forwarded-for': '203.0.113.8' },
+      json: { email: 'b@comic.test' },
+    });
+    expect(sent()).toBe(1);
+  });
+
+  it(`limits wrong passwords per IP across accounts (X-Forwarded-For only with TRUST_PROXY)`, async () => {
+    fakeClock({ loginFailuresPerAccount: { limit: 1000, windowMs: 60_000 } });
+    process.env.TRUST_PROXY = '1';
+    for (let i = 0; i < L.loginFailuresPerIp.limit; i++) {
+      expect((await login(`user${i}@club.test`, 'nope-nope', '203.0.113.7')).status).toBe(401);
+    }
+    expect((await login('fresh@club.test', 'nope-nope', '203.0.113.7')).status).toBe(429);
+    // A different client is fine.
+    expect((await login('fresh@club.test', 'nope-nope', '198.51.100.2')).status).toBe(401);
+    // Each proxy appends what it saw: a client-supplied left-hand entry doesn't pick the key.
+    expect((await login('fresh@club.test', 'nope-nope', '198.51.100.99, 203.0.113.7')).status).toBe(429);
+
+    // Without TRUST_PROXY the header is ignored: every request is the same (socket) client.
+    delete process.env.TRUST_PROXY;
+    fakeClock({ loginFailuresPerAccount: { limit: 1000, windowMs: 60_000 } });
+    for (let i = 0; i < L.loginFailuresPerIp.limit; i++) {
+      await login(`user${i}@club.test`, 'nope-nope', `10.0.0.${i}`);
+    }
+    expect((await login('fresh@club.test', 'nope-nope', '10.9.9.9')).status).toBe(429);
+  });
+
+  it(`caps code requests per IP at ${L.codeRequestsPerIp.limit} per 15 minutes, known email or not (security#3)`, async () => {
+    const clock = fakeClock();
+    createComedian(t.db, { email: 'real@comic.test' });
+    for (let i = 0; i < L.codeRequestsPerIp.limit; i++) {
+      const res = await post('/api/auth/comedian/request-code', { email: i % 2 ? 'real@comic.test' : `x${i}@comic.test` });
+      expect(res.status).toBe(200);
+    }
+    for (const email of ['real@comic.test', 'nobody@comic.test']) {
+      const res = await post('/api/auth/comedian/request-code', { email });
+      expect(res.status).toBe(429);
+      expect(await readJson(res)).toMatchObject({ code: 'rate_limited', retryAfter: expect.any(Number) });
+    }
+    clock.now += L.codeRequestsPerIp.windowMs + 1;
+    expect((await post('/api/auth/comedian/request-code', { email: 'nobody@comic.test' })).status).toBe(200);
+  });
+
+  it('caps sign-in code emails club-wide, so a flood from many IPs can\'t burn the SMTP quota — without ever answering 429 for it', async () => {
+    const budget = CODE_RATE_LIMIT + 1;
+    const clock = fakeClock({ codeEmailsGlobal: { limit: budget, windowMs: 60 * 60_000 } });
+    process.env.TRUST_PROXY = '1';
+    for (let i = 0; i < 3; i++) createComedian(t.db, { email: `c${i}@comic.test` });
+    let n = 0;
+    const statuses: number[] = [];
+    const request = async (email: string) => {
+      const res = await t.request('/api/auth/comedian/request-code', {
+        method: 'POST',
+        headers: { 'x-forwarded-for': `198.51.100.${++n}` },
+        json: { email },
+      });
+      statuses.push(res.status);
+      expect(await readJson(res)).toEqual({ ok: true });
+    };
+    const sent = () => emailsTo(t.db).filter((e) => e.kind === 'login_code').length;
+
+    // Only emails that actually go out count: unknown emails send nothing…
+    for (let i = 0; i < 5; i++) await request(`nobody${i}@comic.test`);
+    expect(sent()).toBe(0);
+    // …and neither does a request the per-comedian cap turns down.
+    for (let i = 0; i < CODE_RATE_LIMIT + 1; i++) await request('c0@comic.test');
+    expect(sent()).toBe(CODE_RATE_LIMIT);
+    await request('c1@comic.test');
+    expect(sent()).toBe(budget);
+
+    // Spent: the same 200, nothing sent, and c1's code from before still works.
+    const code = latestCode('c1@comic.test');
+    await request('c1@comic.test');
+    await request('c2@comic.test');
+    await request('nobody@comic.test');
+    expect(sent()).toBe(budget);
+    expect(statuses.every((s) => s === 200)).toBe(true);
+    expect((await post('/api/auth/comedian/verify-code', { email: 'c1@comic.test', code })).status).toBe(200);
+
+    // The budget refills as the window slides.
+    clock.now += 60 * 60_000 + 1;
+    await request('c2@comic.test');
+    expect(sent()).toBe(budget + 1);
+  });
+
+  it('answers known and unknown emails alike after repeated wrong codes (security#5)', async () => {
+    createComedian(t.db, { email: 'real@comic.test' });
+    const probe = async (email: string) => {
+      await post('/api/auth/comedian/request-code', { email });
+      const statuses: number[] = [];
+      for (let i = 0; i < L.codeFailuresPerEmailIp.limit + 2; i++) {
+        statuses.push((await post('/api/auth/comedian/verify-code', { email, code: '000000' })).status);
+      }
+      return statuses;
+    };
+    const known = await probe('real@comic.test');
+    const unknown = await probe('nobody@comic.test');
+    expect(known).toEqual(unknown);
+    expect(known).toEqual([...Array<number>(L.codeFailuresPerEmailIp.limit).fill(400), 429, 429]);
+  });
+
+  it(`allows at most ${L.codeFailuresPerEmailIp.limit} code guesses per email from one IP per 15 minutes, however many codes are sent (security#3)`, async () => {
+    const comedian = createComedian(t.db, { email: 'b@comic.test' });
+    // The PoC: request 6 codes, guess wrong, then try the oldest code.
+    for (let i = 0; i < 6; i++) await post('/api/auth/comedian/request-code', { email: 'b@comic.test' });
+    // Newest first.
+    const codes = emailsTo(t.db, 'b@comic.test').map((e) => /\b(\d{6})\b/.exec(e.bodyText)?.[1]);
+    expect(codes).toHaveLength(CODE_RATE_LIMIT);
+    for (let i = 0; i < 4; i++) await post('/api/auth/comedian/verify-code', { email: 'b@comic.test', code: '999999' });
+    const oldest = codes[codes.length - 1]!;
+    if (oldest !== codes[0]) {
+      expect((await post('/api/auth/comedian/verify-code', { email: 'b@comic.test', code: oldest })).status).toBe(400);
+    }
+    // Only one code is live at a time.
+    const live = t.db
+      .select()
+      .from(loginCodes)
+      .where(eq(loginCodes.comedianId, comedian.id))
+      .all()
+      .filter((row) => row.consumedAt == null && row.expiresAt > Date.now());
+    expect(live).toHaveLength(1);
+
+    // Keep guessing: the per-email cap stops it even with fresh codes.
+    const statuses: number[] = [];
+    for (let i = 0; i < L.codeFailuresPerEmailIp.limit; i++) {
+      statuses.push((await post('/api/auth/comedian/verify-code', { email: 'b@comic.test', code: '999998' })).status);
+    }
+    expect(statuses.filter((s) => s === 429).length).toBeGreaterThan(0);
+    const newest = codes[0]!;
+    expect((await post('/api/auth/comedian/verify-code', { email: 'b@comic.test', code: newest })).status).toBe(429);
+  });
+
+  it('caps wrong codes per IP across emails', async () => {
+    fakeClock({ codeFailuresPerIp: { limit: 3, windowMs: 15 * 60_000 } });
+    for (let i = 0; i < 3; i++) {
+      expect((await post('/api/auth/comedian/verify-code', { email: `n${i}@comic.test`, code: '123456' })).status).toBe(400);
+    }
+    expect((await post('/api/auth/comedian/verify-code', { email: 'new@comic.test', code: '123456' })).status).toBe(429);
+  });
+
+  it('someone else\'s wrong codes don\'t lock a comedian out of their own IP (lockout DoS)', async () => {
+    fakeClock();
+    process.env.TRUST_PROXY = '1';
+    createComedian(t.db, { email: 'victim@comic.test' });
+    const verify = (code: string, ip: string) =>
+      t.request('/api/auth/comedian/verify-code', {
+        method: 'POST',
+        headers: { 'x-forwarded-for': ip },
+        json: { email: 'victim@comic.test', code },
+      });
+    for (let i = 0; i < L.codeFailuresPerEmailIp.limit; i++) expect((await verify('111111', '203.0.113.9')).status).toBe(400);
+    expect((await verify('111111', '203.0.113.9')).status).toBe(429);
+    await t.request('/api/auth/comedian/request-code', {
+      method: 'POST',
+      headers: { 'x-forwarded-for': '192.0.2.60' },
+      json: { email: 'victim@comic.test' },
+    });
+    const code = latestCode('victim@comic.test');
+    expect((await verify(code, '203.0.113.9')).status).toBe(429);
+    expect((await verify(code, '192.0.2.60')).status).toBe(200);
+  });
+
+  it(`stops code guessing spread over many IPs at ${L.codeFailuresPerEmail.limit} per email, known email or not`, async () => {
+    fakeClock();
+    process.env.TRUST_PROXY = '1';
+    createComedian(t.db, { email: 'real@comic.test' });
+    const perIp = L.codeFailuresPerEmailIp.limit - 1;
+    const results: number[][] = [];
+    for (const email of ['real@comic.test', 'nobody@comic.test']) {
+      const statuses: number[] = [];
+      for (let i = 0; i < L.codeFailuresPerEmail.limit + 1; i++) {
+        const res = await t.request('/api/auth/comedian/verify-code', {
+          method: 'POST',
+          headers: { 'x-forwarded-for': `198.51.100.${Math.floor(i / perIp)}` },
+          json: { email, code: '000000' },
+        });
+        statuses.push(res.status);
+      }
+      results.push(statuses);
+    }
+    expect(results[0]).toEqual(results[1]);
+    expect(results[0]).toEqual([...Array<number>(L.codeFailuresPerEmail.limit).fill(400), 429]);
+  });
+
+  it('a correct code clears the email\'s wrong guesses', async () => {
+    createComedian(t.db, { email: 'john@example.test' });
+    for (let round = 0; round < 2; round++) {
+      await post('/api/auth/comedian/request-code', { email: 'john@example.test' });
+      const code = latestCode('john@example.test');
+      for (let i = 0; i < CODE_MAX_ATTEMPTS - 1; i++) {
+        await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code: wrongCode(code) });
+      }
+      expect((await post('/api/auth/comedian/verify-code', { email: 'john@example.test', code })).status).toBe(200);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Change password (Settings → Account)
+// ---------------------------------------------------------------------------
+
+describe('POST /api/auth/password', () => {
+  function change(json: unknown, headers?: AuthHeaders) {
+    return t.request('/api/auth/password', { method: 'POST', headers, json });
+  }
+
+  it('changes the password, keeps this browser signed in and signs out every other session', async () => {
+    const user = createUser(t.db, { email: 'dana@example.test' });
+    const signIn = async () => cookieFrom(await post('/api/auth/login', { email: 'dana@example.test', password: TEST_PASSWORD }));
+    const laptop = { cookie: await signIn() };
+    const phone = { cookie: await signIn() };
+    const other = await loginAsBooker(t, { email: 'other@example.test' });
+
+    const res = await change({ current: TEST_PASSWORD, next: 'a-brand-new-password' }, laptop);
+    expect(res.status).toBe(200);
+    expect(await readJson<ChangePasswordResponse>(res)).toEqual({ ok: true, signedOut: 1 });
+
+    // This browser got a fresh session cookie; the old token and the phone are signed out.
+    const fresh = { cookie: cookieFrom(res) };
+    expect(fresh.cookie).toMatch(new RegExp(`^${SESSION_COOKIES.booker}=`));
+    expect(fresh.cookie).not.toBe(laptop.cookie);
+    expect((await getMe(fresh)).booker?.id).toBe(user.id);
+    expect((await getMe(laptop)).booker).toBeNull();
+    expect((await getMe(phone)).booker).toBeNull();
+    // Other bookers are untouched.
+    expect((await getMe(other.headers)).booker?.id).toBe(other.user.id);
+
+    expect((await post('/api/auth/login', { email: 'dana@example.test', password: TEST_PASSWORD })).status).toBe(401);
+    expect((await post('/api/auth/login', { email: 'dana@example.test', password: 'a-brand-new-password' })).status).toBe(200);
+  });
+
+  it('needs the right current password and a valid new one', async () => {
+    const { headers } = await loginAsBooker(t);
+    const wrong = await change({ current: 'not-my-password', next: 'a-brand-new-password' }, headers);
+    expect(wrong.status).toBe(400);
+    expect(await readJson(wrong)).toMatchObject({ code: 'wrong_password', issues: [{ path: 'current' }] });
+
+    for (const [json, path] of [
+      [{ current: TEST_PASSWORD, next: 'short' }, 'next'],
+      [{ current: TEST_PASSWORD, next: TEST_PASSWORD }, 'next'],
+      [{ current: '', next: 'a-brand-new-password' }, 'current'],
+      [{ next: 'a-brand-new-password' }, 'current'],
+    ] as const) {
+      const res = await change(json, headers);
+      expect(res.status, JSON.stringify(json)).toBe(400);
+      expect(await readJson(res)).toMatchObject({ code: 'validation_error', issues: [{ path }] });
+    }
+    // Nothing changed; still signed in.
+    expect((await getMe(headers)).booker).not.toBeNull();
+  });
+
+  it(`stops guessing the current password after ${DEFAULT_RATE_LIMITS.passwordChangeFailuresPerAccount.limit} tries`, async () => {
+    const { headers } = await loginAsBooker(t);
+    for (let i = 0; i < DEFAULT_RATE_LIMITS.passwordChangeFailuresPerAccount.limit; i++) {
+      expect((await change({ current: `guess-${i}`, next: 'a-brand-new-password' }, headers)).status).toBe(400);
+    }
+    const res = await change({ current: TEST_PASSWORD, next: 'a-brand-new-password' }, headers);
+    expect(res.status).toBe(429);
+    expect(await readJson(res)).toMatchObject({ code: 'rate_limited' });
+  });
+
+  it('is only for signed-in bookers', async () => {
+    expect((await change({ current: 'x', next: 'a-brand-new-password' })).status).toBe(401);
+    const comedian = createComedian(t.db);
+    const { headers } = await loginAsComedian(t, comedian.id);
+    expect((await change({ current: 'x', next: 'a-brand-new-password' }, headers)).status).toBe(401);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Comedian email change (security#6)
+// ---------------------------------------------------------------------------
+
+describe('changing a comedian\'s email', () => {
+  it('ends their sessions and kills links and codes sent to the old address', async () => {
+    const { headers: booker } = await loginAsBooker(t, { role: 'booker' });
+    const c = createComedian(t.db, { email: 'typo@wrong-person.test' });
+    const { headers: oldSession } = await loginAsComedian(t, c.id);
+    const magic = tokenFromUrl(createLoginLink(t.db, c.id));
+    const confirm = tokenFromUrl(createConfirmLink(t.db, c.id, '2026-11-02'));
+    await post('/api/auth/comedian/request-code', { email: 'typo@wrong-person.test' });
+
+    const patch = await t.request(`/api/comedians/${c.id}`, {
+      method: 'PATCH',
+      headers: booker,
+      json: { email: 'right@comic.test' },
+    });
+    expect(patch.status).toBe(200);
+    expect((await t.request('/api/portal/me', { headers: oldSession })).status).toBe(401);
+    expect((await post('/api/auth/magic', { token: magic })).status).toBe(400);
+    expect(findConfirmToken(t.db, confirm)).toBeNull();
+    expect(t.db.select().from(loginCodes).where(eq(loginCodes.comedianId, c.id)).all()).toHaveLength(0);
+
+    // Changing anything else keeps them signed in.
+    const { headers: fresh } = await loginAsComedian(t, c.id);
+    await t.request(`/api/comedians/${c.id}`, { method: 'PATCH', headers: booker, json: { bio: 'Hi' } });
+    expect((await t.request('/api/portal/me', { headers: fresh })).status).toBe(200);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Token housekeeping (correctness#6)
+// ---------------------------------------------------------------------------
+
+describe('deleteExpiredTokens', () => {
+  it('keeps expired confirm tokens for 30 days so old links say "expired", deletes the rest', async () => {
+    const comedian = createComedian(t.db);
+    const confirm = tokenFromUrl(createConfirmLink(t.db, comedian.id, '2026-11-02'));
+    createLoginLink(t.db, comedian.id);
+    const expiry = Date.now() - 1000;
+    t.db.update(tokens).set({ expiresAt: expiry }).run(); // both expired a second ago
+
+    // A day after expiry: the login link is cleaned up, the confirm link is kept…
+    expect(deleteExpiredTokens(t.db, expiry + 86_400_000)).toBe(1);
+    expect(t.db.select().from(tokens).all().map((r) => r.purpose)).toEqual(['confirm']);
+    const res = await t.request(`/api/portal/confirm/${confirm}`);
+    expect(res.status).toBe(410);
+    expect(await readJson(res)).toMatchObject({ code: 'expired_token' });
+
+    // …until 30 days past expiry.
+    expect(deleteExpiredTokens(t.db, expiry + EXPIRED_CONFIRM_RETENTION_MS - 1)).toBe(0);
+    expect(deleteExpiredTokens(t.db, expiry + EXPIRED_CONFIRM_RETENTION_MS + 1)).toBe(1);
+    expect((await t.request(`/api/portal/confirm/${confirm}`)).status).toBe(404);
   });
 });

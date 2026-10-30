@@ -3,14 +3,18 @@
  * parser (shared so the client's live preview and the server agree).
  *
  *   GET    /api/comedians?search&tagIds&archived     ComedianListItem[]
- *   POST   /api/comedians                            { name, email } → 201 ComedianDetail (409 email_taken)
- *   POST   /api/comedians/bulk                       { rows, dryRun? } → BulkAddResult
+ *   POST   /api/comedians                            { name, email, sendLoginLink? } → 201 CreateComedianResponse
+ *                                                    (409 email_taken)
+ *   POST   /api/comedians/bulk                       { rows, dryRun?, sendLoginLinks? } → BulkAddResult
  *   POST   /api/comedians/bulk-tag                   { comedianIds, tagId, action } → { updated }
  *   POST   /api/comedians/bulk-archive               { comedianIds, archived } → { updated }
+ *   POST   /api/comedians/bulk-send-login-link       { comedianIds } → BulkLoginLinkResult (archived skipped)
  *   GET    /api/comedians/:id                        ComedianDetail
  *   PATCH  /api/comedians/:id                        { name?, email?, bio?, headshotUrl?, archived? } → ComedianDetail
+ *                                                    (a new email signs them out everywhere and voids their
+ *                                                    sign-in links, confirmation links and codes)
  *   PUT    /api/comedians/:id/tags                   { tagIds } → TagSummary[]
- *   GET    /api/comedians/:id/availability?month     ComedianAvailability
+ *   GET    /api/comedians/:id/availability?month     ComedianAvailability (month defaults to the planning month)
  *   GET    /api/comedians/:id/bookings[?upcoming=1]  ComedianBooking[]
  *   GET    /api/comedians/:id/card                   ComedianCard (hover card)
  *   POST   /api/comedians/:id/send-login-link        SendLoginLinkResponse
@@ -86,6 +90,8 @@ export type ListComediansQuery = z.input<typeof listComediansQuerySchema>;
 export const createComedianSchema = z.object({
   name: comedianNameSchema,
   email: emailSchema,
+  /** Email them a portal sign-in link right away ("Email them a sign-in link", on by default in the UI). */
+  sendLoginLink: z.boolean().optional(),
 });
 export type CreateComedianInput = z.input<typeof createComedianSchema>;
 
@@ -108,6 +114,8 @@ export const bulkAddSchema = z.object({
     .max(BULK_ADD_MAX, `Add at most ${BULK_ADD_MAX} at a time`),
   /** Preview only: report what would be created/skipped without writing. */
   dryRun: z.boolean().optional(),
+  /** Email each comedian created a portal sign-in link (ignored on a dry run). */
+  sendLoginLinks: z.boolean().optional(),
 });
 export type BulkAddInput = z.input<typeof bulkAddSchema>;
 
@@ -127,7 +135,16 @@ export const bulkArchiveSchema = z.object({
 });
 export type BulkArchiveInput = z.input<typeof bulkArchiveSchema>;
 
-/** `GET /api/comedians/:id/availability` — month defaults to the club's current month. */
+/** `POST /api/comedians/bulk-send-login-link` — archived comedians are skipped. */
+export const bulkSendLoginLinkSchema = z.object({
+  comedianIds: z.array(idSchema).min(1).max(2000),
+});
+export type BulkSendLoginLinkInput = z.input<typeof bulkSendLoginLinkSchema>;
+
+/**
+ * `GET /api/comedians/:id/availability` — month defaults to the club's planning month
+ * (`planningMonth`: next month from the 20th on).
+ */
 export const comedianAvailabilityQuerySchema = z.object({ month: monthSchema.optional() });
 
 export const comedianBookingsQuerySchema = z.object({ upcoming: queryBooleanSchema });
@@ -176,8 +193,11 @@ export interface ComedianListItem {
   headshotUrl: string;
   archived: boolean;
   tags: TagSummary[];
-  /** Has submitted availability for next month (club timezone). */
-  nextMonthSubmitted: boolean;
+  /**
+   * Has submitted availability for the planning month (`planningMonth` of the club's today:
+   * this month until the 19th, next month from the 20th on).
+   */
+  planningMonthSubmitted: boolean;
   /** Bookings on scheduled shows from today on. */
   upcomingCount: number;
   lastLoginAt: number | null;
@@ -290,6 +310,31 @@ export interface BulkAddResult {
   dryRun: boolean;
   created: BulkCreated[];
   skipped: BulkSkip[];
+  /** Sign-in links emailed to the comedians created (null unless `sendLoginLinks` on a real run). */
+  loginLinks: BulkLoginLinkResult | null;
+}
+
+/** One sign-in link email. `outbox` when email isn't set up (it's in Settings → Email log). */
+export interface LoginLinkResult {
+  status: EmailStatus;
+  error?: string;
+}
+
+/** `POST /api/comedians` */
+export interface CreateComedianResponse extends ComedianDetail {
+  /** The sign-in link email, when `sendLoginLink` was set. */
+  loginLink: LoginLinkResult | null;
+}
+
+/** Sign-in links sent to many comedians at once. */
+export interface BulkLoginLinkResult {
+  /** Delivered to the mail server. */
+  sent: number;
+  /** Went to the outbox (email isn't set up). */
+  outbox: number;
+  failed: number;
+  /** Archived comedians (never emailed). */
+  skipped: number;
 }
 
 export interface BulkUpdateResult {

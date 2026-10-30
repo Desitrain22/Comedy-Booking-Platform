@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import {
+  copySourceEmptyReason,
   countByMonth,
   isWeekdayFullySelected,
+  monthParam,
   monthsPhrase,
+  namesPhrase,
   paintDates,
   pillAriaLabel,
   pillLabel,
   shortLocationName,
+  timeChangeEffects,
   toggleWeekday,
 } from './showFormat';
 
@@ -80,5 +84,52 @@ describe('date selection', () => {
       ['2026-11', 2],
       ['2026-12', 1],
     ]);
+  });
+});
+
+describe('timeChangeEffects (warn before a new start time is saved — correctness #1)', () => {
+  const b = (comedianName: string, availability: [number, number] | null, overrideUnavailable = false, declinedAt: number | null = null) => ({
+    comedianName,
+    overrideUnavailable,
+    declinedAt,
+    availability: availability ? { startMin: availability[0], endMin: availability[1] } : null,
+  });
+  const lineup = [
+    b('Early Bird', [1140, 1260]), // 7–9 PM, fits 9 PM
+    b('Night Owl', [1320, 1500], true), // booked anyway at 9 PM
+    b('Blank', null, true),
+    b('All Night', [1140, 1500]),
+    b('Gone', [1140, 1260], false, 5), // declined
+  ];
+
+  it('lists who a later time leaves unavailable and whose ⚠ goes away', () => {
+    const at11 = timeChangeEffects(lineup, 1380);
+    expect(at11.newlyUnavailable.map((x) => x.comedianName)).toEqual(['Early Bird']);
+    expect(at11.nowAvailable.map((x) => x.comedianName)).toEqual(['Night Owl']);
+    const same = timeChangeEffects(lineup, 1260);
+    expect(same).toEqual({ newlyUnavailable: [], nowAvailable: [] });
+  });
+
+  it('joins names', () => {
+    expect(namesPhrase([])).toBe('');
+    expect(namesPhrase(['Ann'])).toBe('Ann');
+    expect(namesPhrase(['Ann', 'Bo'])).toBe('Ann and Bo');
+    expect(namesPhrase(['Ann', 'Bo', 'Cy'])).toBe('Ann, Bo and Cy');
+  });
+});
+
+describe('month defaults (UX B8)', () => {
+  it('opens on the planning month without ?month (next month from the 20th on)', () => {
+    expect(monthParam(null, '2026-10-30')).toBe('2026-11');
+    expect(monthParam(null, '2026-10-19')).toBe('2026-10');
+    expect(monthParam(null, '2026-12-25')).toBe('2027-01');
+    expect(monthParam('2027-03', '2026-10-30')).toBe('2027-03');
+    expect(monthParam('2027-13', '2026-10-30')).toBe('2026-11');
+  });
+
+  it('explains a copy-pattern with nothing to copy (only once the count is known)', () => {
+    expect(copySourceEmptyReason('2026-12', 0)).toBe('November has no shows to copy');
+    expect(copySourceEmptyReason('2026-12', 12)).toBeNull();
+    expect(copySourceEmptyReason('2026-12', undefined)).toBeNull();
   });
 });

@@ -1,4 +1,7 @@
-/** Dashboard section 2: tonight's shows as compact cards with status-colored lineup chips. */
+/**
+ * Dashboard section 2: tonight's shows as compact cards with status-colored lineup chips
+ * (declined comedians struck through: they still hold the slot until replaced).
+ */
 import { ArrowRight, CalendarPlus, TriangleAlert } from 'lucide-react';
 import { Link } from 'react-router';
 import type { TonightShow } from '../../../shared/api/dashboard';
@@ -116,7 +119,7 @@ function ShowCard({ show, dayLink }: { show: TonightShow; dayLink: string }) {
                       )}
                     >
                       <span aria-hidden className={cn('size-1.5 shrink-0 rounded-full', s.dot)} />
-                      <span className="truncate">{b.comedianName}</span>
+                      <span className={cn('truncate', s.name)}>{b.comedianName}</span>
                       {b.overrideUnavailable && (
                         <TriangleAlert className="size-3 shrink-0" aria-label="Booked while unavailable" />
                       )}

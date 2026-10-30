@@ -1,7 +1,9 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  NOTE_EXCERPT_MAX,
   restoreOf,
+  type ConfirmBookingResponse,
   type CreateBookingResponse,
   type DayResponse,
   type DeleteBookingResponse,
@@ -10,13 +12,16 @@ import {
   type UnavailableErrorBody,
 } from '../../shared/api/lineup';
 import type { ApiErrorBody } from '../../shared/types';
+import { addDays, weekStartOf } from '../../shared/time';
 import { bookings, shows, users } from '../db/schema';
-import { clubToday } from '../lib/settings';
+import { unsentThisWeek } from './lineup';
+import { clubNight, clubToday } from '../lib/settings';
 import {
   createAvailability,
   createBooking,
   createComedian,
   createLocation,
+  createNote,
   createShow,
   createSubmission,
   createTag,
@@ -92,6 +97,7 @@ describe('guards', () => {
       ['PATCH', '/api/bookings/1'],
       ['DELETE', '/api/bookings/1'],
       ['POST', '/api/bookings/1/confirm'],
+      ['POST', '/api/bookings/1/unconfirm'],
     ];
     for (const [method, path] of calls) {
       const json = method === 'POST' || method === 'PATCH' ? { showId: 1, position: 0, comedianId: 1 } : undefined;
@@ -133,7 +139,7 @@ describe('GET /api/days/:date', () => {
 
     const day = await getDay();
     expect(day.date).toBe(DATE);
-    expect(day.today).toBe(clubToday(t.db));
+    expect(day.today).toBe(clubNight(t.db));
     expect(day.shows.map((s) => s.id)).toEqual([cellar7.id, cellar730.id, cellar9.id, annex6.id, annex8.id]);
 
     const nine = day.shows.find((s) => s.id === cellar9.id)!;
@@ -153,8 +159,8 @@ describe('GET /api/days/:date', () => {
     expect(day.shows.find((s) => s.id === annex8.id)).toMatchObject({ name: 'Annex Showcase', bookings: [] });
   });
 
-  it('marks unconfirmed bookings on today’s shows red', async () => {
-    const today = clubToday(t.db);
+  it('marks unconfirmed bookings on tonight’s shows red', async () => {
+    const today = clubNight(t.db);
     const show = createShow(t.db, { date: today });
     const [x, y] = [createComedian(t.db), createComedian(t.db)];
     createBooking(t.db, { showId: show.id, comedianId: x.id, confirmationSentAt: 1 });
@@ -217,6 +223,8 @@ describe('GET /api/days/:date', () => {
         { bookingId: bSeven.id, showId: seven.id, startMin: 1140, locationName: 'The Cellar', position: 0 },
         { bookingId: bTen.id, showId: ten.id, startMin: 1320, locationName: 'The Annex', position: 3 },
       ],
+      noteCount: 0,
+      latestNote: null,
     });
     expect(a).toMatchObject({ availability: null, submittedMonth: true, tags: [], bookings: [] });
     expect(b).toMatchObject({ availability: null, submittedMonth: false, tags: [], bookings: [] });
@@ -541,6 +549,8 @@ describe('DELETE /api/bookings/:id', () => {
         confirmationSentAt: 1_000,
         confirmedAt: 2_000,
         confirmedBy: 'comedian',
+        declinedAt: null,
+        declineNote: '',
         bookedById: bookerId,
         createdAt: b.createdAt,
       },
@@ -756,5 +766,250 @@ describe('day view after changes elsewhere', () => {
     expect((await getDay()).shows).toHaveLength(1);
     t.db.update(shows).set({ status: 'cancelled' }).where(eq(shows.id, show.id)).run();
     expect((await getDay()).shows).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Fix round: notes on the board, the "never emailed" nudge, archived moves (correctness #5),
+// declines, and Undo of "Mark confirmed"
+// ---------------------------------------------------------------------------
+
+describe('GET /api/days/:date — notes and the "never emailed" nudge', () => {
+  it('gives each pool comedian their note count and the first line of the newest note', async () => {
+    const quiet = createComedian(t.db, { name: 'Quiet' });
+    const noted = createComedian(t.db, { name: 'Noted' });
+    const archived = createComedian(t.db, { name: 'Gone', archived: true });
+    createNote(t.db, { comedianId: noted.id, body: 'Old note', createdAt: 1_000 });
+    createNote(t.db, { comedianId: noted.id, body: '\n  Runs long — keep to 7 min  \nSecond line', createdAt: 3_000 });
+    createNote(t.db, { comedianId: noted.id, body: 'Middle', createdAt: 2_000 });
+    createNote(t.db, { comedianId: archived.id, body: 'Hidden' });
+    const long = createComedian(t.db, { name: 'Wordy' });
+    createNote(t.db, { comedianId: long.id, body: 'x'.repeat(500) });
+
+    const day = await getDay();
+    const byName = new Map(day.comedians.map((c) => [c.name, c]));
+    expect(byName.get('Quiet')).toMatchObject({ id: quiet.id, noteCount: 0, latestNote: null });
+    expect(byName.get('Noted')).toMatchObject({ noteCount: 3, latestNote: 'Runs long — keep to 7 min' });
+    expect(byName.get('Wordy')!.latestNote).toHaveLength(NOTE_EXCERPT_MAX);
+    expect(byName.get('Wordy')!.latestNote!.endsWith('…')).toBe(true);
+    expect(byName.has('Gone')).toBe(false);
+  });
+
+  it('counts this week’s never-emailed, unconfirmed spots (the dashboard nudge’s rule)', async () => {
+    // Wed Nov 4, noon in New York: the week is Mon Nov 2 – Sun Nov 8.
+    const noon = new Date('2026-11-04T17:00:00Z');
+    const tonightShow = createShow(t.db, { date: '2026-11-04', slotCount: 10 });
+    const sundayShow = createShow(t.db, { date: '2026-11-08', startMin: 1200 });
+    const nextWeek = createShow(t.db, { date: '2026-11-09' });
+    const lastNight = createShow(t.db, { date: '2026-11-03' });
+    const cancelled = createShow(t.db, { date: '2026-11-04', startMin: 1320, status: 'cancelled' });
+    const comic = () => createComedian(t.db).id;
+
+    createBooking(t.db, { showId: tonightShow.id, comedianId: comic() }); // counts
+    createBooking(t.db, { showId: sundayShow.id, comedianId: comic() }); // counts
+    createBooking(t.db, { showId: tonightShow.id, comedianId: comic(), confirmationSentAt: 5 }); // emailed
+    createBooking(t.db, { showId: tonightShow.id, comedianId: comic(), confirmedAt: 5, confirmedBy: 'booker' });
+    createBooking(t.db, { showId: tonightShow.id, comedianId: comic(), declinedAt: 5 }); // needs replacing, not emailing
+    createBooking(t.db, { showId: tonightShow.id, comedianId: createComedian(t.db, { archived: true }).id });
+    createBooking(t.db, { showId: nextWeek.id, comedianId: comic() });
+    createBooking(t.db, { showId: lastNight.id, comedianId: comic() });
+    createBooking(t.db, { showId: cancelled.id, comedianId: comic() });
+
+    expect(unsentThisWeek(t.db, noon)).toEqual({ weekStart: '2026-11-02', weekEnd: '2026-11-08', count: 2 });
+    // 1 AM Thursday: still Wednesday night, but Wednesday's shows are over and won't be emailed.
+    expect(unsentThisWeek(t.db, new Date('2026-11-05T06:00:00Z'))).toEqual({ weekStart: '2026-11-02', weekEnd: '2026-11-08', count: 1 });
+
+    // GET /api/days carries it (for the current week, whatever day is being looked at).
+    const now = unsentThisWeek(t.db);
+    expect((await getDay('2027-03-01')).unsentThisWeek).toEqual(now);
+    expect(now.weekStart).toBe(weekStartOf(clubNight(t.db)));
+    expect(now.weekEnd).toBe(addDays(now.weekStart, 6));
+  });
+});
+
+describe('PATCH /api/bookings/:id — archived comedians (correctness #5)', () => {
+  it('refuses to move an archived comedian into another show, but lets them be reordered', async () => {
+    const seven = createShow(t.db, { date: DATE, startMin: 1140 });
+    const nine = createShow(t.db, { date: DATE, startMin: 1260 });
+    const archived = createComedian(t.db, { name: 'Archie', archived: true });
+    const b = createBooking(t.db, { showId: seven.id, comedianId: archived.id, position: 0, confirmedAt: 9, confirmedBy: 'comedian' });
+
+    for (const force of [false, true]) {
+      const res = await move(b.id, { showId: nine.id, position: 0, force });
+      expect(res.status).toBe(409);
+      expect(res.body).toMatchObject({ code: 'comedian_archived', comedianId: archived.id });
+    }
+    expect(bookingRow(b.id)).toMatchObject({ showId: seven.id, position: 0, confirmedAt: 9 });
+
+    // Same show: just a reorder, still allowed.
+    expect((await move(b.id, { position: 2 })).status).toBe(200);
+    expect(bookingRow(b.id)).toMatchObject({ showId: seven.id, position: 2, confirmedAt: 9 });
+  });
+
+  it('refuses a cross-show swap that would move an archived occupant', async () => {
+    const seven = createShow(t.db, { date: DATE, startMin: 1140 });
+    const nine = createShow(t.db, { date: DATE, startMin: 1260 });
+    const mover = createBooking(t.db, { showId: seven.id, comedianId: availableComic().id, position: 0 });
+    const archived = createComedian(t.db, { archived: true });
+    const occupant = createBooking(t.db, { showId: nine.id, comedianId: archived.id, position: 1 });
+    const res = await move(mover.id, { showId: nine.id, position: 1, force: true });
+    expect(res.status).toBe(409);
+    expect(res.body).toMatchObject({ code: 'comedian_archived', comedianId: archived.id });
+    expect(bookingRow(mover.id)).toMatchObject({ showId: seven.id, position: 0 });
+    expect(bookingRow(occupant.id)).toMatchObject({ showId: nine.id, position: 1 });
+  });
+});
+
+describe('Declined bookings on the board', () => {
+  it('report declined (with the note) and keep their slot', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const b = createBooking(t.db, { showId: show.id, comedianId: availableComic().id, declinedAt: 1_234, declineNote: 'Sick', confirmationSentAt: 1 });
+    const day = await getDay();
+    expect(day.shows[0]!.bookings[0]).toMatchObject({ id: b.id, status: 'declined', declinedAt: 1_234, declineNote: 'Sick' });
+  });
+
+  it('dropping someone onto a declined slot replaces it (Undo brings the decline back)', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const declined = createBooking(t.db, {
+      showId: show.id,
+      comedianId: availableComic(DATE, 'Can’t Make It').id,
+      position: 2,
+      confirmationSentAt: 100,
+      declinedAt: 200,
+      declineNote: 'Out of town',
+      createdAt: 50,
+    });
+    const newcomer = availableComic(DATE, 'Fill In');
+    const res = await book({ showId: show.id, position: 2, comedianId: newcomer.id, replaceBookingId: declined.id });
+    expect(res.status).toBe(201);
+    expect(res.body).toMatchObject({ comedianId: newcomer.id, status: 'not_sent', declinedAt: null, declineNote: '' });
+    expect(res.body.replaced).toMatchObject({ id: declined.id, status: 'declined', declinedAt: 200, declineNote: 'Out of town' });
+
+    // Undo: remove the newcomer, restore the declined booking exactly.
+    await unbook(res.body.id);
+    const undo = await book({
+      showId: show.id,
+      position: 2,
+      comedianId: declined.comedianId,
+      restore: restoreOf(res.body.replaced!),
+    });
+    expect(undo.status).toBe(201);
+    const { id: _a, ...original } = declined;
+    const { id: _b, ...restored } = bookingRow(undo.body.id)!;
+    expect(restored).toEqual(original);
+  });
+
+  it('a restore from an older client (no decline fields) is simply not declined; future declinedAt is refused', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const comic = availableComic();
+    const restore = { overrideUnavailable: false, confirmationSentAt: null, confirmedAt: null, confirmedBy: null, bookedById: null, createdAt: 1 };
+    const future = await book({ showId: show.id, position: 0, comedianId: comic.id, restore: { ...restore, declinedAt: Date.now() + 86_400_000 } });
+    expect(future.status).toBe(400);
+    const res = await book({ showId: show.id, position: 0, comedianId: comic.id, restore });
+    expect(res.status).toBe(201);
+    expect(bookingRow(res.body.id)).toMatchObject({ declinedAt: null, declineNote: '' });
+  });
+
+  it('moving to another show clears the decline (a new spot); moving within the show keeps it', async () => {
+    const seven = createShow(t.db, { date: DATE, startMin: 1140 });
+    const nine = createShow(t.db, { date: DATE, startMin: 1260 });
+    const b = createBooking(t.db, { showId: seven.id, comedianId: availableComic().id, position: 0, declinedAt: 5, declineNote: 'Busy' });
+    expect((await move(b.id, { position: 3 })).body.booking).toMatchObject({ status: 'declined', declinedAt: 5 });
+    const res = await move(b.id, { showId: nine.id, position: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body.booking).toMatchObject({ showId: nine.id, status: 'not_sent', declinedAt: null, declineNote: '' });
+    expect(bookingRow(b.id)).toMatchObject({ declinedAt: null, declineNote: '' });
+  });
+
+  it('moving a comedian from another show onto a declined slot replaces it instead of swapping', async () => {
+    const seven = createShow(t.db, { date: DATE, startMin: 1140 });
+    const nine = createShow(t.db, { date: DATE, startMin: 1260 });
+    const xavier = createBooking(t.db, { showId: seven.id, comedianId: availableComic(DATE, 'Xavier').id, position: 1 });
+    const dee = createBooking(t.db, {
+      showId: nine.id,
+      comedianId: availableComic(DATE, 'Dee').id,
+      position: 0,
+      confirmationSentAt: 100,
+      declinedAt: 200,
+      declineNote: 'Flu',
+    });
+
+    const res = await move(xavier.id, { showId: nine.id, position: 0 });
+    expect(res.status).toBe(200);
+    expect(res.body.booking).toMatchObject({ id: xavier.id, showId: nine.id, position: 0 });
+    expect(res.body.swapped).toBeNull();
+    // Dee is unbooked (not sent to the 7 PM show with her decline wiped), and comes back for Undo.
+    expect(res.body.replaced).toMatchObject({ id: dee.id, showId: nine.id, status: 'declined', declineNote: 'Flu' });
+    expect(bookingRow(dee.id)).toBeUndefined();
+    expect((await getDay()).shows.find((s) => s.id === seven.id)!.bookings).toEqual([]);
+
+    // Undo: Xavier back to 7 PM, then Dee's declined booking back exactly.
+    expect((await move(xavier.id, { showId: seven.id, position: 1 })).body.replaced).toBeNull();
+    const undo = await book({ showId: nine.id, position: 0, comedianId: dee.comedianId, restore: restoreOf(res.body.replaced!) });
+    const { id: _a, ...original } = dee;
+    const { id: _b, ...restored } = bookingRow(undo.body.id)!;
+    expect(restored).toEqual(original);
+
+    // Within one show it's still a swap (the decline stays in that show).
+    const other = createBooking(t.db, { showId: nine.id, comedianId: availableComic(DATE, 'Other').id, position: 2 });
+    const within = await move(other.id, { position: 0 });
+    expect(within.body).toMatchObject({ swapped: { id: undo.body.id, position: 2, status: 'declined' }, replaced: null });
+  });
+});
+
+describe('POST /api/bookings/:id/unconfirm — Undo of "Mark confirmed"', () => {
+  async function confirm(id: number) {
+    const res = await t.request(`/api/bookings/${id}/confirm`, { method: 'POST', headers });
+    expect(res.status).toBe(200);
+    return readJson<ConfirmBookingResponse>(res);
+  }
+  async function unconfirm(id: number, json: unknown) {
+    const res = await t.request(`/api/bookings/${id}/unconfirm`, { method: 'POST', headers, json });
+    return { status: res.status, body: await readJson<LineupBooking & ApiErrorBody>(res) };
+  }
+
+  it('puts back exactly the state "Mark confirmed" replaced', async () => {
+    const tonight = clubNight(t.db);
+    const show = createShow(t.db, { date: tonight });
+    const b = createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id, confirmationSentAt: 50 });
+
+    const confirmed = await confirm(b.id);
+    expect(confirmed).toMatchObject({ status: 'confirmed', confirmedBy: 'booker' });
+    expect(confirmed.previous).toEqual({ confirmedAt: null, confirmedBy: null, declinedAt: null, declineNote: '' });
+
+    const res = await unconfirm(b.id, confirmed.previous);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: b.id, status: 'unconfirmed_today', confirmedAt: null, confirmedBy: null, confirmationSentAt: 50 });
+    const { id: _a, ...before } = b;
+    const { id: _b, ...after } = bookingRow(b.id)!;
+    expect(after).toEqual(before);
+  });
+
+  it('"Mark confirmed" takes back a decline, and Undo restores it', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const b = createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id, declinedAt: 77, declineNote: 'Flu' });
+    const confirmed = await confirm(b.id);
+    expect(confirmed).toMatchObject({ status: 'confirmed', declinedAt: null, declineNote: '' });
+    expect(confirmed.previous).toEqual({ confirmedAt: null, confirmedBy: null, declinedAt: 77, declineNote: 'Flu' });
+    expect((await unconfirm(b.id, confirmed.previous)).body).toMatchObject({ status: 'declined', declinedAt: 77, declineNote: 'Flu', confirmedAt: null });
+  });
+
+  it('an empty body just unconfirms (leaving any decline alone); validates and 404s', async () => {
+    const show = createShow(t.db, { date: DATE });
+    const b = createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id, confirmedAt: 5, confirmedBy: 'comedian', confirmationSentAt: 1 });
+    expect((await unconfirm(b.id, {})).body).toMatchObject({ status: 'awaiting', confirmedAt: null, confirmedBy: null });
+
+    for (const bad of [
+      { confirmedAt: 5 },
+      { confirmedBy: 'booker' },
+      { confirmedAt: Date.now() + 86_400_000, confirmedBy: 'booker' },
+      { declinedAt: Date.now() + 86_400_000 },
+      { confirmedAt: 5, confirmedBy: 'nobody' },
+    ]) {
+      const res = await unconfirm(b.id, bad);
+      expect(res.status, JSON.stringify(bad)).toBe(400);
+      expect(res.body.code).toBe('validation_error');
+    }
+    expect((await unconfirm(999, {})).status).toBe(404);
   });
 });

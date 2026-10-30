@@ -2,8 +2,11 @@
  * Feature emails (F5): availability requests / reminders and the weekly confirmation.
  * Built on the foundation's layout helpers; every template returns
  * `{ subject, html, text }` with a plain-text alternative.
+ *
+ * Show times are comedian-facing: an after-midnight show (startMin >= 1440) belongs to its
+ * night's date but also names the real calendar day — "Sun, Nov 8 — 1 AM (early Mon, Nov 9)".
  */
-import { formatDateMedium, formatDateShort, formatMonthName, formatTime } from '../../shared/time';
+import { formatDateMedium, formatDateShort, formatMonthName, formatShowTime, formatShowWhen } from '../../shared/time';
 import type { AvailabilityRequestKind } from '../../shared/types';
 import {
   emailButton,
@@ -118,6 +121,12 @@ export interface ConfirmationSpot {
   showName: string;
   /** Already confirmed (shown with a check, still listed). */
   confirmed: boolean;
+  /**
+   * Only when the club lets comedians decline single spots: the confirm page with this
+   * spot's "Can't make it" opened (`declineLink(url, bookingId)`). Opening it changes
+   * nothing — email scanners prefetch links; the decline itself is a POST from the page.
+   */
+  declineUrl?: string;
 }
 
 export interface ConfirmationEmailParams {
@@ -129,13 +138,20 @@ export interface ConfirmationEmailParams {
   url: string;
   /** "this week" | "next week" | "the week of Mon, Nov 9". */
   weekPhrase: string;
+  /**
+   * The club lets comedians decline single spots: the closing line points at the per-spot
+   * "Can't make it?" links instead of only "reply to this email".
+   */
+  allowDeclines?: boolean;
 }
 
-/** "9 PM · Late Show" (or just "9 PM"). */
+/** "9 PM · Late Show", "1 AM (early Mon, Nov 9) · Late Late Show" (or just the time). */
 function spotTitle(spot: ConfirmationSpot): string {
-  const time = formatTime(spot.startMin);
+  const time = formatShowTime(spot.date, spot.startMin);
   return spot.showName ? `${time} · ${spot.showName}` : time;
 }
+
+const CANT_MAKE_IT = "Can't make it?";
 
 function spotWhere(spot: ConfirmationSpot): string {
   return spot.locationAddress ? `${spot.locationName}, ${spot.locationAddress}` : spot.locationName;
@@ -147,6 +163,9 @@ function spotRowHtml(spot: ConfirmationSpot, last: boolean): string {
   const status = spot.confirmed
     ? `<div style="margin-top:4px;font-size:12px;font-weight:600;color:${CONFIRMED}">&#10003; Confirmed</div>`
     : '';
+  const decline = spot.declineUrl
+    ? `<div style="margin-top:6px;font-size:13px"><a href="${escapeHtml(spot.declineUrl)}" target="_blank" style="color:${MUTED};text-decoration:underline">${escapeHtml(CANT_MAKE_IT)}</a></div>`
+    : '';
   return `<tr>
   <td valign="top" style="${border}padding:12px 14px 12px 0;width:64px;white-space:nowrap">
     <div style="font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:${MUTED}">${escapeHtml(weekday ?? '')}</div>
@@ -155,13 +174,13 @@ function spotRowHtml(spot: ConfirmationSpot, last: boolean): string {
   <td valign="top" style="${border}padding:12px 0">
     <div style="font-size:15px;font-weight:600;color:${TEXT}">${escapeHtml(spotTitle(spot))}</div>
     <div style="margin-top:2px;font-size:14px;line-height:1.45;color:${MUTED}">${escapeHtml(spotWhere(spot))}</div>
-    ${status}
+    ${status}${decline}
   </td>
 </tr>`;
 }
 
 export function confirmationEmail(params: ConfirmationEmailParams): EmailContent {
-  const { clubName, name, spots, url, weekPhrase } = params;
+  const { clubName, name, spots, url, weekPhrase, allowDeclines = false } = params;
   const first = firstName(name);
   const count = spots.length;
   const spotsWord = count === 1 ? 'spot' : 'spots';
@@ -170,7 +189,7 @@ export function confirmationEmail(params: ConfirmationEmailParams): EmailContent
 
   const firstSpot = spots[0];
   const preheader = firstSpot
-    ? `${formatDateShort(firstSpot.date)}, ${formatTime(firstSpot.startMin)} at ${firstSpot.locationName}${
+    ? `${formatDateShort(firstSpot.date)}, ${formatShowTime(firstSpot.date, firstSpot.startMin)} at ${firstSpot.locationName}${
         count > 1 ? ` and ${count - 1} more` : ''
       }. Tap to confirm.`
     : 'Tap to confirm your spots.';
@@ -186,22 +205,32 @@ ${spots.map((spot, i) => spotRowHtml(spot, i === spots.length - 1)).join('\n')}
       emailParagraph(`Hey ${escapeHtml(first)}, ${escapeHtml(lead)}`),
       table,
       bigButton(url, 'Confirm my spots'),
-      emailParagraph(`<strong>Can't make one?</strong> Reply to this email.`),
+      emailParagraph(
+        allowDeclines
+          ? `<strong>Can't make one?</strong> Tap “${escapeHtml(CANT_MAKE_IT)}” under that spot, or reply to this email.`
+          : `<strong>Can't make one?</strong> Reply to this email.`,
+      ),
       emailFinePrint(`Or paste this link into your browser:<br>${escapeHtml(url)}`),
     ].join('\n'),
   });
 
   const lines = spots.map((spot) => {
     const check = spot.confirmed ? ' (confirmed)' : '';
-    return `• ${formatDateMedium(spot.date)} — ${spotTitle(spot)}${check}\n  ${spotWhere(spot)}`;
+    const when = formatShowWhen(spot.date, spot.startMin, { separator: ' — ' });
+    const title = spot.showName ? `${when} · ${spot.showName}` : when;
+    const decline = spot.declineUrl ? `\n  ${CANT_MAKE_IT} ${spot.declineUrl}` : '';
+    return `• ${title}${check}\n  ${spotWhere(spot)}${decline}`;
   });
+  const closing = allowDeclines
+    ? `Can't make one? Use the "${CANT_MAKE_IT}" link under that spot, or reply to this email.`
+    : `Can't make one? Reply to this email.`;
   const text = `Hey ${first}, ${lead}
 
 ${lines.join('\n\n')}
 
 Confirm my spots: ${url}
 
-Can't make one? Reply to this email.`;
+${closing}`;
 
   return { subject, html, text };
 }

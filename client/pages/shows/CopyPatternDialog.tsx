@@ -1,8 +1,10 @@
 /**
  * "Copy October's pattern into November": previews (dryRun) the shows the copy would
  * create, grouped by weekday then location, with an optional location filter, then
- * creates them on Confirm. Used by the create-shows page and the calendar's empty state.
+ * creates them on Confirm (the success toast can Undo it). Used by the create-shows page and
+ * the calendar's empty state.
  */
+import { useQueryClient } from '@tanstack/react-query';
 import { CalendarX, TriangleAlert } from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { toast } from 'sonner';
@@ -12,7 +14,7 @@ import { Button, ColorDot, Dialog, EmptyState, Spinner } from '../../components/
 import { errorMessage } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { WEEKDAY_PLURALS, plural } from './showFormat';
-import { useCopyPattern, useCopyPatternPreview } from './showsData';
+import { undoCreatedShows, useCopyPattern, useCopyPatternPreview } from './showsData';
 
 export interface CopyPatternDialogProps {
   open: boolean;
@@ -81,6 +83,7 @@ export function CopyPatternDialog({ open, onOpenChange, toMonth, onCopied }: Cop
   // Always preview every location; the chips filter what we show and what we send.
   const preview = useCopyPatternPreview({ fromMonth, toMonth }, open);
   const copy = useCopyPattern();
+  const queryClient = useQueryClient();
   const [excluded, setExcluded] = useState<ReadonlySet<number>>(new Set());
 
   const locations = useMemo(() => {
@@ -123,8 +126,12 @@ export function CopyPatternDialog({ open, onOpenChange, toMonth, onCopied }: Cop
     try {
       const result = await copy.mutateAsync({ fromMonth, toMonth, locationIds });
       const skipped = result.skipped.filter((s) => s.reason === 'duplicate').length;
+      const ids = result.shows.flatMap((s) => (s.id != null ? [s.id] : []));
       toast.success(`Created ${plural(result.shows.length, 'show')} in ${toName}`, {
         description: skipped ? `${plural(skipped, 'show')} already existed and ${skipped === 1 ? 'was' : 'were'} skipped.` : undefined,
+        ...(ids.length
+          ? { action: { label: 'Undo', onClick: () => void undoCreatedShows(queryClient, ids) }, duration: 10_000 }
+          : {}),
       });
       onCopied?.(result);
       setExcluded(new Set());

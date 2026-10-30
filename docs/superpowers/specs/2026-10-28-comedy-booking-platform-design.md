@@ -422,3 +422,63 @@ targets).
 ## 9. Left to the builder
 Exact component styling, copy polish, empty states, loading skeletons, how pagination
 looks (lists are small; no pagination needed under ~500 rows), error toasts.
+
+## 10. Owner decisions and contract changes (fix round, 2026-10-30)
+
+Recorded after the security, correctness and UX reviews. These override the sections above
+where they disagree.
+
+### Owner decisions (binding)
+
+1. **Late bookings: daily catch-up.** Every day at `confirmationTimeMin`, comedians with
+   scheduled, unconfirmed, undeclined, never-emailed spots this week (Mon–Sun, from now on)
+   get their week's confirmation email. Setting `catchUpEnabled`, **on** by default; it
+   only runs when automatic confirmations are on. The dashboard and the day board show
+   "N booked this week haven't been emailed yet – Send" (`POST /api/confirmations/send
+   {weekStart, onlyUnsent: true}`); the nudge, the catch-up and Send count the same spots.
+2. **Declines are a booker setting.** `allowDeclines`, **off** by default: confirming is
+   all-or-nothing for the week, as originally specified, and comedians reply to the email
+   (Reply-To falls back to the first admin's address). On: comedians can decline single
+   spots ("Can't make it", optional note ≤ 300 chars) in the portal and from a per-spot
+   link in the email (`…/portal/confirm/<token>?decline=<bookingId>`; the GET only opens
+   the form). A declined booking keeps its slot, struck through, marked as needing a
+   replacement; it is never emailed, stamped, confirmed by "confirm my spots", or counted
+   as unconfirmed.
+3. **With `allowDeclines` off there is no decline UI anywhere**, including the day board's
+   status legend. (A booking declined while it was on still renders as Declined until
+   replaced.)
+
+### Contract changes
+
+- **Schema** (migration `0001_declines_catch_up.sql`): `bookings.declinedAt` (ms, nullable),
+  `bookings.declineNote` (text, `''`), `settings.catchUpEnabled` (bool, true),
+  `settings.allowDeclines` (bool, false). `ClubInfo.allowDeclines` is public club info.
+- **Booking status** gains `declined` (wins over every other status). `isUnconfirmed` (not
+  confirmed and not declined) and `isUnsent` (also never emailed) are the shared definitions.
+- **Club night.** "Tonight" and the red `unconfirmed_today` status use the club *night*
+  (`clubNightDate`: yesterday's date until 6 AM club time); calendar logic (past-day
+  locking, availability editing) keeps the calendar date. Confirmation emails list only
+  spots that haven't started, from tonight through Sunday.
+- **Missed sends.** A weekly send that was due but didn't run (server down, schedule just
+  changed or switched on) goes out on the next tick while its week isn't over; Settings →
+  Confirmations says so before saving (`SettingsDto.confirmationWeeksSent`).
+- **Planning month.** Dashboard availability, create-shows, the calendar and copy-pattern
+  default to `planningMonth(today)`: next month from the 20th, else this month.
+- **After-midnight shows** read "Sun, Nov 8 · 1 AM (early Mon, Nov 9)" to comedians
+  (`formatShowWhen` / `formatShowTime`).
+- **Lineups.** Dropping a pool comedian, or a comedian from another show, onto a declined
+  slot replaces it (`replaced` in the response, for an exact Undo); a cross-show move resets
+  confirmation and decline; archived comedians can't be moved into another show (409).
+  "Mark confirmed" returns `previous` and clears a decline; `POST /bookings/:id/unconfirm`
+  is its Undo. Show time changes re-check `overrideUnavailable`. New bulk endpoints:
+  `POST /api/shows/bulk-delete` (Undo of a bulk create; booked shows are kept) and
+  `POST /api/shows/bulk-status` (cancel all shows of a day and its Undo; unchanged shows are
+  reported as skipped).
+- **Security.** Only admins change SMTP/From/Reply-To and `appUrl`; changing the SMTP
+  connection clears the stored password. Request bodies ≤ 1 MB; JSON-only, same-origin
+  writes. In-memory rate limits on sign-in, codes and password change (per account+IP locks,
+  looser per-account backstops, IPv6 by /64, fail closed rather than evict); `TRUST_PROXY`
+  decides whether forwarded headers are believed. Bookers can change their password
+  (Settings → Account). Confirm-link sessions last 7 days (code sign-in: 90). Changing a
+  comedian's email revokes their sessions, links and codes. CSP and other security headers;
+  `__Host-` cookies over https.

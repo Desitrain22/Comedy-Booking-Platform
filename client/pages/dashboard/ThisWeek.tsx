@@ -1,20 +1,22 @@
 /**
- * Dashboard section 3: this week per day (shows, open slots, unconfirmed), when
- * confirmations were last sent / go out next, and **Send confirmations now**.
+ * Dashboard section 3: this week per day (shows, open slots, unconfirmed), the "N booked this
+ * week haven't been emailed yet – Send" nudge (spots booked after the confirmations went out;
+ * the daily catch-up also sends them), when confirmations were last sent / go out next, and
+ * **Send confirmations now**.
  */
-import { Send } from 'lucide-react';
+import { MailWarning, Send } from 'lucide-react';
 import { useState } from 'react';
 import { Link } from 'react-router';
 import type { DashboardResponse } from '../../../shared/api/dashboard';
 import { BOOKING_STATUS_SHORT_LABELS, type BookingStatus } from '../../../shared/bookingStatus';
-import { formatDateShort, formatRelative, formatWeekday } from '../../../shared/time';
+import { formatDateShort, formatRelative, formatTime, formatWeekday } from '../../../shared/time';
 import { Button, Card, CardHeader, Dialog, Switch } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import { BOOKING_STATUS_CLASSES } from '../../lib/statusStyles';
 import { formatNextSend, formatWeekRange, plural } from './format';
 import { outboxNote, useSendConfirmations } from './useDashboard';
 
-const STATUS_ORDER: BookingStatus[] = ['unconfirmed_today', 'awaiting', 'not_sent', 'confirmed'];
+const STATUS_ORDER: BookingStatus[] = ['unconfirmed_today', 'awaiting', 'not_sent', 'confirmed', 'declined'];
 
 export function ThisWeek({ data }: { data: DashboardResponse }) {
   const { week, today } = data;
@@ -46,6 +48,7 @@ export function ThisWeek({ data }: { data: DashboardResponse }) {
         </thead>
         <tbody>
           {week.days.map((day) => {
+            const declinedNote = day.declined > 0 ? `, ${day.declined} declined` : '';
             const isToday = day.date === today;
             const past = day.date < today;
             const dark = day.shows === 0;
@@ -73,8 +76,20 @@ export function ThisWeek({ data }: { data: DashboardResponse }) {
                 </th>
                 <td className="px-2 py-2 text-right tabular-nums">{dark ? '—' : day.shows}</td>
                 <td className="px-2 py-2 text-right tabular-nums">{dark ? '—' : day.openSlots}</td>
-                <td className="py-2 pr-4 pl-2 text-right tabular-nums">
-                  <UnconfirmedCell count={day.unconfirmed} booked={day.booked} past={past} today={isToday} />
+                <td className="py-2 pr-4 pl-2 text-right tabular-nums" title={declinedNote ? `Needs a replacement${declinedNote}` : undefined}>
+                  <UnconfirmedCell
+                    count={day.unconfirmed}
+                    booked={day.booked - day.declined}
+                    past={past}
+                    today={isToday}
+                  />
+                  {day.declined > 0 && !past && (
+                    <span className="ml-1 inline-flex min-w-6 justify-center rounded-full border border-dashed border-declined/60 bg-declined-soft px-1.5 text-xs leading-[18px] font-semibold text-declined-fg">
+                      <span className="sr-only">plus </span>
+                      {day.declined}
+                      <span className="sr-only"> declined</span>
+                    </span>
+                  )}
                 </td>
               </tr>
             );
@@ -83,6 +98,8 @@ export function ThisWeek({ data }: { data: DashboardResponse }) {
       </table>
 
       <div className="space-y-3 border-t border-border px-4 py-3.5">
+        <UnsentNudge data={data} />
+
         {remainingTotal > 0 && (
           <div>
             <p className="mb-1.5 text-xs font-medium text-fg-muted">
@@ -100,7 +117,7 @@ export function ThisWeek({ data }: { data: DashboardResponse }) {
           <dt className="text-fg-muted">Next automatic</dt>
           <dd className="text-fg">
             {confirmations.nextSend ? (
-              formatNextSend(confirmations.nextSend, today)
+              formatNextSend(confirmations.nextSend, today, Date.now())
             ) : (
               <>
                 Off ·{' '}
@@ -122,12 +139,62 @@ export function ThisWeek({ data }: { data: DashboardResponse }) {
           Send confirmations now
         </Button>
         {confirmations.pendingComedians === 0 && (
-          <p className="text-center text-xs text-fg-muted">Everyone booked from today to Sunday has confirmed.</p>
+          <p className="text-center text-xs text-fg-muted">
+            {remainingTotal === 0
+              ? 'No one is booked from today to Sunday.'
+              : week.remaining.declined > 0
+                ? 'Everyone else booked from today to Sunday has confirmed.'
+                : 'Everyone booked from today to Sunday has confirmed.'}
+          </p>
         )}
       </div>
 
       <SendConfirmationsDialog open={dialogOpen} onOpenChange={setDialogOpen} data={data} />
     </Card>
+  );
+}
+
+/**
+ * "4 booked this week haven't been emailed yet – Send": spots from tonight to Sunday that
+ * nobody has emailed (booked after the confirmations went out). Sends with `onlyUnsent`.
+ */
+function UnsentNudge({ data }: { data: DashboardResponse }) {
+  const { confirmations, weekStart } = data.week;
+  const send = useSendConfirmations(data.emailConfigured);
+  const count = confirmations.unsentBookings;
+  if (count === 0) return null;
+  const catchUp = confirmations.enabled && confirmations.catchUpEnabled;
+  return (
+    <div className="rounded-lg border border-awaiting/35 bg-awaiting-soft px-3 py-2.5" role="status">
+      <div className="flex items-center gap-2.5">
+        <MailWarning className="size-4 shrink-0 text-awaiting-fg" aria-hidden />
+        <p className="min-w-0 flex-1 text-sm text-fg">
+          <span className="font-semibold tabular-nums">{count}</span> booked this week{' '}
+          {count === 1 ? "hasn't" : "haven't"} been emailed yet
+        </p>
+        <Button
+          size="sm"
+          loading={send.isPending}
+          onClick={() => send.mutate({ weekStart, onlyUnsent: true })}
+          aria-label={`Send confirmation emails for the ${count} spots booked this week that haven't been emailed`}
+        >
+          {!send.isPending && <Send aria-hidden />}
+          Send
+        </Button>
+      </div>
+      <p className="mt-1 pl-6.5 text-xs text-fg-muted">
+        {catchUp ? (
+          <>Or leave it: the daily catch-up emails them at {formatTime(confirmations.timeMin)}.</>
+        ) : (
+          <>
+            Daily catch-up is off ·{' '}
+            <Link to="/app/settings/confirmations" className="text-accent hover:underline">
+              Settings
+            </Link>
+          </>
+        )}
+      </p>
+    </div>
   );
 }
 

@@ -1,10 +1,11 @@
 /**
  * Emailed comedian links.
  * - Login (magic) links: `/portal/magic/:token`, valid 30 days, reusable in that window.
- * - Confirm links: `/portal/confirm/:token`, valid until 2 days after the week ends.
+ * - Confirm links: `/portal/confirm/:token`, valid until 2 days after the week ends. Expired
+ *   confirm tokens are kept another 30 days so an old link says "expired", not "invalid".
  * Only the sha256 of a token is stored.
  */
-import { and, eq, gt, lt } from 'drizzle-orm';
+import { and, eq, gt, lt, ne, or } from 'drizzle-orm';
 import { addDays, zonedTimeToUtc } from '../../shared/time';
 import type { TokenPurpose } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
@@ -14,6 +15,8 @@ import { randomToken, sha256Hex } from './crypto';
 
 const DAY = 86_400_000;
 export const LOGIN_TOKEN_TTL_MS = 30 * DAY;
+/** How long an expired confirm token is kept (so the portal can say the link expired). */
+export const EXPIRED_CONFIRM_RETENTION_MS = 30 * DAY;
 export const DEFAULT_PORTAL_PATH = '/portal';
 
 /** Only same-app absolute paths are allowed as redirect targets. */
@@ -108,6 +111,23 @@ export function findConfirmToken(
   return { tokenId: row.id, comedianId: row.comedianId, weekStart: row.weekStart };
 }
 
+/**
+ * Housekeeping: delete expired tokens. Confirm tokens stay `EXPIRED_CONFIRM_RETENTION_MS`
+ * past their expiry (an old weekly email then answers 410 "expired", not 404 "invalid").
+ */
 export function deleteExpiredTokens(db: DbOrTx, now = Date.now()): number {
-  return db.delete(tokens).where(lt(tokens.expiresAt, now)).run().changes;
+  return db
+    .delete(tokens)
+    .where(
+      or(
+        and(ne(tokens.purpose, 'confirm'), lt(tokens.expiresAt, now)),
+        and(eq(tokens.purpose, 'confirm'), lt(tokens.expiresAt, now - EXPIRED_CONFIRM_RETENTION_MS)),
+      ),
+    )
+    .run().changes;
+}
+
+/** Delete every emailed link (sign-in and confirm) for a comedian, e.g. when their email changes. */
+export function deleteTokensFor(db: DbOrTx, comedianId: number): number {
+  return db.delete(tokens).where(eq(tokens.comedianId, comedianId)).run().changes;
 }

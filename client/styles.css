@@ -8,7 +8,7 @@
  *   text-fg  text-fg-muted  text-fg-subtle             text
  *   text-accent  bg-accent  bg-accent-soft  ring-accent  the accent (links, selection, focus)
  *   bg-accent-solid  text-accent-solid-fg               solid accent buttons
- *   {bg,text,border}-{confirmed,awaiting,notsent,unconfirmed,available}[-soft|-fg]
+ *   {bg,text,border}-{confirmed,awaiting,notsent,unconfirmed,declined,available}[-soft|-fg]
  *                                                       booking status + availability colors
  */
 @import 'tailwindcss';
@@ -71,6 +71,10 @@
   --color-unconfirmed: var(--unconfirmed);
   --color-unconfirmed-soft: var(--unconfirmed-soft);
   --color-unconfirmed-fg: var(--unconfirmed-fg);
+  /* Declined ("can't make it"): a muted violet, distinct from red and from not-sent zinc */
+  --color-declined: var(--declined);
+  --color-declined-soft: var(--declined-soft);
+  --color-declined-fg: var(--declined-fg);
 
   /* Availability green (emerald) */
   --color-available: var(--available);
@@ -115,6 +119,9 @@
   --unconfirmed: var(--color-red-500);
   --unconfirmed-soft: var(--color-red-50);
   --unconfirmed-fg: var(--color-red-700);
+  --declined: color-mix(in oklab, var(--color-violet-400) 70%, var(--color-zinc-400));
+  --declined-soft: var(--color-violet-50);
+  --declined-fg: color-mix(in oklab, var(--color-violet-700) 60%, var(--color-zinc-600));
 
   --available: var(--color-emerald-500);
   --available-soft: var(--color-emerald-50);
@@ -157,6 +164,9 @@
     --unconfirmed: var(--color-red-400);
     --unconfirmed-soft: color-mix(in oklab, var(--color-red-500) 18%, transparent);
     --unconfirmed-fg: var(--color-red-300);
+    --declined: color-mix(in oklab, var(--color-violet-400) 70%, var(--color-zinc-500));
+    --declined-soft: color-mix(in oklab, var(--color-violet-500) 13%, transparent);
+    --declined-fg: color-mix(in oklab, var(--color-violet-300) 70%, var(--color-zinc-400));
 
     --available: var(--color-emerald-400);
     --available-soft: color-mix(in oklab, var(--color-emerald-500) 18%, transparent);

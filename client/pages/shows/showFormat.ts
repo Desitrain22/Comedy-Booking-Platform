@@ -1,5 +1,29 @@
 /** Pure formatting and selection helpers for F1 pages (unit-tested in showFormat.test.ts). */
-import { datesForWeekday, formatMonthName, formatTime, formatTimeShort, monthOf } from '../../../shared/time';
+import {
+  addMonths,
+  datesForWeekday,
+  formatMonthName,
+  formatTime,
+  formatTimeShort,
+  isValidMonth,
+  monthOf,
+  planningMonth,
+} from '../../../shared/time';
+
+/**
+ * `?month=` if valid, else the month being planned (`planningMonth`: next month from the 20th
+ * on), the same rule the portal and dashboard use (UX B8): the calendar and create-shows open
+ * on it, and copy-pattern copies from the month before it.
+ */
+export function monthParam(value: string | null, today: string): string {
+  return value && isValidMonth(value) ? value : planningMonth(today);
+}
+
+/** "Copy October's pattern" is a no-op when October has no shows: say why instead. */
+export function copySourceEmptyReason(toMonth: string, sourceCount: number | undefined): string | null {
+  if (sourceCount !== 0) return null;
+  return `${formatMonthName(addMonths(toMonth, -1))} has no shows to copy`;
+}
 
 /** "The Cellar" → "Cellar" (pills are tight; the full name is in the accessible label). */
 export function shortLocationName(name: string): string {
@@ -97,4 +121,35 @@ export function countByMonth(dates: Iterable<string>): [string, number][] {
   const counts = new Map<string, number>();
   for (const d of dates) counts.set(monthOf(d), (counts.get(monthOf(d)) ?? 0) + 1);
   return [...counts.entries()].sort(([a], [b]) => a.localeCompare(b));
+}
+
+/** "Ann", "Ann and Bo", "Ann, Bo and Cy". */
+export function namesPhrase(names: readonly string[]): string {
+  if (names.length <= 1) return names[0] ?? '';
+  return `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
+}
+
+/** A booking as the show editor sees it (enough to say what a new start time does). */
+export interface TimeChangeBooking {
+  comedianName: string;
+  overrideUnavailable: boolean;
+  declinedAt: number | null;
+  availability: { startMin: number; endMin: number } | null;
+}
+
+/**
+ * What moving a show to `startMin` does to who's available (correctness #1), before saving:
+ * `newlyUnavailable` get the ⚠ "booked anyway" flag, `nowAvailable` lose it. Declined
+ * bookings are left out (they need a replacement either way).
+ */
+export function timeChangeEffects<T extends TimeChangeBooking>(
+  bookings: readonly T[],
+  startMin: number,
+): { newlyUnavailable: T[]; nowAvailable: T[] } {
+  const fits = (b: T) => b.availability != null && b.availability.startMin <= startMin && startMin <= b.availability.endMin;
+  const live = bookings.filter((b) => b.declinedAt == null);
+  return {
+    newlyUnavailable: live.filter((b) => !b.overrideUnavailable && !fits(b)),
+    nowAvailable: live.filter((b) => b.overrideUnavailable && fits(b)),
+  };
 }

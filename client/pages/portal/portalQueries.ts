@@ -18,10 +18,12 @@ export const portalKeys = {
   confirm: (token: string) => ['portal', 'confirm', token] as const,
 };
 
-export function usePortalMe() {
+/** `GET /api/portal/me`. Pass `enabled: false` where no comedian may be signed in (the layout). */
+export function usePortalMe(options: { enabled?: boolean } = {}) {
   return useQuery({
     queryKey: portalKeys.me,
     queryFn: ({ signal }) => api.get<PortalMeResponse>('/portal/me', { signal }),
+    enabled: options.enabled ?? true,
   });
 }
 

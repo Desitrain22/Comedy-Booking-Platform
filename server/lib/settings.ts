@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 import type { AvailabilityRange } from '../../shared/availability';
-import { todayInTz } from '../../shared/time';
+import { clubNightDate, todayInTz } from '../../shared/time';
 import type { ClubInfo } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
 import { settings, type Settings, type SettingsUpdate } from '../db/schema';
@@ -45,10 +45,22 @@ export function getAllNightRange(s: Settings): AvailabilityRange {
 /** Public club info (safe for any visitor). */
 export function getClubInfo(db: DbOrTx): ClubInfo {
   const s = getSettings(db);
-  return { name: s.clubName, timezone: s.timezone, allNight: getAllNightRange(s) };
+  return { name: s.clubName, timezone: s.timezone, allNight: getAllNightRange(s), allowDeclines: s.allowDeclines };
 }
 
-/** Today's date in the club timezone. */
+/**
+ * Today's *calendar* date in the club timezone. Use for calendar logic: past-day locking,
+ * availability editing, month defaults. For "tonight" and red status use `clubNight`.
+ */
 export function clubToday(db: DbOrTx, now: Date = new Date()): string {
   return todayInTz(getSettings(db).timezone, now);
+}
+
+/**
+ * The club's current night (`clubNightDate`): yesterday's date until 6 AM club time, so a
+ * 1 AM show is still "tonight". Pass it as `today` to `bookingStatus` and use it for
+ * "tonight" lists.
+ */
+export function clubNight(db: DbOrTx, now: Date = new Date()): string {
+  return clubNightDate(getSettings(db).timezone, now);
 }

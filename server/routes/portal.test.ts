@@ -4,16 +4,19 @@ import type {
   ConfirmLinkInfo,
   ConfirmLinkResult,
   ConfirmWeekResponse,
+  DeclineSpotResponse,
   PortalAvailabilityResponse,
   PortalMeResponse,
   PortalProfile,
   PortalSpotsResponse,
 } from '../../shared/api/portal';
-import { defaultAvailabilityMonth } from '../../shared/api/portal';
+import { DECLINE_NOTE_MAX, declineLink, defaultAvailabilityMonth } from '../../shared/api/portal';
 import type { MeResponse } from '../../shared/types';
 import { SESSION_COOKIES } from '../auth/sessions';
 import { createConfirmLink, createLoginLink } from '../auth/tokens';
 import { availability, availabilitySubmissions, bookings, comedians, sessions, tokens, type Comedian } from '../db/schema';
+import { updateSettings } from '../lib/settings';
+import { CONFIRM_LINK_SESSION_TTL_MS } from './portal';
 import {
   cookieFrom,
   createAvailability,
@@ -150,7 +153,12 @@ describe('GET /api/portal/me', () => {
         bio: 'Dry wit.',
         headshotUrl: 'https://img.test/j.jpg',
       },
-      club: { name: 'Test Comedy Club', timezone: 'America/New_York', allNight: { startMin: 1140, endMin: 1380 } },
+      club: {
+        name: 'Test Comedy Club',
+        timezone: 'America/New_York',
+        allNight: { startMin: 1140, endMin: 1380 },
+        allowDeclines: false,
+      },
       today: TODAY,
       spots: { upcoming: 2, unconfirmed: 1 },
     });
@@ -344,6 +352,8 @@ describe('GET /api/portal/spots', () => {
     expect(res.status).toBe(200);
     const body = await readJson<PortalSpotsResponse>(res);
     expect(body.today).toBe(TODAY);
+    expect(body.allowDeclines).toBe(false);
+    expect(body.weeks.every((w) => w.declinedCount === 0)).toBe(true);
     expect(body.weeks.map((w) => [w.weekStart, w.past, w.unconfirmedCount, w.spots.map((s) => s.date)])).toEqual([
       ['2026-10-26', true, 1, ['2026-10-26']],
       ['2026-11-02', true, 1, ['2026-11-06']],
@@ -364,6 +374,9 @@ describe('GET /api/portal/spots', () => {
         status: 'confirmed',
         confirmedAt: 1,
         confirmedBy: 'booker',
+        declinedAt: null,
+        declineNote: '',
+        startsAt: new Date('2026-11-11T00:00:00Z').getTime(), // 7 PM EST
       },
       expect.objectContaining({ showId: today.id, status: 'unconfirmed_today', location: expect.objectContaining({ name: 'The Annex' }) }),
     ]);
@@ -372,7 +385,7 @@ describe('GET /api/portal/spots', () => {
   });
 
   it('is empty for a comedian with no spots', async () => {
-    expect(await readJson(await get('/api/portal/spots'))).toEqual({ today: TODAY, weeks: [] });
+    expect(await readJson(await get('/api/portal/spots'))).toEqual({ today: TODAY, weeks: [], allowDeclines: false });
   });
 });
 
@@ -422,6 +435,21 @@ describe('POST /api/portal/spots/confirm', () => {
 
     const bad = await post('/api/portal/spots/confirm', { weekStart: 'soon' });
     expect(await readJson(bad)).toMatchObject({ code: 'validation_error' });
+  });
+
+  it("at 12:30 AM Monday, last week's Sunday-night 1 AM spot can still be confirmed (club night)", async () => {
+    const late = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-15', startMin: 1500 }).id,
+      comedianId: john.id,
+      confirmationSentAt: 1,
+    });
+    vi.setSystemTime(new Date('2026-11-16T05:30:00Z')); // Mon Nov 16, 12:30 AM in New York
+    const res = await post('/api/portal/spots/confirm', { weekStart: THIS_WEEK });
+    expect(res.status).toBe(200);
+    expect(bookingRow(late.id)).toMatchObject({ confirmedBy: 'comedian' });
+
+    vi.setSystemTime(new Date('2026-11-16T11:00:00Z')); // 6 AM: that night is over
+    expect(await readJson(await post('/api/portal/spots/confirm', { weekStart: THIS_WEEK }))).toMatchObject({ code: 'week_past' });
   });
 });
 
@@ -535,7 +563,8 @@ describe('confirm links', () => {
 
   it("POST confirms the week's spots, signs the comedian in, and is idempotent", async () => {
     const { fri, sat, nextWeek, cancelled, othersSpot, token } = setup();
-    const res = await post(`/api/portal/confirm/${token}`, {}, undefined);
+    // Straight from the email: no session yet (`undefined` would mean the default signed-in headers).
+    const res = await post(`/api/portal/confirm/${token}`, {}, { cookie: '' });
     expect(res.status).toBe(200);
     const body = await readJson<ConfirmLinkResult>(res);
     expect(body).toMatchObject({
@@ -556,6 +585,8 @@ describe('confirm links', () => {
     const setCookie = res.headers.getSetCookie().join('\n');
     expect(setCookie).toMatch(new RegExp(`^${SESSION_COOKIES.comedian}=`, 'm'));
     expect(setCookie).toMatch(/HttpOnly/);
+    // An emailed link signs in for a week, not the 90 days a sign-in code gives.
+    expect(setCookie).toMatch(new RegExp(`Max-Age=${CONFIRM_LINK_SESSION_TTL_MS / 1000}\\b`));
     const cookie = { cookie: cookieFrom(res) };
     expect((await readJson<MeResponse>(await get('/api/auth/me', cookie))).comedian?.id).toBe(john.id);
     expect((await get('/api/portal/spots', cookie)).status).toBe(200);
@@ -565,6 +596,8 @@ describe('confirm links', () => {
     const again = await post(`/api/portal/confirm/${token}`, {}, undefined);
     expect(again.status).toBe(200);
     expect(await readJson(again)).toMatchObject({ confirmedCount: 0, unconfirmedCount: 0 });
+    // Already signed in as them (here with a sign-in code's 90-day session): that session is kept.
+    expect(again.headers.getSetCookie()).toEqual([]);
   });
 
   it('works for a week with no spots left', async () => {
@@ -607,5 +640,257 @@ describe('confirm links', () => {
     expect((await get(`/api/portal/confirm/${token}`, undefined)).status).toBe(200);
     vi.setSystemTime(new Date('2026-11-18T05:00:01Z')); // just past midnight → Wed Nov 18
     expect((await get(`/api/portal/confirm/${token}`, undefined)).status).toBe(410);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Declining a spot ("Can't make it", only when the club allows it)
+// ---------------------------------------------------------------------------
+
+describe("declining a spot (Can't make it)", () => {
+  function setup() {
+    updateSettings(t.db, { allowDeclines: true });
+    const fri = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-13', startMin: 1260 }).id,
+      comedianId: john.id,
+      confirmationSentAt: 1,
+    });
+    const sat = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-14', startMin: 1260 }).id,
+      comedianId: john.id,
+      confirmationSentAt: 1,
+      confirmedAt: 5,
+      confirmedBy: 'comedian',
+    });
+    return { fri, sat };
+  }
+  const decline = (id: number, json: unknown = {}, h: AuthHeaders | undefined = headers) =>
+    post(`/api/portal/spots/${id}/decline`, json, h);
+  const undo = (id: number, h: AuthHeaders | undefined = headers) =>
+    t.request(`/api/portal/spots/${id}/decline`, { method: 'DELETE', headers: h });
+
+  it('409s while the club has declines off (the default) — nothing changes', async () => {
+    const { fri } = setup();
+    updateSettings(t.db, { allowDeclines: false });
+    const res = await decline(fri.id, { note: 'Sick' });
+    expect(res.status).toBe(409);
+    expect(await readJson(res)).toMatchObject({ code: 'declines_off' });
+    expect(bookingRow(fri.id)).toMatchObject({ declinedAt: null, declineNote: '' });
+  });
+
+  it('declines with an optional note; the booking keeps its slot and reads as declined', async () => {
+    const { fri } = setup();
+    const res = await decline(fri.id, { note: '  Flight got moved  ' });
+    expect(res.status).toBe(200);
+    const { spot } = await readJson<DeclineSpotResponse>(res);
+    expect(spot).toMatchObject({
+      bookingId: fri.id,
+      status: 'declined',
+      declinedAt: NOW.getTime(),
+      declineNote: 'Flight got moved',
+      startsAt: new Date('2026-11-14T02:00:00Z').getTime(), // Fri 9 PM EST
+    });
+    expect(bookingRow(fri.id)).toMatchObject({
+      showId: fri.showId,
+      position: fri.position,
+      declinedAt: NOW.getTime(),
+      declineNote: 'Flight got moved',
+      confirmedAt: null,
+    });
+
+    // Idempotent: the first time is kept, the latest note wins; no note is fine.
+    vi.setSystemTime(new Date(NOW.getTime() + 60_000));
+    const again = await decline(fri.id, {});
+    expect(again.status).toBe(200);
+    expect(bookingRow(fri.id)).toMatchObject({ declinedAt: NOW.getTime(), declineNote: '' });
+  });
+
+  it('is not counted as "to confirm" and confirming the week never confirms it', async () => {
+    const { fri } = setup();
+    const sun = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-15' }).id, comedianId: john.id });
+    await decline(fri.id);
+
+    expect((await readJson<PortalMeResponse>(await get('/api/portal/me'))).spots).toEqual({ upcoming: 3, unconfirmed: 1 });
+    const week = (await readJson<PortalSpotsResponse>(await get('/api/portal/spots'))).weeks[0]!;
+    expect(week).toMatchObject({ weekStart: THIS_WEEK, unconfirmedCount: 1, declinedCount: 1 });
+    expect(week.spots.map((s) => s.status)).toEqual(['declined', 'confirmed', 'not_sent']);
+
+    const res = await post('/api/portal/spots/confirm', { weekStart: THIS_WEEK });
+    expect(await readJson(res)).toEqual({ weekStart: THIS_WEEK, confirmedCount: 1 });
+    expect(bookingRow(sun.id).confirmedAt).toBe(NOW.getTime());
+    expect(bookingRow(fri.id)).toMatchObject({ confirmedAt: null, declinedAt: NOW.getTime() });
+
+    // The emailed link's confirm skips it too.
+    const token = tokenFromUrl(createConfirmLink(t.db, john.id, THIS_WEEK));
+    const viaLink = await readJson<ConfirmLinkResult>(await post(`/api/portal/confirm/${token}`, {}, undefined));
+    expect(viaLink).toMatchObject({ confirmedCount: 0, unconfirmedCount: 0, allowDeclines: true });
+    expect(bookingRow(fri.id).confirmedAt).toBeNull();
+  });
+
+  it('undo puts the spot back exactly as it was, even after declines were switched off', async () => {
+    const { fri, sat } = setup();
+    await decline(sat.id, { note: 'Double-booked' });
+    expect(bookingRow(sat.id)).toMatchObject({ declinedAt: NOW.getTime(), confirmedAt: 5 });
+    updateSettings(t.db, { allowDeclines: false });
+
+    const res = await undo(sat.id);
+    expect(res.status).toBe(200);
+    expect((await readJson<DeclineSpotResponse>(res)).spot).toMatchObject({ status: 'confirmed', declinedAt: null, declineNote: '' });
+    expect(bookingRow(sat.id)).toMatchObject({ declinedAt: null, declineNote: '', confirmedAt: 5, confirmedBy: 'comedian' });
+    // Undoing a spot that isn't declined is a no-op.
+    expect((await undo(fri.id)).status).toBe(200);
+    expect(bookingRow(fri.id)).toMatchObject({ declinedAt: null, confirmationSentAt: 1 });
+  });
+
+  it("404s someone else's spot, cancelled shows and unknown ids; 409s once the show has started; validates the note", async () => {
+    setup();
+    const other = createComedian(t.db);
+    const othersSpot = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-13' }).id, comedianId: other.id });
+    const cancelled = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-13', status: 'cancelled' }).id,
+      comedianId: john.id,
+    });
+    // Last night's 1 AM show (Tue 1 AM, already over) vs. tonight's 1 AM show (still ahead).
+    const lastNight = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-09', startMin: 1500 }).id, comedianId: john.id });
+    const tonight = createBooking(t.db, { showId: createShow(t.db, { date: TODAY, startMin: 1500 }).id, comedianId: john.id });
+
+    for (const id of [othersSpot.id, cancelled.id, 999_999]) {
+      for (const res of [await decline(id), await undo(id)]) {
+        expect(res.status).toBe(404);
+        expect(await readJson(res)).toMatchObject({ code: 'not_found' });
+      }
+    }
+    expect(bookingRow(othersSpot.id).declinedAt).toBeNull();
+
+    const started = await decline(lastNight.id);
+    expect(started.status).toBe(409);
+    expect(await readJson(started)).toMatchObject({ code: 'spot_past' });
+    expect((await decline(tonight.id)).status).toBe(200);
+
+    const long = await decline(tonight.id, { note: 'x'.repeat(DECLINE_NOTE_MAX + 1) });
+    expect(long.status).toBe(400);
+    expect(await readJson(long)).toMatchObject({ code: 'validation_error' });
+    expect((await post('/api/portal/spots/abc/decline', {})).status).toBe(400);
+  });
+
+  it('needs a comedian session', async () => {
+    const { fri } = setup();
+    const booker = await loginAsBooker(t);
+    for (const h of [{}, booker.headers]) {
+      const path = `/api/portal/spots/${fri.id}/decline`;
+      expect((await t.request(path, { method: 'POST', json: {}, headers: h })).status).toBe(401);
+      expect((await t.request(path, { method: 'DELETE', headers: h })).status).toBe(401);
+    }
+    expect(bookingRow(fri.id).declinedAt).toBeNull();
+  });
+});
+
+describe('declining from the emailed confirm link', () => {
+  function setup() {
+    updateSettings(t.db, { allowDeclines: true });
+    const fri = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-13' }).id, comedianId: john.id });
+    const sat = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-14' }).id, comedianId: john.id });
+    const nextWeek = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-17' }).id, comedianId: john.id });
+    const url = createConfirmLink(t.db, john.id, THIS_WEEK);
+    return { fri, sat, nextWeek, url, token: tokenFromUrl(url) };
+  }
+
+  it('the per-spot email link only opens the page: GET with ?decline= changes nothing', async () => {
+    const { fri, url } = setup();
+    const link = declineLink(url, fri.id);
+    expect(link).toBe(`${url}?decline=${fri.id}`);
+    const res = await t.request(`/api/portal/confirm/${tokenFromUrl(url)}?decline=${fri.id}`);
+    expect(res.status).toBe(200);
+    expect(await readJson(res)).toMatchObject({ allowDeclines: true, unconfirmedCount: 2 });
+    expect(bookingRow(fri.id).declinedAt).toBeNull();
+  });
+
+  it('declines and undoes a spot in that week without signing in', async () => {
+    const { fri, sat, token } = setup();
+    const anonymous = (path: string, json: unknown = {}) => t.request(path, { method: 'POST', json });
+    const res = await anonymous(`/api/portal/confirm/${token}/spots/${fri.id}/decline`, { note: 'Sick' });
+    expect(res.status).toBe(200);
+    expect(res.headers.getSetCookie()).toEqual([]);
+    const info = await readJson<ConfirmLinkInfo>(res);
+    expect(info).toMatchObject({ unconfirmedCount: 1, allowDeclines: true });
+    expect(info.spots.map((s) => [s.bookingId, s.status, s.declineNote])).toEqual([
+      [fri.id, 'declined', 'Sick'],
+      [sat.id, 'not_sent', ''],
+    ]);
+    expect(t.db.select().from(tokens).where(eq(tokens.purpose, 'confirm')).get()!.lastUsedAt).toBe(NOW.getTime());
+
+    // Confirming the rest leaves the declined spot alone.
+    const confirmed = await readJson<ConfirmLinkResult>(await anonymous(`/api/portal/confirm/${token}`));
+    expect(confirmed.confirmedCount).toBe(1);
+    expect(confirmed.spots.map((s) => s.status)).toEqual(['declined', 'confirmed']);
+
+    const undone = await t.request(`/api/portal/confirm/${token}/spots/${fri.id}/decline`, { method: 'DELETE' });
+    expect(undone.status).toBe(200);
+    expect((await readJson<ConfirmLinkInfo>(undone)).spots[0]).toMatchObject({ status: 'not_sent', declinedAt: null });
+  });
+
+  it("404s spots outside the link's week or someone else's, honours declines_off, and rejects bad tokens", async () => {
+    const { fri, nextWeek, token } = setup();
+    const other = createComedian(t.db);
+    const othersSpot = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-13' }).id, comedianId: other.id });
+    for (const id of [nextWeek.id, othersSpot.id]) {
+      const res = await post(`/api/portal/confirm/${token}/spots/${id}/decline`, {}, undefined);
+      expect(res.status).toBe(404);
+    }
+
+    const expired = tokenFromUrl(createConfirmLink(t.db, john.id, '2026-10-26'));
+    expect((await post(`/api/portal/confirm/${expired}/spots/${fri.id}/decline`, {}, undefined)).status).toBe(410);
+    expect((await post(`/api/portal/confirm/nope/spots/${fri.id}/decline`, {}, undefined)).status).toBe(404);
+
+    updateSettings(t.db, { allowDeclines: false });
+    const off = await post(`/api/portal/confirm/${token}/spots/${fri.id}/decline`, {}, undefined);
+    expect(off.status).toBe(409);
+    expect(await readJson(off)).toMatchObject({ code: 'declines_off' });
+    for (const b of [fri, nextWeek, othersSpot]) expect(bookingRow(b.id).declinedAt).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ⚠ markers follow availability edits
+// ---------------------------------------------------------------------------
+
+describe('PUT /api/portal/availability re-evaluates booked-anyway markers', () => {
+  it('flags spots on nights the comedian no longer covers and clears ones they now cover', async () => {
+    // Booked 9 PM Fri while marked 7–11 PM (fine); booked anyway 11 PM Sat (not marked).
+    createAvailability(t.db, { comedianId: john.id, date: '2026-11-13', startMin: 1140, endMin: 1380 });
+    const fri = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-13', startMin: 1260 }).id, comedianId: john.id });
+    const sat = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-14', startMin: 1380 }).id,
+      comedianId: john.id,
+      overrideUnavailable: true,
+    });
+    // A past night and another month are left alone.
+    const past = createBooking(t.db, {
+      showId: createShow(t.db, { date: '2026-11-03', startMin: 1260 }).id,
+      comedianId: john.id,
+      overrideUnavailable: true,
+    });
+    const december = createBooking(t.db, { showId: createShow(t.db, { date: '2026-12-04', startMin: 1260 }).id, comedianId: john.id });
+    const other = createComedian(t.db);
+    const othersSpot = createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-13', startMin: 1260 }).id, comedianId: other.id });
+
+    const res = await put('/api/portal/availability', {
+      month: '2026-11',
+      entries: [
+        { date: '2026-11-03', startMin: 1140, endMin: 1380 }, // past: ignored
+        { date: '2026-11-13', startMin: 1140, endMin: 1200 }, // now only 7–8 PM: the 9 PM spot no longer fits
+        { date: '2026-11-14', startMin: 1320, endMin: 1560 }, // now 10 PM–2 AM: the 11 PM spot fits
+      ],
+    });
+    expect(res.status).toBe(200);
+    expect(bookingRow(fri.id).overrideUnavailable).toBe(true);
+    expect(bookingRow(sat.id).overrideUnavailable).toBe(false);
+    expect(bookingRow(past.id).overrideUnavailable).toBe(true);
+    expect(bookingRow(december.id).overrideUnavailable).toBe(false);
+    expect(bookingRow(othersSpot.id).overrideUnavailable).toBe(false);
+
+    // Clearing the month flags every remaining spot in it.
+    await put('/api/portal/availability', { month: '2026-11', entries: [] });
+    expect(bookingRow(sat.id).overrideUnavailable).toBe(true);
   });
 });

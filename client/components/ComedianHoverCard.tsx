@@ -13,6 +13,8 @@
  * - Drag-and-drop safe: no pointer capture, closes on pointer down (and on Space/Enter
  *   from the keyboard), and never opens while any pointer button is held, so dragging
  *   over other chips stays quiet. Pass `disabled` to switch it off entirely.
+ * - Optionally controlled (`open` + `onOpenChange`), e.g. so a notes badge inside the trigger
+ *   can open it on click or tap (touch never hovers). Hover/focus still report changes.
  */
 import * as HoverCard from '@radix-ui/react-hover-card';
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -31,6 +33,9 @@ export interface ComedianHoverCardProps {
   children: ReactElement;
   /** Never open (the trigger still renders normally). */
   disabled?: boolean;
+  /** Controlled open state; omit to let hover/focus drive it. */
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
 }
 
 const OPEN_DELAY_MS = 350;
@@ -58,9 +63,20 @@ if (typeof window !== 'undefined') {
   window.addEventListener('blur', release);
 }
 
-export function ComedianHoverCard({ comedianId, children, disabled = false }: ComedianHoverCardProps) {
+export function ComedianHoverCard({
+  comedianId,
+  children,
+  disabled = false,
+  open: openProp,
+  onOpenChange,
+}: ComedianHoverCardProps) {
   const queryClient = useQueryClient();
-  const [open, setOpen] = useState(false);
+  const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
+  const open = openProp ?? uncontrolledOpen;
+  const setOpen = (next: boolean) => {
+    if (openProp === undefined) setUncontrolledOpen(next);
+    if (next !== open) onOpenChange?.(next);
+  };
   // Set when the trigger itself is pressed (click, tap, drag start) so the focus that
   // follows doesn't pop the card; cleared by the next real hover or by blur.
   const suppressed = useRef(false);

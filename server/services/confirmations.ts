@@ -7,14 +7,25 @@
  * comedians with at least one unconfirmed spot are emailed. Every send is recorded in
  * email_log (via sendEmail) and, unless it failed, stamps `confirmationSentAt` on the
  * spots it listed.
+ *
+ * Declined spots (the comedian said "Can't make it"; only when settings.allowDeclines)
+ * are left out entirely: never listed, never a reason to email, never re-stamped. When
+ * declines are allowed each listed spot gets its own "Can't make it?" link. Reply-To falls
+ * back to an admin's address when none is configured, so "reply to this email" reaches
+ * a person.
+ *
+ * The scheduler (./scheduler.ts) sends the weekly run and a daily catch-up of this week's
+ * never-emailed bookings, both with `onlyUnsent`.
  */
-import { and, asc, eq, gte, inArray, lte } from 'drizzle-orm';
-import { addDays, formatDateMedium, todayInTz, weekStartOf } from '../../shared/time';
+import { and, asc, eq, gte, inArray, isNull, lte } from 'drizzle-orm';
+import { declineLink } from '../../shared/api/portal';
+import { isUnconfirmed, isUnsent } from '../../shared/bookingStatus';
+import { addDays, clubNightDate, formatDateMedium, weekStartOf, zonedTimeToUtc } from '../../shared/time';
 import { createConfirmLink } from '../auth/tokens';
 import type { Db, DbOrTx } from '../db/client';
 import { bookings, comedians, locations, shows } from '../db/schema';
 import { confirmationEmail, type ConfirmationSpot } from '../email/featureTemplates';
-import { sendEmail } from '../email/mailer';
+import { replyToWithAdminFallback, sendEmail } from '../email/mailer';
 import { getSettings } from '../lib/settings';
 import { EMAIL_CONCURRENCY, mapWithConcurrency } from './batch';
 
@@ -49,6 +60,7 @@ export interface SendConfirmationOptions {
 
 export interface WeekSpot extends ConfirmationSpot {
   bookingId: number;
+  confirmedAt: number | null;
   confirmationSentAt: number | null;
 }
 
@@ -60,22 +72,24 @@ export interface ComedianWeekSpots {
   spots: WeekSpot[];
 }
 
-/** First day of the week that still counts: today when the week is underway. */
-function weekFrom(weekStart: string, today: string): string {
-  return today > weekStart ? today : weekStart;
+/** First day of the week that still counts: tonight when the week is underway. */
+function weekFrom(weekStart: string, tonight: string): string {
+  return tonight > weekStart ? tonight : weekStart;
 }
 
 /**
- * Scheduled spots of non-archived comedians in the week starting `weekStart`, from today
- * (club tz) through Sunday, grouped by comedian (ordered by name).
+ * Scheduled, not-declined spots of non-archived comedians in the week starting
+ * `weekStart` that haven't started yet, from tonight (the club night, so a 1 AM show
+ * still counts at 12:30 AM) through Sunday, grouped by comedian (ordered by name).
  */
 export function weekSpotsByComedian(
   db: DbOrTx,
   weekStart: string,
   options: { now?: Date; comedianId?: number } = {},
 ): ComedianWeekSpots[] {
-  const today = todayInTz(getSettings(db).timezone, options.now ?? new Date());
-  const from = weekFrom(weekStart, today);
+  const timeZone = getSettings(db).timezone;
+  const now = options.now ?? new Date();
+  const from = weekFrom(weekStart, clubNightDate(timeZone, now));
   const to = addDays(weekStart, 6);
   if (from > to) return [];
 
@@ -103,6 +117,8 @@ export function weekSpotsByComedian(
         gte(shows.date, from),
         lte(shows.date, to),
         eq(comedians.archived, false),
+        // A declined spot is the booker's to replace: never listed, confirmed or re-emailed.
+        isNull(bookings.declinedAt),
         options.comedianId === undefined ? undefined : eq(bookings.comedianId, options.comedianId),
       ),
     )
@@ -118,6 +134,8 @@ export function weekSpotsByComedian(
 
   const groups = new Map<number, ComedianWeekSpots>();
   for (const row of rows) {
+    // Last night's 9 PM show is still on the club night at 1 AM, but it's over.
+    if (zonedTimeToUtc(row.date, row.startMin, timeZone) <= now.getTime()) continue;
     let group = groups.get(row.comedianId);
     if (!group) {
       group = { comedianId: row.comedianId, name: row.comedianName, email: row.comedianEmail, spots: [] };
@@ -125,6 +143,7 @@ export function weekSpotsByComedian(
     }
     group.spots.push({
       bookingId: row.bookingId,
+      confirmedAt: row.confirmedAt,
       confirmationSentAt: row.confirmationSentAt,
       date: row.date,
       startMin: row.startMin,
@@ -137,9 +156,12 @@ export function weekSpotsByComedian(
   return [...groups.values()];
 }
 
+/** `isUnconfirmed` / `isUnsent` for a listed spot (declined spots are never listed). */
+const spotStatusInput = (s: WeekSpot) => ({ ...s, declinedAt: null });
+
 /** Has something to confirm (and, with `onlyUnsent`, something never emailed). */
 function needsConfirmation(group: ComedianWeekSpots, onlyUnsent: boolean): boolean {
-  return group.spots.some((s) => !s.confirmed && (!onlyUnsent || s.confirmationSentAt == null));
+  return group.spots.some((s) => (onlyUnsent ? isUnsent(spotStatusInput(s)) : isUnconfirmed(spotStatusInput(s))));
 }
 
 /** How many comedians "Send confirmations now" would email for the week (both modes). */
@@ -153,6 +175,18 @@ export function countConfirmationRecipients(
     pendingComedians: groups.filter((g) => needsConfirmation(g, false)).length,
     unsentComedians: groups.filter((g) => needsConfirmation(g, true)).length,
   };
+}
+
+/**
+ * Spots in the week (from today on) that still need confirming but were never emailed —
+ * booked after that week's confirmations went out. What the daily catch-up sends and the
+ * "N booked this week haven't been emailed yet" nudge counts.
+ */
+export function countUnsentSpots(db: DbOrTx, weekStart: string, options: { now?: Date } = {}): number {
+  return weekSpotsByComedian(db, weekStart, options).reduce(
+    (n, group) => n + group.spots.filter((s) => isUnsent(spotStatusInput(s))).length,
+    0,
+  );
 }
 
 /** "this week" | "next week" | "the week of Mon, Nov 9" (relative to today in the club). */
@@ -175,18 +209,22 @@ async function deliver(
 ): Promise<SendConfirmationResult> {
   const settings = getSettings(db);
   const url = createConfirmLink(db, group.comedianId, weekStart);
+  const allowDeclines = settings.allowDeclines;
   const content = confirmationEmail({
     clubName: settings.clubName,
     name: group.name,
-    spots: group.spots,
+    spots: allowDeclines ? group.spots.map((s) => ({ ...s, declineUrl: declineLink(url, s.bookingId) })) : group.spots,
     url,
-    weekPhrase: weekPhrase(weekStart, todayInTz(settings.timezone, now)),
+    weekPhrase: weekPhrase(weekStart, clubNightDate(settings.timezone, now)),
+    allowDeclines,
   });
   const result = await sendEmail(db, {
     to: group.email,
     ...content,
     kind: 'confirmation',
     comedianId: group.comedianId,
+    // "Can't make one? Reply to this email" must reach a person even with no Reply-To set.
+    replyTo: replyToWithAdminFallback(db) || undefined,
   });
   if (result.status !== 'failed') {
     db.update(bookings)

@@ -43,7 +43,7 @@ export function TagsPage() {
   const missingSuggestions = SUGGESTIONS.filter((s) => !list.some((t) => t.name.toLowerCase() === s.toLowerCase()));
 
   return (
-    <div className="mx-auto max-w-3xl">
+    <div>
       <PageHeader
         title="Tags"
         description="Group comedians — hosts, headliners, bullet spots — then pull them into lineups by tag."

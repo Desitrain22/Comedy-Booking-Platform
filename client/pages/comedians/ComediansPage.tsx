@@ -1,15 +1,20 @@
 /**
  * /app/comedians — the roster: search, tag filter (`?tags=1,2`, any of), show archived,
- * row selection for bulk tag / archive, and the Add / Bulk add dialogs.
+ * row selection for bulk tag / archive / "Send sign-in link", and the Add / Bulk add dialogs.
  * URL params: `q`, `tags`, `archived=1` (the Tags page links here with `?tags=<id>`).
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Archive, ArchiveRestore, Check, ChevronDown, ClipboardList, Plus, Search, Tag, Users, X } from 'lucide-react';
+import { Archive, ArchiveRestore, Check, ChevronDown, ClipboardList, Plus, Search, Send, Tag, Users, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
 import { toast } from 'sonner';
-import type { BulkUpdateResult, ComedianListItem, TagWithCount } from '../../../shared/api/comedians';
-import { addMonths, formatMonthShort, monthOf, todayInTz } from '../../../shared/time';
+import type {
+  BulkLoginLinkResult,
+  BulkUpdateResult,
+  ComedianListItem,
+  TagWithCount,
+} from '../../../shared/api/comedians';
+import { formatMonthShort, planningMonth, todayInTz } from '../../../shared/time';
 import { ComedianHoverCard } from '../../components/ComedianHoverCard';
 import {
   Avatar,
@@ -30,9 +35,10 @@ import {
 } from '../../components/ui';
 import { api } from '../../lib/api';
 import { cn } from '../../lib/cn';
-import { useClub } from '../../lib/useMe';
+import { useBooker, useClub } from '../../lib/useMe';
 import { AddComedianDialog } from './AddComedianDialog';
 import { BulkAddDialog } from './BulkAddDialog';
+import { bulkLinksToast } from './loginLinks';
 import { invalidateTags, rosterQuery, useTags } from './queries';
 
 function parseIds(value: string | null): number[] {
@@ -95,13 +101,14 @@ export function ComediansPage() {
   const roster = useQuery(rosterQuery({ search: urlSearch, tagIds, archived }));
   const { data: tags = [] } = useTags();
   const club = useClub();
-  const nextMonth = addMonths(monthOf(todayInTz(club?.timezone ?? 'America/New_York')), 1);
+  // The month being planned (next month from the 20th on), as on the dashboard and portal.
+  const availabilityMonth = planningMonth(todayInTz(club?.timezone ?? 'America/New_York'));
 
   const rows = roster.data ?? [];
   const filtered = Boolean(urlSearch) || tagIds.length > 0;
 
   return (
-    <div className="mx-auto max-w-6xl">
+    <div>
       <PageHeader
         title="Comedians"
         description="Your roster. Hover a name to see tags and notes."
@@ -187,7 +194,7 @@ export function ComediansPage() {
         <RosterTable
           rows={rows}
           tags={tags}
-          nextMonth={nextMonth}
+          availabilityMonth={availabilityMonth}
           fetching={roster.isFetching && roster.isPlaceholderData}
           filtered={filtered}
         />
@@ -243,16 +250,19 @@ function TagFilter({
 interface RosterTableProps {
   rows: ComedianListItem[];
   tags: TagWithCount[];
-  nextMonth: string;
+  /** The planning month, for the availability column. */
+  availabilityMonth: string;
   fetching: boolean;
   filtered: boolean;
 }
 
-function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableProps) {
+function RosterTable({ rows, tags, availabilityMonth, fetching, filtered }: RosterTableProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const isAdmin = useBooker().role === 'admin';
   const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
   const [confirmArchive, setConfirmArchive] = useState(false);
+  const [confirmSendLinks, setConfirmSendLinks] = useState(false);
 
   // Only act on selected rows that are still visible under the current filters.
   const selectedRows = rows.filter((r) => selected.has(r.id));
@@ -305,6 +315,17 @@ function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableP
     },
   });
 
+  const sendLinks = useMutation({
+    mutationFn: (comedianIds: number[]) =>
+      api.post<BulkLoginLinkResult>('/comedians/bulk-send-login-link', { comedianIds }),
+    meta: { silent: true }, // ConfirmDialog shows the error
+    onSuccess: (result) => {
+      setSelected(new Set());
+      const t = bulkLinksToast(null, result, isAdmin);
+      toast[t.tone](t.title, { description: t.description });
+    },
+  });
+
   const selectedTagIds = new Set(selectedRows.flatMap((r) => r.tags.map((t) => t.id)));
   const removableTags = tags.filter((t) => selectedTagIds.has(t.id));
   const activeSelected = selectedRows.filter((r) => !r.archived).length;
@@ -317,7 +338,7 @@ function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableP
     void navigate(`/app/comedians/${id}`);
   }
 
-  const monthLabel = formatMonthShort(nextMonth);
+  const monthLabel = formatMonthShort(availabilityMonth);
 
   return (
     <>
@@ -361,6 +382,11 @@ function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableP
                   ))}
                 </MenuContent>
               </Menu>
+            )}
+            {activeSelected > 0 && (
+              <Button variant="secondary" size="sm" onClick={() => setConfirmSendLinks(true)}>
+                <Send /> Send sign-in link
+              </Button>
             )}
             {activeSelected > 0 && (
               <Button variant="secondary" size="sm" onClick={() => setConfirmArchive(true)}>
@@ -474,7 +500,7 @@ function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableP
                       </div>
                     </td>
                     <td className="px-3 py-2 whitespace-nowrap">
-                      {c.nextMonthSubmitted ? (
+                      {c.planningMonthSubmitted ? (
                         <span className="inline-flex items-center gap-1 text-xs font-medium text-available-fg">
                           <Check className="size-3.5" aria-hidden /> Submitted
                         </span>
@@ -505,6 +531,23 @@ function RosterTable({ rows, tags, nextMonth, fetching, filtered }: RosterTableP
         confirmLabel="Archive"
         destructive
         onConfirm={() => bulkArchive.mutateAsync(true)}
+      />
+      <ConfirmDialog
+        open={confirmSendLinks}
+        onOpenChange={setConfirmSendLinks}
+        title={`Email ${activeSelected === 1 ? 'a sign-in link' : `sign-in links to ${activeSelected} comedians`}?`}
+        description={
+          <>
+            {activeSelected === 1
+              ? `${selectedRows.find((r) => !r.archived)?.name ?? 'They'} gets`
+              : 'Each of them gets'}{' '}
+            an email with a link that signs them in to the comedian portal, where they mark their availability and see
+            their spots.
+            {archivedSelected > 0 && ` Archived comedians (${archivedSelected}) are skipped.`}
+          </>
+        }
+        confirmLabel={activeSelected === 1 ? 'Send link' : `Send ${activeSelected} links`}
+        onConfirm={() => sendLinks.mutateAsync(selectedRows.filter((r) => !r.archived).map((r) => r.id))}
       />
     </>
   );

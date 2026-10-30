@@ -6,7 +6,11 @@
  * - Emails are unique and stored lowercased; clashes → 409 `email_taken` with the
  *   existing comedian in `existing`.
  * - Archived comedians are hidden from `GET /comedians` unless `archived=1`, and their
- *   sessions are revoked (foundation auth already refuses archived sign-ins).
+ *   sessions are revoked (foundation auth already refuses archived sign-ins). They are never
+ *   emailed sign-in links.
+ * - Changing a comedian's email revokes everything tied to the old address: sessions,
+ *   magic/confirmation link tokens and login codes.
+ * - Adding comedians can email them a sign-in link right away (`sendLoginLink(s)`).
  * - Notes: any booker can add; only the author or an admin can edit/delete (403 `forbidden`).
  * - Tag names are unique case-insensitively → 409 `tag_exists`.
  */
@@ -15,6 +19,7 @@ import { Hono } from 'hono';
 import {
   bulkAddSchema,
   bulkArchiveSchema,
+  bulkSendLoginLinkSchema,
   bulkTagSchema,
   CARD_NOTE_COUNT,
   checkBulkRows,
@@ -30,6 +35,7 @@ import {
   updateTagSchema,
   type BulkAddResult,
   type BulkCreated,
+  type BulkLoginLinkResult,
   type BulkSkip,
   type BulkUpdateResult,
   type ComedianAvailability,
@@ -37,6 +43,8 @@ import {
   type ComedianCard,
   type ComedianDetail,
   type ComedianListItem,
+  type CreateComedianResponse,
+  type LoginLinkResult,
   type NoteDto,
   type SendLoginLinkResponse,
   type TagSummary,
@@ -44,12 +52,12 @@ import {
 } from '../../shared/api/comedians';
 import { bookingStatus } from '../../shared/bookingStatus';
 import { normalizeEmail } from '../../shared/schemas';
-import { addMonths, firstDayOfMonth, lastDayOfMonth, monthOf } from '../../shared/time';
+import { firstDayOfMonth, lastDayOfMonth, planningMonth } from '../../shared/time';
 import { requireBooker } from '../auth/middleware';
 import { deleteSessionsFor } from '../auth/sessions';
 import { createLoginLink } from '../auth/tokens';
 import type { AppEnv, SessionBooker } from '../context';
-import type { DbOrTx } from '../db/client';
+import type { Db, DbOrTx } from '../db/client';
 import {
   availability,
   availabilitySubmissions,
@@ -57,17 +65,20 @@ import {
   comedians,
   comedianTags,
   locations,
+  loginCodes,
   notes,
   shows,
   tags,
+  tokens,
   users,
   type Comedian,
 } from '../db/schema';
 import { sendEmail } from '../email/mailer';
 import { loginLinkEmail } from '../email/templates';
 import { httpError, orNotFound, parseId } from '../lib/http';
-import { clubToday, getAllNightRange, getSettings } from '../lib/settings';
+import { clubNight, clubToday, getAllNightRange, getSettings } from '../lib/settings';
 import { validate } from '../lib/validate';
+import { EMAIL_CONCURRENCY, mapWithConcurrency } from '../services/batch';
 
 export const comediansRoutes = new Hono<AppEnv>();
 
@@ -187,7 +198,7 @@ function findNote(db: DbOrTx, id: number): NoteRow {
 }
 
 function selectBookings(db: DbOrTx, where: SQL | undefined, order: 'asc' | 'desc'): ComedianBooking[] {
-  const today = clubToday(db);
+  const today = clubNight(db);
   const dir = order === 'asc' ? asc : desc;
   return db
     .select({
@@ -205,6 +216,7 @@ function selectBookings(db: DbOrTx, where: SQL | undefined, order: 'asc' | 'desc
       overrideUnavailable: bookings.overrideUnavailable,
       confirmationSentAt: bookings.confirmationSentAt,
       confirmedAt: bookings.confirmedAt,
+      declinedAt: bookings.declinedAt,
     })
     .from(bookings)
     .innerJoin(shows, eq(shows.id, bookings.showId))
@@ -253,6 +265,40 @@ function assertTagNameFree(db: DbOrTx, name: string, exceptId?: number): void {
   }
 }
 
+/** Email one comedian a portal sign-in link (a fresh 30-day magic link). Never throws. */
+async function sendLoginLink(db: Db, comedian: Pick<Comedian, 'id' | 'name' | 'email'>): Promise<LoginLinkResult> {
+  const url = createLoginLink(db, comedian.id);
+  const content = loginLinkEmail({ clubName: getSettings(db).clubName, name: comedian.name, url });
+  const result = await sendEmail(db, { to: comedian.email, ...content, kind: 'login_link', comedianId: comedian.id });
+  return { status: result.status, ...(result.error ? { error: result.error } : {}) };
+}
+
+/** Sign-in links for many comedians (a few at a time); archived ones are skipped. */
+async function sendLoginLinks(
+  db: Db,
+  list: Pick<Comedian, 'id' | 'name' | 'email' | 'archived'>[],
+): Promise<BulkLoginLinkResult> {
+  const active = list.filter((c) => !c.archived);
+  const results = await mapWithConcurrency(active, EMAIL_CONCURRENCY, (comedian) => sendLoginLink(db, comedian));
+  return {
+    sent: results.filter((r) => r.status === 'sent').length,
+    outbox: results.filter((r) => r.status === 'outbox').length,
+    failed: results.filter((r) => r.status === 'failed').length,
+    skipped: list.length - active.length,
+  };
+}
+
+/**
+ * Everything that signs a comedian in and was tied to their old email: sessions, magic-link
+ * and confirmation-link tokens, and login codes (security: a changed address must not keep
+ * working for whoever reads the old inbox).
+ */
+function revokeComedianAccess(db: DbOrTx, comedianId: number): void {
+  deleteSessionsFor(db, 'comedian', comedianId);
+  db.delete(tokens).where(eq(tokens.comedianId, comedianId)).run();
+  db.delete(loginCodes).where(eq(loginCodes.comedianId, comedianId)).run();
+}
+
 /** 400 `unknown_comedian` unless every id exists. */
 function assertComediansExist(db: DbOrTx, ids: number[]): void {
   const unique = [...new Set(ids)];
@@ -272,7 +318,7 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
   const db = c.var.db;
   const { search, tagIds, archived } = c.req.valid('query');
   const today = clubToday(db);
-  const nextMonth = addMonths(monthOf(today), 1);
+  const planning = planningMonth(today);
 
   const filters: (SQL | undefined)[] = [];
   if (!archived) filters.push(eq(comedians.archived, false));
@@ -302,7 +348,7 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
     db
       .select({ comedianId: availabilitySubmissions.comedianId })
       .from(availabilitySubmissions)
-      .where(eq(availabilitySubmissions.month, nextMonth))
+      .where(eq(availabilitySubmissions.month, planning))
       .all()
       .map((r) => r.comedianId),
   );
@@ -314,7 +360,7 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
     headshotUrl: r.headshotUrl,
     archived: r.archived,
     tags: tagMap.get(r.id) ?? [],
-    nextMonthSubmitted: submitted.has(r.id),
+    planningMonthSubmitted: submitted.has(r.id),
     upcomingCount: counts.get(r.id) ?? 0,
     lastLoginAt: r.lastLoginAt,
     createdAt: r.createdAt,
@@ -322,17 +368,18 @@ comediansRoutes.get('/comedians', requireBooker, validate('query', listComedians
   return c.json(list);
 });
 
-comediansRoutes.post('/comedians', requireBooker, validate('json', createComedianSchema), (c) => {
+comediansRoutes.post('/comedians', requireBooker, validate('json', createComedianSchema), async (c) => {
   const db = c.var.db;
-  const { name, email } = c.req.valid('json');
+  const { name, email, sendLoginLink: invite = false } = c.req.valid('json');
   assertEmailFree(db, email);
   const comedian = db.insert(comedians).values({ name, email }).returning().get();
-  return c.json(toDetail(db, comedian), 201);
+  const loginLink = invite ? await sendLoginLink(db, comedian) : null;
+  return c.json({ ...toDetail(db, comedian), loginLink } satisfies CreateComedianResponse, 201);
 });
 
-comediansRoutes.post('/comedians/bulk', requireBooker, validate('json', bulkAddSchema), (c) => {
+comediansRoutes.post('/comedians/bulk', requireBooker, validate('json', bulkAddSchema), async (c) => {
   const db = c.var.db;
-  const { rows, dryRun = false } = c.req.valid('json');
+  const { rows, dryRun = false, sendLoginLinks: invite = false } = c.req.valid('json');
   const problems = checkBulkRows(rows);
   const normalized = rows.map((r) => ({ name: r.name.trim().replace(/\s+/g, ' '), email: normalizeEmail(r.email) }));
 
@@ -378,7 +425,14 @@ comediansRoutes.post('/comedians/bulk', requireBooker, validate('json', bulkAddS
       }),
     );
   }
-  const result: BulkAddResult = { dryRun, created, skipped };
+  const loginLinks =
+    !dryRun && invite && created.length
+      ? await sendLoginLinks(
+          db,
+          created.map((r) => ({ id: r.id, name: r.name, email: r.email, archived: false })),
+        )
+      : null;
+  const result: BulkAddResult = { dryRun, created, skipped, loginLinks };
   return c.json(result, dryRun || created.length === 0 ? 200 : 201);
 });
 
@@ -421,6 +475,24 @@ comediansRoutes.post('/comedians/bulk-archive', requireBooker, validate('json', 
   return c.json({ updated } satisfies BulkUpdateResult);
 });
 
+comediansRoutes.post(
+  '/comedians/bulk-send-login-link',
+  requireBooker,
+  validate('json', bulkSendLoginLinkSchema),
+  async (c) => {
+    const db = c.var.db;
+    const ids = [...new Set(c.req.valid('json').comedianIds)];
+    assertComediansExist(db, ids);
+    const list = db
+      .select({ id: comedians.id, name: comedians.name, email: comedians.email, archived: comedians.archived })
+      .from(comedians)
+      .where(inArray(comedians.id, ids))
+      .orderBy(asc(comedians.id))
+      .all();
+    return c.json((await sendLoginLinks(db, list)) satisfies BulkLoginLinkResult);
+  },
+);
+
 comediansRoutes.get('/comedians/:id', requireBooker, (c) => {
   const db = c.var.db;
   return c.json(toDetail(db, findComedian(db, parseId(c.req.param('id')))));
@@ -431,11 +503,13 @@ comediansRoutes.patch('/comedians/:id', requireBooker, validate('json', updateCo
   const comedian = findComedian(db, parseId(c.req.param('id')));
   const patch = c.req.valid('json');
   if (Object.keys(patch).length === 0) throw httpError(400, 'Nothing to update', 'validation_error');
-  if (patch.email !== undefined && patch.email !== comedian.email) assertEmailFree(db, patch.email, comedian.id);
+  const newEmail = patch.email !== undefined && patch.email !== comedian.email ? patch.email : null;
+  if (newEmail) assertEmailFree(db, newEmail, comedian.id);
 
   const updated = db.transaction((tx) => {
     const row = tx.update(comedians).set(patch).where(eq(comedians.id, comedian.id)).returning().get();
-    if (patch.archived === true) deleteSessionsFor(tx, 'comedian', comedian.id);
+    if (newEmail) revokeComedianAccess(tx, comedian.id);
+    else if (patch.archived === true) deleteSessionsFor(tx, 'comedian', comedian.id);
     return row;
   });
   return c.json(toDetail(db, updated));
@@ -469,7 +543,7 @@ comediansRoutes.get(
     const db = c.var.db;
     const comedian = findComedian(db, parseId(c.req.param('id')));
     const today = clubToday(db);
-    const month = c.req.valid('query').month ?? monthOf(today);
+    const month = c.req.valid('query').month ?? planningMonth(today);
     const from = firstDayOfMonth(month);
     const to = lastDayOfMonth(month);
 
@@ -514,7 +588,7 @@ comediansRoutes.get('/comedians/:id/bookings', requireBooker, validate('query', 
   const list = upcoming
     ? selectBookings(
         db,
-        and(eq(bookings.comedianId, comedian.id), gte(shows.date, clubToday(db)), eq(shows.status, 'scheduled')),
+        and(eq(bookings.comedianId, comedian.id), gte(shows.date, clubNight(db)), eq(shows.status, 'scheduled')),
         'asc',
       )
     : selectBookings(db, eq(bookings.comedianId, comedian.id), 'desc');
@@ -547,14 +621,7 @@ comediansRoutes.post('/comedians/:id/send-login-link', requireBooker, async (c) 
   if (comedian.archived) {
     throw httpError(409, `${comedian.name} is archived. Restore them first.`, 'archived');
   }
-  const url = createLoginLink(db, comedian.id);
-  const content = loginLinkEmail({ clubName: getSettings(db).clubName, name: comedian.name, url });
-  const result = await sendEmail(db, { to: comedian.email, ...content, kind: 'login_link', comedianId: comedian.id });
-  const body: SendLoginLinkResponse = {
-    ok: true,
-    status: result.status,
-    ...(result.error ? { error: result.error } : {}),
-  };
+  const body: SendLoginLinkResponse = { ok: true, ...(await sendLoginLink(db, comedian)) };
   return c.json(body);
 });
 

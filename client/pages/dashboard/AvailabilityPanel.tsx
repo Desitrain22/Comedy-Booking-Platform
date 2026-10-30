@@ -1,68 +1,89 @@
 /**
- * Dashboard section 4: availability for this month and next ("14 of 32 comedians have
- * submitted December"), **Request availability**, and **Remind the 18 who haven't**.
+ * Dashboard section 4: availability from this month through the month after the planning
+ * month ("14 of 32 comedians have submitted December"), **Request availability** (defaults to
+ * the planning month, and to a reminder once that month was asked for), and **Remind the 18
+ * who haven't**. The planning month follows the portal's rule: next month from the 20th on.
+ * A month that's winding down (this month, once we're planning the next) shows its progress
+ * without the buttons.
  */
 import { BellRing, CircleCheck, Megaphone } from 'lucide-react';
-import { useState } from 'react';
+import { Link } from 'react-router';
 import type { AvailabilityRequestSummary, DashboardResponse, MonthAvailabilityProgress } from '../../../shared/api/dashboard';
+import { formatMonthName, formatRelative } from '../../../shared/time';
 import type { AvailabilityRequestKind } from '../../../shared/types';
-import { addMonths, formatMonthName, formatRelative, monthOf } from '../../../shared/time';
-import { Button, Card, CardHeader } from '../../components/ui';
+import { Badge, Button, Card, CardHeader } from '../../components/ui';
 import { cn } from '../../lib/cn';
-import { AvailabilityRequestDialog } from './AvailabilityRequestDialog';
-import { percent, plural } from './format';
+import { defaultRequestKind, percent, plural } from './format';
 
-interface DialogState {
+export interface RequestDialogTarget {
   kind: AvailabilityRequestKind;
   month: string;
 }
 
-export function AvailabilityPanel({ data }: { data: DashboardResponse }) {
-  const [dialog, setDialog] = useState<DialogState | null>(null);
-  const nextMonth = addMonths(monthOf(data.today), 1);
+export interface AvailabilityPanelProps {
+  data: DashboardResponse;
+  /** Open the request/remind dialog. */
+  onRequest: (target: RequestDialogTarget) => void;
+}
+
+export function AvailabilityPanel({ data, onRequest }: AvailabilityPanelProps) {
+  const planning = data.planningMonth;
+  const noComedians = data.setup.comedians === 0;
+  const planningProgress = data.availability.find((p) => p.month === planning);
 
   return (
     <Card>
       <CardHeader
         title="Availability"
-        description="This month and next"
+        description={`Planning ${formatMonthName(planning)}`}
         actions={
-          <Button size="sm" onClick={() => setDialog({ kind: 'request', month: nextMonth })}>
+          <Button
+            size="sm"
+            disabled={noComedians}
+            title={noComedians ? 'Add comedians first' : undefined}
+            onClick={() => onRequest({ kind: defaultRequestKind(planningProgress), month: planning })}
+          >
             <Megaphone aria-hidden />
             Request availability
           </Button>
         }
       />
+      {noComedians && (
+        <p className="border-b border-border bg-surface-2/60 px-4 py-2.5 text-xs text-fg-muted">
+          There's no one to ask yet.{' '}
+          <Link to="/app/comedians" className="font-medium text-accent hover:underline">
+            Add comedians
+          </Link>{' '}
+          first, then request their availability.
+        </p>
+      )}
       <div className="divide-y divide-border">
         {data.availability.map((progress) => (
           <MonthProgress
             key={progress.month}
             progress={progress}
-            onRemind={() => setDialog({ kind: 'reminder', month: progress.month })}
-            onRequest={() => setDialog({ kind: 'request', month: progress.month })}
+            role={progress.month === planning ? 'planning' : progress.month < planning ? 'ending' : 'ahead'}
+            disabled={noComedians}
+            onRemind={() => onRequest({ kind: 'reminder', month: progress.month })}
+            onRequest={() => onRequest({ kind: 'request', month: progress.month })}
           />
         ))}
       </div>
-      {dialog && (
-        <AvailabilityRequestDialog
-          key={`${dialog.kind}-${dialog.month}`}
-          open
-          onOpenChange={(open) => !open && setDialog(null)}
-          kind={dialog.kind}
-          initialMonth={dialog.month}
-          data={data}
-        />
-      )}
     </Card>
   );
 }
 
 function MonthProgress({
   progress,
+  role,
+  disabled,
   onRemind,
   onRequest,
 }: {
   progress: MonthAvailabilityProgress;
+  /** `ending`: this month while the club already plans the next (no buttons). */
+  role: 'planning' | 'ending' | 'ahead';
+  disabled: boolean;
   onRemind: () => void;
   onRequest: () => void;
 }) {
@@ -71,12 +92,15 @@ function MonthProgress({
   const pct = percent(submitted, total);
   const done = total > 0 && notSubmitted === 0;
   const labelId = `availability-${month}`;
+  const ending = role === 'ending';
 
   return (
-    <section className="px-4 py-3.5" aria-labelledby={labelId}>
+    <section className={cn('px-4 py-3.5', ending && 'bg-surface-2/40')} aria-labelledby={labelId}>
       <div className="flex items-baseline justify-between gap-3">
-        <h3 id={labelId} className="text-sm font-semibold text-fg">
+        <h3 id={labelId} className={cn('flex items-center gap-2 text-sm font-semibold', ending ? 'text-fg-muted' : 'text-fg')}>
           {monthName}
+          {role === 'planning' && <Badge variant="accent">Planning</Badge>}
+          {ending && <span className="text-xs font-normal text-fg-subtle">This month</span>}
         </h3>
         <span className="text-xs font-medium text-fg-muted tabular-nums">{pct}%</span>
       </div>
@@ -95,30 +119,35 @@ function MonthProgress({
         className="mt-2 h-2 overflow-hidden rounded-full bg-surface-3"
       >
         <div
-          className={cn('h-full rounded-full transition-[width] duration-500', done ? 'bg-available' : 'bg-accent-solid')}
+          className={cn(
+            'h-full rounded-full transition-[width] duration-500',
+            done ? 'bg-available' : ending ? 'bg-fg-subtle' : 'bg-accent-solid',
+          )}
           style={{ width: `${pct}%` }}
         />
       </div>
 
       <p className="mt-2 text-xs text-fg-muted">{historyLine(lastRequest, lastReminder)}</p>
 
-      <div className="mt-2.5 flex flex-wrap items-center gap-2">
-        {done ? (
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-available-fg">
-            <CircleCheck className="size-4" aria-hidden /> Everyone's in
-          </span>
-        ) : lastRequest ? (
-          <Button size="sm" variant="secondary" onClick={onRemind} disabled={notSubmitted === 0}>
-            <BellRing aria-hidden />
-            Remind the {notSubmitted} who haven't
-          </Button>
-        ) : (
-          <Button size="sm" variant="secondary" onClick={onRequest}>
-            <Megaphone aria-hidden />
-            Request {monthName}
-          </Button>
-        )}
-      </div>
+      {!ending && (
+        <div className="mt-2.5 flex flex-wrap items-center gap-2">
+          {done ? (
+            <span className="inline-flex items-center gap-1.5 text-xs font-medium text-available-fg">
+              <CircleCheck className="size-4" aria-hidden /> Everyone's in
+            </span>
+          ) : lastRequest ? (
+            <Button size="sm" variant="secondary" onClick={onRemind} disabled={disabled || notSubmitted === 0}>
+              <BellRing aria-hidden />
+              Remind the {notSubmitted} who haven't
+            </Button>
+          ) : (
+            <Button size="sm" variant="secondary" onClick={onRequest} disabled={disabled}>
+              <Megaphone aria-hidden />
+              Request {monthName}
+            </Button>
+          )}
+        </div>
+      )}
     </section>
   );
 }

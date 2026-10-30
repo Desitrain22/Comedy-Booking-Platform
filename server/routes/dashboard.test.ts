@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   AvailabilityRequestPreview,
   AvailabilityRequestSummary,
@@ -9,11 +9,12 @@ import type {
   SendConfirmationsResponse,
 } from '../../shared/api/dashboard';
 import { addDays, weekStartOf } from '../../shared/time';
+import type { DayResponse } from '../../shared/api/lineup';
 import type { MagicLinkResponse } from '../../shared/types';
-import { availabilityRequests, bookings, tokens, type Comedian, type LocationRow } from '../db/schema';
-import { clubToday, updateSettings } from '../lib/settings';
+import { availabilityRequests, bookings, jobRuns, tokens, type Comedian, type LocationRow } from '../db/schema';
+import { clubNight, clubToday, updateSettings } from '../lib/settings';
 import { buildDashboard } from '../services/dashboard';
-import { runSchedulerTick } from '../services/scheduler';
+import { confirmationsJobKey, runSchedulerTick } from '../services/scheduler';
 import {
   createBooking,
   createComedian,
@@ -140,6 +141,7 @@ describe('buildDashboard', () => {
         comedianId: priya.id,
         comedianName: 'Priya Raman',
         comedianEmail: 'priya@example.com',
+        comedianArchived: false,
         startMin: 1140,
         showName: 'Early Show',
         location: { id: cellar.id, name: 'The Cellar', address: '214 Sullivan St', color: '#7c5cff' },
@@ -182,6 +184,8 @@ describe('buildDashboard', () => {
   });
 
   it('summarizes this week (Mon–Sun) and the confirmation schedule', () => {
+    // This week's automatic send already ran on Monday, so the next one is next Monday.
+    t.db.insert(jobRuns).values({ key: confirmationsJobKey('2026-11-02'), ranAt: EARLIER }).run();
     const { week } = buildDashboard(t.db, NOW);
     expect(week.weekStart).toBe('2026-11-02');
     expect(week.weekEnd).toBe('2026-11-08');
@@ -202,6 +206,7 @@ describe('buildDashboard', () => {
       openSlots: 3,
       confirmed: 1,
       unconfirmed: 1,
+      declined: 0,
     });
     // Wednesday: three scheduled shows (the cancelled one doesn't count).
     expect(week.days[2]).toEqual({
@@ -212,10 +217,11 @@ describe('buildDashboard', () => {
       openSlots: 11,
       confirmed: 1,
       unconfirmed: 3,
+      declined: 0,
     });
     expect(week.days[1]).toMatchObject({ shows: 0, slots: 0, booked: 0 });
     // Today → Sunday only.
-    expect(week.remaining).toEqual({ confirmed: 1, unconfirmed_today: 3, awaiting: 2, not_sent: 0 });
+    expect(week.remaining).toEqual({ confirmed: 1, unconfirmed_today: 3, awaiting: 2, not_sent: 0, declined: 0 });
     expect(week.confirmations).toEqual({
       enabled: true,
       day: 1,
@@ -229,6 +235,8 @@ describe('buildDashboard', () => {
       },
       pendingComedians: 3, // Priya, Devon, John (Maria is all confirmed)
       unsentComedians: 2, // Priya and Devon have spots never emailed
+      unsentBookings: 2, // Priya's and Devon's spots tonight
+      catchUpEnabled: true,
     });
   });
 
@@ -237,22 +245,29 @@ describe('buildDashboard', () => {
     expect(buildDashboard(t.db, NOW).week.confirmations).toMatchObject({ enabled: false, nextSend: null });
   });
 
-  it('uses the club timezone for "today", including near midnight', () => {
+  it('uses the club timezone and the club *night* for "today" (until 6 AM it is still last night)', () => {
     // 11:30 PM Wednesday in New York is already Thursday in UTC.
     const lateNight = buildDashboard(t.db, new Date('2026-11-05T04:30:00Z'));
     expect(lateNight.today).toBe('2026-11-04');
     expect(lateNight.nowMin).toBe(23 * 60 + 30);
     expect(lateNight.unconfirmedTonight).toHaveLength(3);
 
-    // 12:30 AM Thursday: Wednesday's rows are gone, Thursday's show is tonight.
+    // 12:30 AM Thursday: still Wednesday night — its late shows stay on the dashboard, red.
     const afterMidnight = buildDashboard(t.db, new Date('2026-11-05T05:30:00Z'));
-    expect(afterMidnight.today).toBe('2026-11-05');
-    expect(afterMidnight.tonight.map((s) => s.id)).toEqual([ids.thursday]);
-    expect(afterMidnight.unconfirmedTonight.map((r) => r.comedianName)).toEqual(['John Mercer']);
+    expect(afterMidnight.today).toBe('2026-11-04');
+    expect(afterMidnight.tonight.map((s) => s.id)).toEqual([ids.early, ids.annexEarly, ids.late, ids.cancelled]);
+    expect(afterMidnight.unconfirmedTonight).toHaveLength(3);
+    expect(afterMidnight.tonight[2]!.bookings.map((b) => b.status)).toEqual(['unconfirmed_today']);
 
-    // Same instant in Los Angeles is still Wednesday evening.
+    // 6 AM Thursday: a new night; Thursday's show is tonight.
+    const morning = buildDashboard(t.db, new Date('2026-11-05T11:00:00Z'));
+    expect(morning.today).toBe('2026-11-05');
+    expect(morning.tonight.map((s) => s.id)).toEqual([ids.thursday]);
+    expect(morning.unconfirmedTonight.map((r) => r.comedianName)).toEqual(['John Mercer']);
+
+    // 5:30 AM Thursday in New York is 2:30 AM in Los Angeles: still Wednesday night there.
     updateSettings(t.db, { timezone: 'America/Los_Angeles' });
-    const la = buildDashboard(t.db, new Date('2026-11-05T05:30:00Z'));
+    const la = buildDashboard(t.db, new Date('2026-11-05T10:30:00Z'));
     expect(la.today).toBe('2026-11-04');
     expect(la.unconfirmedTonight).toHaveLength(3);
   });
@@ -274,6 +289,8 @@ describe('buildDashboard', () => {
       .run();
 
     const d = buildDashboard(t.db, NOW);
+    expect(d.planningMonth).toBe('2026-11');
+    expect(d.availability.map((m) => m.month)).toEqual(['2026-11', '2026-12']);
     expect(d.tags.map((tag) => tag.name)).toEqual(['All Stars', 'Hosts']);
     const [nov, dec] = d.availability;
     expect(nov).toMatchObject({ month: '2026-11', total: 4, submitted: 4, notSubmitted: 0, lastRequest: null, lastReminder: null });
@@ -293,11 +310,157 @@ describe('buildDashboard', () => {
     });
     expect(dec!.lastReminder).toMatchObject({ audienceLabel: 'Hosts', recipientCount: 2, sentByName: null });
   });
+
+  it('keeps after-midnight shows on the dashboard, red, until 6 AM (correctness#3)', () => {
+    // A 1 AM show "on" Wednesday night (startMin 1500 = Thu 1:00 AM).
+    const afterHours = createShow(t.db, { date: '2026-11-04', startMin: 1500, locationId: cellar.id, name: 'After Hours' });
+    const late = createBooking(t.db, { showId: afterHours.id, comedianId: devon.id, confirmationSentAt: EARLIER });
+
+    for (const at of ['2026-11-05T05:30:00Z', '2026-11-05T06:30:00Z', '2026-11-05T10:59:00Z']) {
+      // 12:30 AM, 1:30 AM (the show is on stage) and 5:59 AM Thursday in New York.
+      const d = buildDashboard(t.db, new Date(at));
+      expect(d.today, at).toBe('2026-11-04');
+      expect(d.tonight.map((s) => s.id), at).toContain(afterHours.id);
+      expect(d.unconfirmedTonight.map((r) => r.bookingId), at).toContain(late.id);
+      expect(d.tonight.find((s) => s.id === afterHours.id)!.bookings[0]!.status, at).toBe('unconfirmed_today');
+    }
+
+    // 6 AM: Thursday's night begins and the 1 AM show is behind us.
+    const morning = buildDashboard(t.db, new Date('2026-11-05T11:00:00Z'));
+    expect(morning.tonight.map((s) => s.id)).not.toContain(afterHours.id);
+    expect(morning.unconfirmedTonight.map((r) => r.bookingId)).not.toContain(late.id);
+  });
+
+  it('flags archived comedians in Unconfirmed tonight instead of offering a resend (correctness#5a)', () => {
+    const show = createShow(t.db, { date: '2026-11-04', startMin: 1200, locationId: cellar.id, slotCount: 3 });
+    const b = createBooking(t.db, { showId: show.id, comedianId: wes.id, confirmationSentAt: EARLIER });
+    const row = buildDashboard(t.db, NOW).unconfirmedTonight.find((r) => r.bookingId === b.id);
+    expect(row).toMatchObject({ comedianName: 'Wes Calloway', comedianArchived: true });
+    expect(buildDashboard(t.db, NOW).unconfirmedTonight.filter((r) => r.comedianArchived)).toHaveLength(1);
+  });
+
+  it('moves declined spots out of the unconfirmed counts into "Needs a replacement"', () => {
+    const declinedAt = NOW.getTime() - 3_600_000;
+    // Priya declines tonight's early spot; John declines Thursday's after confirming it first.
+    t.db.update(bookings).set({ declinedAt, declineNote: 'Sick' }).where(eq(bookings.id, ids.priyaEarly)).run();
+    const thursdayJohn = t.db.select().from(bookings).where(eq(bookings.showId, ids.thursday)).get()!;
+    t.db.update(bookings)
+      .set({ declinedAt: declinedAt + 1, confirmedAt: EARLIER, confirmedBy: 'comedian' })
+      .where(eq(bookings.id, thursdayJohn.id))
+      .run();
+    // Not "needs a replacement": a past show, a cancelled show.
+    const past = createShow(t.db, { date: '2026-11-03', startMin: 1200, locationId: annex.id });
+    createBooking(t.db, { showId: past.id, comedianId: maria.id, declinedAt });
+    createBooking(t.db, { showId: ids.cancelled, comedianId: john.id, declinedAt });
+    // Next week still needs a replacement.
+    const later = createShow(t.db, { date: '2026-11-12', startMin: 1260, locationId: annex.id, name: 'Late' });
+    const laterDecline = createBooking(t.db, { showId: later.id, comedianId: devon.id, position: 2, declinedAt });
+
+    const d = buildDashboard(t.db, NOW);
+    expect(d.unconfirmedTonight.map((r) => r.bookingId)).toEqual([ids.devonAnnex, ids.johnLate]);
+    expect(d.needsReplacement).toEqual([
+      {
+        bookingId: ids.priyaEarly,
+        showId: ids.early,
+        date: '2026-11-04',
+        startMin: 1140,
+        showName: 'Early Show',
+        location: { id: cellar.id, name: 'The Cellar', address: '214 Sullivan St', color: '#7c5cff' },
+        position: 0,
+        comedianId: priya.id,
+        comedianName: 'Priya Raman',
+        declinedAt,
+        declineNote: 'Sick',
+      },
+      expect.objectContaining({ bookingId: thursdayJohn.id, date: '2026-11-05', comedianName: 'John Mercer', declineNote: '' }),
+      expect.objectContaining({ bookingId: laterDecline.id, date: '2026-11-12', position: 2, showName: 'Late' }),
+    ]);
+
+    const early = d.tonight.find((s) => s.id === ids.early)!;
+    expect(early.bookings.map((b) => b.status)).toEqual(['declined', 'confirmed']);
+    expect(early).toMatchObject({ bookedCount: 2, confirmedCount: 1 });
+
+    // Wednesday: Priya no longer counts as unconfirmed; Thursday's confirmed-then-declined spot isn't confirmed.
+    expect(d.week.days[2]).toMatchObject({ booked: 4, confirmed: 1, unconfirmed: 2, declined: 1 });
+    expect(d.week.days[3]).toMatchObject({ booked: 1, confirmed: 0, unconfirmed: 0, declined: 1 });
+    expect(d.week.remaining).toEqual({ confirmed: 1, unconfirmed_today: 2, awaiting: 1, not_sent: 0, declined: 2 });
+    // Priya's declined spot is no longer "never emailed".
+    expect(d.week.confirmations.unsentBookings).toBe(1);
+  });
+
+  it('counts this week’s never-emailed spots from tonight to Sunday for the catch-up nudge', () => {
+    // Already counted: Priya (tonight) and Devon (tonight). Add a mix around them.
+    const friday = createShow(t.db, { date: '2026-11-06', startMin: 1200, locationId: cellar.id, slotCount: 8 });
+    createBooking(t.db, { showId: friday.id, comedianId: john.id }); // counts
+    createBooking(t.db, { showId: friday.id, comedianId: maria.id }); // counts
+    createBooking(t.db, { showId: friday.id, comedianId: priya.id, confirmationSentAt: EARLIER }); // emailed
+    createBooking(t.db, { showId: friday.id, comedianId: devon.id, confirmedAt: EARLIER, confirmedBy: 'booker' }); // confirmed
+    createBooking(t.db, { showId: friday.id, comedianId: wes.id }); // archived: never emailed
+    const fridayCancelled = createShow(t.db, { date: '2026-11-06', startMin: 1320, locationId: annex.id, status: 'cancelled' });
+    createBooking(t.db, { showId: fridayCancelled.id, comedianId: john.id }); // cancelled show
+    const tuesday = createShow(t.db, { date: '2026-11-03', startMin: 1200, locationId: annex.id });
+    createBooking(t.db, { showId: tuesday.id, comedianId: john.id }); // already past
+    const nextWeek = createShow(t.db, { date: '2026-11-10', startMin: 1200, locationId: annex.id });
+    createBooking(t.db, { showId: nextWeek.id, comedianId: john.id }); // next week
+
+    const { confirmations } = buildDashboard(t.db, NOW).week;
+    expect(confirmations.unsentBookings).toBe(4);
+    expect(confirmations.catchUpEnabled).toBe(true);
+
+    updateSettings(t.db, { catchUpEnabled: false });
+    expect(buildDashboard(t.db, NOW).week.confirmations.catchUpEnabled).toBe(false);
+  });
+
+  it('shows this month, the planning month and the month after it (ux#B8)', () => {
+    // Oct 30: planning November → October, November, December.
+    const oct30 = buildDashboard(t.db, new Date('2026-10-30T16:00:00Z'));
+    expect(oct30.planningMonth).toBe('2026-11');
+    expect(oct30.availability.map((m) => m.month)).toEqual(['2026-10', '2026-11', '2026-12']);
+    // Oct 5: still planning October → October, November.
+    const oct5 = buildDashboard(t.db, new Date('2026-10-05T16:00:00Z'));
+    expect(oct5.planningMonth).toBe('2026-10');
+    expect(oct5.availability.map((m) => m.month)).toEqual(['2026-10', '2026-11']);
+    // Dec 20 → December, January, February (year wraps).
+    const dec20 = buildDashboard(t.db, new Date('2026-12-20T16:00:00Z'));
+    expect(dec20.planningMonth).toBe('2027-01');
+    expect(dec20.availability.map((m) => m.month)).toEqual(['2026-12', '2027-01', '2027-02']);
+    // Months follow the calendar date, not the club night: 1 AM Nov 20 already plans December.
+    const earlyNov20 = buildDashboard(t.db, new Date('2026-11-20T06:00:00Z'));
+    expect(earlyNov20.today).toBe('2026-11-19');
+    expect(earlyNov20.planningMonth).toBe('2026-12');
+  });
+
+  it('reports the new-club checklist counts (ux#B12)', () => {
+    expect(buildDashboard(t.db, NOW).setup).toEqual({ locations: 2, comedians: 4, shows: 8, availabilityRequests: 0 });
+    createLocation(t.db, { name: 'Old Room', archived: true });
+    t.db.insert(availabilityRequests).values({ month: '2026-12', kind: 'request', audience: 'all', recipientCount: 4 }).run();
+    expect(buildDashboard(t.db, NOW).setup).toEqual({ locations: 2, comedians: 4, shows: 8, availabilityRequests: 1 });
+  });
+});
+
+describe('a brand-new club', () => {
+  it('has nothing to show yet and an empty checklist', () => {
+    const fresh = makeTestApp();
+    try {
+      const d = buildDashboard(fresh.db, new Date('2026-11-04T17:00:00Z'));
+      expect(d.setup).toEqual({ locations: 0, comedians: 0, shows: 0, availabilityRequests: 0 });
+      expect(d.tonight).toEqual([]);
+      expect(d.unconfirmedTonight).toEqual([]);
+      expect(d.needsReplacement).toEqual([]);
+      expect(d.week.confirmations).toMatchObject({ pendingComedians: 0, unsentBookings: 0 });
+      expect(d.availability.map((m) => [m.month, m.total])).toEqual([
+        ['2026-11', 0],
+        ['2026-12', 0],
+      ]);
+    } finally {
+      fresh.close();
+    }
+  });
 });
 
 describe('GET /api/dashboard', () => {
-  it('returns the payload for today in the club', async () => {
-    const today = clubToday(t.db);
+  it('returns the payload for tonight in the club', async () => {
+    const today = clubNight(t.db);
     const show = createShow(t.db, { date: today, startMin: 1140 });
     const comedian = createComedian(t.db, { name: 'John Mercer' });
     createBooking(t.db, { showId: show.id, comedianId: comedian.id });
@@ -309,7 +472,7 @@ describe('GET /api/dashboard', () => {
     expect(body.week.weekStart).toBe(weekStartOf(today));
     expect(body.unconfirmedTonight.map((r) => r.comedianName)).toEqual(['John Mercer']);
     expect(body.tonight).toHaveLength(1);
-    expect(body.availability).toHaveLength(2);
+    expect(body.availability.map((m) => m.month)).toContain(body.planningMonth);
   });
 });
 
@@ -317,7 +480,23 @@ describe('GET /api/dashboard', () => {
 // Confirmations
 // ---------------------------------------------------------------------------
 
+/**
+ * Wed Nov 4, 2026, noon in New York. Sends only list spots that haven't started, so tests that
+ * book "tonight" pin the clock instead of failing when run in the evening.
+ */
+function pinClockToWednesdayNoon() {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-04T17:00:00Z'));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+}
+
 describe('POST /api/confirmations/send', () => {
+  pinClockToWednesdayNoon();
+
   it('emails comedians with unconfirmed spots this week; onlyUnsent skips those already emailed', async () => {
     const today = clubToday(t.db);
     const weekStart = weekStartOf(today);
@@ -358,6 +537,8 @@ describe('POST /api/confirmations/send', () => {
 });
 
 describe('POST /api/confirmations/resend', () => {
+  pinClockToWednesdayNoon();
+
   it("resends one comedian's confirmation for the week", async () => {
     const today = clubToday(t.db);
     const weekStart = weekStartOf(today);
@@ -387,6 +568,23 @@ describe('POST /api/confirmations/resend', () => {
     expect(await readJson(skipped)).toEqual({ status: 'skipped', bookingCount: 0 });
   });
 
+  it('says "archived" (and sends nothing) for an archived comedian (correctness#5a)', async () => {
+    const today = clubToday(t.db);
+    const wes = createComedian(t.db, { name: 'Wes Calloway', email: 'wes@example.com', archived: true });
+    const tonight = createShow(t.db, { date: today, startMin: 1140 });
+    const b = createBooking(t.db, { showId: tonight.id, comedianId: wes.id, confirmationSentAt: 1 });
+
+    const res = await t.request('/api/confirmations/resend', {
+      method: 'POST',
+      headers,
+      json: { comedianId: wes.id, weekStart: weekStartOf(today) },
+    });
+    expect(res.status).toBe(200);
+    expect(await readJson<ResendConfirmationResponse>(res)).toEqual({ status: 'archived', bookingCount: 0 });
+    expect(emailsTo(t.db, 'wes@example.com')).toHaveLength(0);
+    expect(t.db.select().from(bookings).where(eq(bookings.id, b.id)).get()!.confirmationSentAt).toBe(1);
+  });
+
   it('404s for an unknown comedian and validates input', async () => {
     const weekStart = weekStartOf(clubToday(t.db));
     const missing = await t.request('/api/confirmations/resend', {
@@ -401,6 +599,56 @@ describe('POST /api/confirmations/resend', () => {
       json: { comedianId: 1, weekStart: addDays(weekStart, 1) },
     });
     expect(bad.status).toBe(400);
+  });
+});
+
+describe('after midnight: one club night for tonight, Resend and the catch-up nudge', () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-07T05:30:00Z')); // Sat Nov 7, 12:30 AM in New York
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('Resend for a Friday-night 1 AM spot still emails it', async () => {
+    const lena = createComedian(t.db, { name: 'Lena Late', email: 'lena@example.com' });
+    const late = createShow(t.db, { date: '2026-11-06', startMin: 1500 });
+    createBooking(t.db, { showId: late.id, comedianId: lena.id, confirmationSentAt: 1 });
+
+    const dash = await readJson<DashboardResponse>(await t.request('/api/dashboard', { headers }));
+    expect(dash.unconfirmedTonight.map((r) => r.comedianName)).toEqual(['Lena Late']);
+    const res = await t.request('/api/confirmations/resend', {
+      method: 'POST',
+      headers,
+      json: { comedianId: lena.id, weekStart: dash.week.weekStart },
+    });
+    expect(await readJson<ResendConfirmationResponse>(res)).toEqual({ status: 'outbox', bookingCount: 1 });
+    expect(emailsTo(t.db, 'lena@example.com')[0]!.bodyText).toContain('1 AM (early Sat, Nov 7)');
+  });
+
+  it('the dashboard nudge, the day board and Send agree, so Send clears the nudge', async () => {
+    const [john, maria, keisha] = ['john', 'maria', 'keisha'].map((n) => createComedian(t.db, { email: `${n}@example.com` }));
+    // Never emailed: Friday 9 PM (already played), Friday's 1 AM show (ahead) and Saturday 8 PM.
+    createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-06', startMin: 1260 }).id, comedianId: john!.id });
+    createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-06', startMin: 1500 }).id, comedianId: maria!.id });
+    createBooking(t.db, { showId: createShow(t.db, { date: '2026-11-07', startMin: 1200 }).id, comedianId: keisha!.id });
+
+    const nudges = async () => {
+      const dash = await readJson<DashboardResponse>(await t.request('/api/dashboard', { headers }));
+      const day = await readJson<DayResponse>(await t.request('/api/days/2026-11-07', { headers }));
+      return [dash.week.confirmations.unsentBookings, day.unsentThisWeek.count];
+    };
+    expect(await nudges()).toEqual([2, 2]);
+
+    const send = await t.request('/api/confirmations/send', {
+      method: 'POST',
+      headers,
+      json: { weekStart: '2026-11-02', onlyUnsent: true },
+    });
+    expect((await readJson<SendConfirmationsResponse>(send)).comedianIds.sort()).toEqual([maria!.id, keisha!.id].sort());
+    expect(emailsTo(t.db, 'john@example.com')).toHaveLength(0);
+    expect(await nudges()).toEqual([0, 0]);
   });
 });
 

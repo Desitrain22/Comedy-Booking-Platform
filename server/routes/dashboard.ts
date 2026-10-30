@@ -4,6 +4,7 @@
  *   GET  /api/dashboard                                 DashboardResponse
  *   POST /api/confirmations/send      {weekStart, onlyUnsent?}   → SendConfirmationsResponse
  *   POST /api/confirmations/resend    {comedianId, weekStart}    → ResendConfirmationResponse
+ *                                     (archived comedian → `{status: 'archived'}`, nothing sent)
  *   POST /api/availability-requests   {month, audience, message, kind} → 201 CreateAvailabilityRequestResponse
  *   GET  /api/availability-requests[?month]             AvailabilityRequestSummary[]
  *   GET  /api/availability-requests/preview?month&message[&kind][&audience] → AvailabilityRequestPreview
@@ -55,7 +56,12 @@ dashboardRoutes.post('/confirmations/send', requireBooker, validate('json', send
 dashboardRoutes.post('/confirmations/resend', requireBooker, validate('json', resendConfirmationSchema), async (c) => {
   const db = c.var.db;
   const { comedianId, weekStart } = c.req.valid('json');
-  orNotFound(db.select({ id: comedians.id }).from(comedians).where(eq(comedians.id, comedianId)).get(), 'Comedian');
+  const comedian = orNotFound(
+    db.select({ id: comedians.id, archived: comedians.archived }).from(comedians).where(eq(comedians.id, comedianId)).get(),
+    'Comedian',
+  );
+  // Archived comedians are never emailed; say so instead of a misleading "nothing to confirm".
+  if (comedian.archived) return c.json({ status: 'archived', bookingCount: 0 } satisfies ResendConfirmationResponse);
   const result = await sendConfirmationToComedian(db, comedianId, weekStart);
   return c.json(result satisfies ResendConfirmationResponse);
 });

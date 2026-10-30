@@ -5,6 +5,7 @@
 import {
   KeyboardSensor,
   MouseSensor,
+  type DraggableSyntheticListeners,
   pointerWithin,
   rectIntersection,
   TouchSensor,
@@ -13,6 +14,7 @@ import {
   type CollisionDetection,
   type KeyboardCoordinateGetter,
 } from '@dnd-kit/core';
+import { useMemo, useRef, type SyntheticEvent } from 'react';
 import type { LineupSource, LineupTarget } from './lineupModel';
 
 /** Data on a draggable: the source plus a label for screen-reader announcements. */
@@ -79,3 +81,24 @@ export function useLineupSensors() {
 export const SCREEN_READER_INSTRUCTIONS =
   'To pick up a comedian, press Space. Use the arrow keys to move between slots, Space to drop, ' +
   'Escape to cancel. Or press Enter to select, then Enter on a slot. In a lineup, Delete removes them.';
+
+type Handler = (event: SyntheticEvent) => void;
+
+/**
+ * dnd-kit hands every draggable a new `listeners` object when a drag starts, which would
+ * re-render every memoized chip and pool card on pickup (UX D18). These proxies keep one
+ * identity for the component's life and call whatever dnd-kit's latest listeners are.
+ */
+export function useStableListeners(listeners: DraggableSyntheticListeners): Record<string, Handler> {
+  const latest = useRef(listeners);
+  latest.current = listeners;
+  return useMemo(() => {
+    const call = (name: string) => (event: SyntheticEvent) => (latest.current?.[name] as Handler | undefined)?.(event);
+    return {
+      onPointerDown: call('onPointerDown'),
+      onMouseDown: call('onMouseDown'),
+      onTouchStart: call('onTouchStart'),
+      onKeyDown: call('onKeyDown'),
+    };
+  }, []);
+}

@@ -2,7 +2,7 @@
  * Small pieces around the board: the drag overlay preview, the click-to-place selection bar,
  * the status legend and the loading skeleton.
  */
-import { Ban, Check, CornerDownLeft, TriangleAlert, Undo2, X } from 'lucide-react';
+import { Ban, Check, Clock, CornerDownLeft, TriangleAlert, Undo2, X } from 'lucide-react';
 import type { ComponentProps, CSSProperties } from 'react';
 import type { DayResponse } from '../../../shared/api/lineup';
 import { BOOKING_STATUSES, BOOKING_STATUS_SHORT_LABELS } from '../../../shared/bookingStatus';
@@ -30,7 +30,7 @@ export function DragPreview({ day, source, plan }: { day: DayResponse; source: L
       ? { icon: TriangleAlert, text: 'Not available', className: 'text-awaiting-fg' }
       : plan.kind === 'move' && plan.swapWith
         ? { icon: Check, text: `Swap with ${plan.swapWith.comedianName.split(' ')[0]}`, className: 'text-accent' }
-        : plan.kind === 'book' && plan.replacing
+        : plan.replacing
           ? { icon: Check, text: `Replace ${plan.replacing.comedianName.split(' ')[0]}`, className: 'text-accent' }
           : { icon: Check, text: plan.kind === 'move' ? 'Move here' : 'Book', className: 'text-available-fg' };
   } else if (plan?.kind === 'unbook') {
@@ -88,7 +88,12 @@ export function SelectionBar({
     }
   } else if (selection?.kind === 'slot') {
     const show = index.shows.get(selection.showId);
-    if (show) message = `Slot ${selection.position + 1} of the ${showTitle(show)}. Pick a comedian from the list.`;
+    const occupant = show?.bookings.find((b) => b.position === selection.position);
+    if (show && occupant) {
+      message = `Replacing ${occupant.comedianName}${occupant.declinedAt != null ? ' (declined)' : ''} in the ${showTitle(show)}. Pick a comedian from the list.`;
+    } else if (show) {
+      message = `Slot ${selection.position + 1} of the ${showTitle(show)}. Pick a comedian from the list.`;
+    }
   }
 
   return (
@@ -123,10 +128,12 @@ export function SelectionBar({
 // Legend
 // ---------------------------------------------------------------------------
 
-export function StatusLegend({ className }: { className?: string }) {
+/** `showDeclined`: declines are on, or someone declined a spot on this day. */
+export function StatusLegend({ className, showDeclined = false }: { className?: string; showDeclined?: boolean }) {
+  const statuses = BOOKING_STATUSES.filter((s) => s !== 'declined' || showDeclined);
   return (
     <ul className={cn('flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-muted', className)} aria-label="Legend">
-      {BOOKING_STATUSES.map((status) => (
+      {statuses.map((status) => (
         <li key={status} className="flex items-center gap-1.5">
           <span aria-hidden className={cn('size-2 rounded-full', BOOKING_STATUS_CLASSES[status].dot)} />
           {status === 'unconfirmed_today' ? 'Unconfirmed today' : BOOKING_STATUS_SHORT_LABELS[status]}
@@ -136,7 +143,11 @@ export function StatusLegend({ className }: { className?: string }) {
         <TriangleAlert aria-hidden className="size-3.5 text-awaiting" strokeWidth={2.25} />
         Booked anyway
       </li>
-      <li className="hidden items-center gap-1 min-[1400px]:flex">
+      <li className="flex items-center gap-1">
+        <Clock aria-hidden className="size-3.5 text-awaiting" strokeWidth={2.25} />
+        Also booked within 90 min
+      </li>
+      <li className="hidden items-center gap-1 min-[1600px]:flex">
         <CornerDownLeft aria-hidden className="size-3.5" />
         Click to select, click a slot to place
       </li>

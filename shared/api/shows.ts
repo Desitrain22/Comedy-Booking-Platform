@@ -9,12 +9,19 @@
  *   PATCH  /api/shows/:id                      UpdateShowInput → UpdateShowResponse
  *                                              (409 `slots_occupied` {minSlotCount},
  *                                               409 `duplicate_show` {showId})
+ *                                              `applyToMatching`: name/time/slots also go to the
+ *                                              month's other matching shows (`matchingShowsWhere`)
  *   DELETE /api/shows/:id                      OkResponse (409 `has_bookings` {bookingCount})
+ *   POST   /api/shows/bulk-delete              {ids} → BulkDeleteShowsResponse (only shows with
+ *                                              no bookings are deleted: Undo of a bulk create)
+ *   POST   /api/shows/bulk-status              {ids, status} → BulkShowStatusResponse
+ *                                              ("Cancel all shows this day" and its Undo)
  */
 import { z } from 'zod';
+import type { AvailabilityRange } from '../availability';
 import type { BookingStatus } from '../bookingStatus';
 import { dateSchema, idSchema, monthSchema, queryIdListSchema } from '../schemas';
-import { diffDays } from '../time';
+import { diffDays, monthOf, weekdayOf } from '../time';
 import { SHOW_STATUSES, type ConfirmedBy, type ShowStatus } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -100,7 +107,10 @@ export const copyPatternSchema = z
   .refine((v) => v.fromMonth !== v.toMonth, { message: 'Pick two different months', path: ['toMonth'] });
 export type CopyPatternInput = z.input<typeof copyPatternSchema>;
 
-/** `PATCH /api/shows/:id`: any subset. */
+/**
+ * `PATCH /api/shows/:id`: any subset. `applyToMatching` also applies the name, start time and
+ * slot count (not notes or status) to the other shows `isMatchingShow` picks.
+ */
 export const updateShowSchema = z
   .object({
     name: showNameSchema,
@@ -109,8 +119,45 @@ export const updateShowSchema = z
     notes: showNotesSchema,
     status: z.enum(SHOW_STATUSES),
   })
-  .partial();
+  .partial()
+  .extend({ applyToMatching: z.boolean().optional() });
 export type UpdateShowInput = z.input<typeof updateShowSchema>;
+
+/** The fields "Apply to all matching shows this month" carries over. */
+export const MATCHING_SHOW_FIELDS = ['name', 'startMin', 'slotCount'] as const;
+
+/**
+ * "All matching shows this month" for `show`: other scheduled shows at the same location, on
+ * the same weekday at the same start time, in the same month, from `today` on.
+ */
+export function isMatchingShow(
+  show: Pick<ShowDto, 'id' | 'locationId' | 'date' | 'startMin'>,
+  other: Pick<ShowDto, 'id' | 'locationId' | 'date' | 'startMin' | 'status'>,
+  today: string,
+): boolean {
+  return (
+    other.id !== show.id &&
+    other.status === 'scheduled' &&
+    other.locationId === show.locationId &&
+    other.startMin === show.startMin &&
+    monthOf(other.date) === monthOf(show.date) &&
+    weekdayOf(other.date) === weekdayOf(show.date) &&
+    other.date >= today
+  );
+}
+
+/** `POST /api/shows/bulk-delete`. */
+export const bulkDeleteShowsSchema = z.object({
+  ids: z.array(idSchema).min(1, 'Pick at least one show').max(BULK_DATES_MAX, `At most ${BULK_DATES_MAX} shows at a time`),
+});
+export type BulkDeleteShowsInput = z.input<typeof bulkDeleteShowsSchema>;
+
+/** `POST /api/shows/bulk-status`. */
+export const bulkShowStatusSchema = z.object({
+  ids: z.array(idSchema).min(1, 'Pick at least one show').max(BULK_DATES_MAX, `At most ${BULK_DATES_MAX} shows at a time`),
+  status: z.enum(SHOW_STATUSES),
+});
+export type BulkShowStatusInput = z.input<typeof bulkShowStatusSchema>;
 
 
 // ---------------------------------------------------------------------------
@@ -160,6 +207,12 @@ export interface ShowBookingSummary {
   confirmationSentAt: number | null;
   confirmedAt: number | null;
   confirmedBy: ConfirmedBy | null;
+  declinedAt: number | null;
+  /** What the comedian marked for the show's date (null = nothing), so the editor can warn
+   *  who a new start time leaves unavailable before saving. */
+  availability: AvailabilityRange | null;
+  /** Whether they submitted availability for the show's month. */
+  submittedMonth: boolean;
 }
 
 /** `GET /api/shows/:id` */
@@ -170,10 +223,51 @@ export interface ShowDetail extends ShowDto {
   minSlotCount: number;
 }
 
+/** A booked comedian a new start time falls outside of (now flagged "booked anyway"). */
+export interface TimeChangeConflict {
+  showId: number;
+  bookingId: number;
+  comedianId: number;
+  comedianName: string;
+  availability: AvailabilityRange | null;
+  submittedMonth: boolean;
+}
+
+/** Why a matching show was left alone by `applyToMatching`. */
+export interface MatchingShowSkipped {
+  id: number;
+  date: string;
+  /** `duplicate_show`: another show is already there at the new time; `slots_occupied`: a
+   *  booked slot is beyond the new slot count. */
+  reason: 'duplicate_show' | 'slots_occupied';
+}
+
 /** `PATCH /api/shows/:id` */
 export interface UpdateShowResponse extends ShowDetail {
-  /** Bookings whose confirmation was cleared because the start time changed. */
+  /** Bookings whose confirmation was cleared because the start time changed (all shows). */
   confirmationsReset: number;
+  /** Comedians the new time leaves unavailable who weren't flagged before (all shows). */
+  newlyUnavailable: TimeChangeConflict[];
+  /** With `applyToMatching`: the other shows updated and skipped; else null. */
+  matching: { updatedIds: number[]; skipped: MatchingShowSkipped[] } | null;
+}
+
+/** `POST /api/shows/bulk-delete` */
+export interface BulkDeleteShowsResponse {
+  deleted: number[];
+  /** Shows left in place because they have bookings now. */
+  kept: { id: number; bookingCount: number }[];
+}
+
+/** `POST /api/shows/bulk-status` */
+export interface BulkShowStatusResponse {
+  /** Shows whose status this request changed. */
+  updatedIds: number[];
+  /**
+   * Restoring would double-book a location and time (`duplicate_show`), the id is unknown,
+   * or the show already had that status (`unchanged`).
+   */
+  skipped: { id: number; reason: 'duplicate_show' | 'not_found' | 'unchanged' }[];
 }
 
 export type SkipReason = 'duplicate' | 'past';

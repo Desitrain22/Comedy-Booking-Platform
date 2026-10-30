@@ -3,7 +3,12 @@
  * *today in the club timezone*, so the dashboard always has something to show:
  * shows for the current and next month, availability for ~70% of comedians, bookings for
  * this week and next (confirmed / awaiting / not sent), today's unconfirmed spots,
- * a few "booked anyway" overrides, notes and availability requests.
+ * a few "booked anyway" overrides, a few of this week's spots booked after the weekly
+ * confirmations went out (never emailed: the dashboard's "haven't been emailed yet" nudge
+ * and the daily catch-up), notes and availability requests. Declines stay off.
+ *
+ * "Today" is the club *night* (clubNightDate): seeding at 1 AM fills last night, which is
+ * what the dashboard shows until 6 AM.
  *
  * Deterministic for a given date (seeded PRNG). Safe to run while the server is running.
  */
@@ -12,8 +17,10 @@ import { isAvailableFor, type AvailabilityRange } from '../../shared/availabilit
 import {
   addDays,
   addMonths,
+  clubNightDate,
   daysInMonth,
   monthOf,
+  nowMinutesInTz,
   todayInTz,
   weekStartOf,
   weekdayOf,
@@ -28,6 +35,8 @@ const CLUB = 'The Laugh Track';
 const TZ = 'America/New_York';
 const PASSWORD = 'comedy123';
 const DAY = 86_400_000;
+/** Confirmation emails (weekly send + daily catch-up) go out at 10 AM club time. */
+const CONFIRMATION_TIME_MIN = 600;
 
 // ---------------------------------------------------------------------------
 // Deterministic randomness
@@ -196,18 +205,31 @@ interface SeedSummary {
   bookings: number;
   unconfirmedToday: number;
   overrides: number;
+  /** This week's bookings made after the weekly send (never emailed). */
+  notEmailed: number;
   comedians: number;
 }
 
 function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
-  const today = todayInTz(TZ, new Date(now));
+  const today = clubNightDate(TZ, new Date(now));
   const thisMonth = monthOf(today);
   const nextMonth = addMonths(thisMonth, 1);
   const thisWeek = weekStartOf(today);
 
   // Settings ------------------------------------------------------------------
   tx.insert(t.settings)
-    .values({ id: 1, clubName: CLUB, timezone: TZ, appUrl: defaultAppUrl(), setupComplete: true, createdAt: now - 120 * DAY })
+    .values({
+      id: 1,
+      clubName: CLUB,
+      timezone: TZ,
+      appUrl: defaultAppUrl(),
+      confirmationDay: 1,
+      confirmationTimeMin: CONFIRMATION_TIME_MIN,
+      catchUpEnabled: true,
+      allowDeclines: false,
+      setupComplete: true,
+      createdAt: now - 120 * DAY,
+    })
     .run();
 
   // Bookers ---------------------------------------------------------------------
@@ -321,13 +343,17 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
 
   // Bookings (this week + next) -------------------------------------------------
   const bookingWindowEnd = addDays(thisWeek, 13);
-  const mondayConfirmations = zonedTimeToUtc(thisWeek, 600, TZ);
+  const mondayConfirmations = zonedTimeToUtc(thisWeek, CONFIRMATION_TIME_MIN, TZ);
   const confirmationsSentAt = Math.min(mondayConfirmations, now - 2 * 3_600_000);
+  /** A moment after the weekly send and before now: when a late booking was made. */
+  const bookedSinceSend = () => confirmationsSentAt + Math.floor((0.2 + rand() * 0.7) * (now - confirmationsSentAt));
   const todayPattern = ['confirmed', 'awaiting', 'confirmed', 'not_sent'] as const;
   let todayIndex = 0;
   let overrides = 0;
   let bookingCount = 0;
   let unconfirmedToday = 0;
+  let notEmailed = 0;
+  let laterThisWeekShows = 0;
   const bookedOnDate = new Map<string, Set<number>>();
 
   const windowShows = allShows
@@ -358,12 +384,16 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
     }
     // Leave the occasional hole mid-lineup so the board shows empty slots.
     const skip = lineup.length >= 3 && lineup.length < show.slotCount && chance(0.3) ? 2 : -1;
+    // Every third show later this week: its last spot was booked after the weekly send.
+    const laterThisWeek = show.date > today && show.date <= addDays(thisWeek, 6);
+    const lateBookingIndex = laterThisWeek && laterThisWeekShows++ % 3 === 0 ? lineup.length - 1 : -1;
 
     lineup.forEach((entry, i) => {
       const position = skip >= 0 && i >= skip ? i + 1 : i;
       let confirmationSentAt: number | null = null;
       let confirmedAt: number | null = null;
       let confirmedBy: 'comedian' | 'booker' | null = null;
+      let createdAt = now - Math.floor(rand() * 14 + 1) * DAY;
 
       if (show.date < today) {
         confirmationSentAt = confirmationsSentAt;
@@ -376,6 +406,8 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
           confirmedAt = Math.min(now, confirmationsSentAt + 3 * 3_600_000);
           confirmedBy = 'comedian';
         } else unconfirmedToday++;
+      } else if (i === lateBookingIndex) {
+        // Booked after this week's confirmations went out: never emailed.
       } else if (show.date <= addDays(thisWeek, 6)) {
         confirmationSentAt = confirmationsSentAt;
         if (chance(0.55)) {
@@ -385,6 +417,12 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
       } else if (chance(0.15)) {
         confirmedAt = now - Math.floor(rand() * 48) * 3_600_000;
         confirmedBy = 'booker';
+      }
+
+      // This week's never-emailed spots (today's "not sent" ones too) were booked after the send.
+      if (show.date >= today && show.date <= addDays(thisWeek, 6) && confirmationSentAt == null && confirmedAt == null) {
+        createdAt = bookedSinceSend();
+        notEmailed++;
       }
 
       tx.insert(t.bookings)
@@ -397,7 +435,7 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
           confirmationSentAt,
           confirmedAt,
           confirmedBy,
-          createdAt: now - Math.floor(rand() * 14 + 1) * DAY,
+          createdAt,
         })
         .run();
       taken.add(entry.comedianId);
@@ -406,6 +444,14 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
   }
   if (confirmationsSentAt <= now) {
     tx.insert(t.jobRuns).values({ key: `confirmations:${thisWeek}`, ranAt: confirmationsSentAt }).run();
+  }
+  // Today's catch-up already ran (job key = scheduler's catchUpJobKey) if its time has passed,
+  // so the never-emailed spots stay visible on the dashboard until tomorrow's catch-up (or Send).
+  const calendarToday = todayInTz(TZ, new Date(now));
+  if (nowMinutesInTz(TZ, new Date(now)) >= CONFIRMATION_TIME_MIN) {
+    tx.insert(t.jobRuns)
+      .values({ key: `catch-up:${calendarToday}`, ranAt: zonedTimeToUtc(calendarToday, CONFIRMATION_TIME_MIN, TZ) })
+      .run();
   }
 
   // Notes -------------------------------------------------------------------------
@@ -460,6 +506,7 @@ function seed(tx: Tx, passwordHash: string, now: number): SeedSummary {
     bookings: bookingCount,
     unconfirmedToday,
     overrides,
+    notEmailed,
     comedians: comedians.length,
   };
 }
@@ -483,7 +530,8 @@ Seeded "${CLUB}" (${TZ}). Today in the club is ${summary.today}.
               Sign in at /portal/login. With no SMTP configured the code is printed
               in the server console and listed under Settings → Email.
 
-  Data        ${summary.shows} shows, ${summary.bookings} bookings (${summary.unconfirmedToday} unconfirmed today, ${summary.overrides} overrides)
+  Data        ${summary.shows} shows, ${summary.bookings} bookings (${summary.unconfirmedToday} unconfirmed today, ${summary.overrides} overrides,
+              ${summary.notEmailed} booked this week since the confirmations went out)
   Database    ${env.dbFile}
 `);
 }

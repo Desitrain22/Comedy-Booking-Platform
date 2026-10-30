@@ -1,7 +1,13 @@
 /**
  * Booker app shell (/app/*): left nav (Dashboard, Calendar, Comedians, Tags, Settings),
  * club name, and a user menu with sign out. On narrow screens the nav becomes a top bar.
- * Pages render into the <Outlet/>; they own their width (the shell adds only padding).
+ *
+ * Page container (one rule for every booker page): pages render into a container with the
+ * same left edge (the shell's padding) and the same max width (`max-w-7xl`), left-aligned
+ * so the edge never moves between pages. Pages don't set their own width or center
+ * themselves (a page root's own `mx-*`/`max-w-*` are neutralized). A full-width page (the
+ * day board) keeps the left edge but drops the max width by putting `FULL_WIDTH_PAGE` on its
+ * root element: `<div {...FULL_WIDTH_PAGE}>`.
  */
 import {
   CalendarDays,
@@ -38,6 +44,19 @@ const NAV: NavItem[] = [
   { to: '/app/tags', label: 'Tags', icon: Tags },
   { to: '/app/settings', label: 'Settings', icon: Settings },
 ];
+
+/**
+ * Spread on a page's root element to opt out of the container's max width (same left edge,
+ * full width): `<div {...FULL_WIDTH_PAGE}>…</div>`.
+ */
+export const FULL_WIDTH_PAGE = { 'data-page-width': 'full' } as const;
+
+/**
+ * The shared page container. `has-[…]` drops the max width for a FULL_WIDTH_PAGE root; the
+ * `[&>*]` rules make sure a page root never re-centers or narrows itself.
+ */
+const PAGE_CONTAINER =
+  'w-full max-w-7xl has-[>[data-page-width=full]]:max-w-none [&>*]:mx-0! [&>*]:w-full [&>*]:max-w-none!';
 
 function isActive(item: NavItem, pathname: string): boolean {
   if (item.end) return pathname === item.to || pathname === `${item.to}/`;
@@ -151,9 +170,11 @@ export function BookerLayout() {
       </header>
 
       <main className="min-w-0 flex-1 px-4 py-5 md:px-6 md:py-6">
-        <ErrorBoundary resetKey={pathname}>
-          <Outlet />
-        </ErrorBoundary>
+        <div className={PAGE_CONTAINER}>
+          <ErrorBoundary resetKey={pathname}>
+            <Outlet />
+          </ErrorBoundary>
+        </div>
       </main>
     </div>
   );

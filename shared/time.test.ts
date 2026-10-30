@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   addDays,
   addMonths,
+  afterMidnightLabel,
+  clubNightDate,
   datesBetween,
   datesForWeekday,
   daysInMonth,
@@ -12,6 +14,8 @@ import {
   formatMonthLong,
   formatRange,
   formatRelative,
+  formatShowTime,
+  formatShowWhen,
   formatTime,
   formatTime24,
   formatTimeShort,
@@ -22,6 +26,8 @@ import {
   monthGrid,
   monthOf,
   nowMinutesInTz,
+  planningMonth,
+  showStartDate,
   timeOptions,
   todayInTz,
   weekDates,
@@ -192,10 +198,81 @@ describe('timezones', () => {
     // Minutes past 1440 roll into the next day.
     expect(zonedTimeToUtc('2026-11-06', 1470, 'America/New_York')).toBe(Date.UTC(2026, 10, 7, 5, 30));
     expect(zonedTimeToUtc('2026-11-06', 0, 'UTC')).toBe(Date.UTC(2026, 10, 6));
+    // 2:30 AM doesn't exist on spring-forward day: the first instant after the gap, 3 AM EDT.
+    expect(zonedTimeToUtc('2027-03-14', 150, 'America/New_York')).toBe(Date.UTC(2027, 2, 14, 7, 0));
+    expect(zonedTimeToUtc('2027-03-14', 180, 'America/New_York')).toBe(Date.UTC(2027, 2, 14, 7, 0));
+    // Fall-back 1:30 AM happens twice: the first one (EDT) as before.
+    expect(zonedTimeToUtc('2026-11-01', 90, 'America/New_York')).toBe(Date.UTC(2026, 10, 1, 5, 30));
   });
 
   it('validates timezone names', () => {
     expect(isValidTimeZone('America/New_York')).toBe(true);
     expect(isValidTimeZone('Mars/Olympus_Mons')).toBe(false);
+  });
+});
+
+describe('clubNightDate', () => {
+  // New York is UTC-5 (EST) in mid-November 2026.
+  const at = (iso: string) => new Date(iso);
+
+  it('is the calendar date from 6 AM on', () => {
+    expect(clubNightDate('America/New_York', at('2026-11-09T11:00:00Z'))).toBe('2026-11-09'); // 6:00 AM Mon
+    expect(clubNightDate('America/New_York', at('2026-11-09T04:30:00Z'))).toBe('2026-11-08'); // 11:30 PM Sun
+    expect(clubNightDate('America/New_York', at('2026-11-09T17:00:00Z'))).toBe('2026-11-09'); // noon Mon
+  });
+
+  it('is still the previous night before 6 AM', () => {
+    expect(clubNightDate('America/New_York', at('2026-11-09T05:00:00Z'))).toBe('2026-11-08'); // midnight
+    expect(clubNightDate('America/New_York', at('2026-11-09T06:30:00Z'))).toBe('2026-11-08'); // 1:30 AM Mon
+    expect(clubNightDate('America/New_York', at('2026-11-09T10:59:00Z'))).toBe('2026-11-08'); // 5:59 AM Mon
+    // Across a month boundary.
+    expect(clubNightDate('America/New_York', at('2026-12-01T06:00:00Z'))).toBe('2026-11-30'); // 1 AM Dec 1
+  });
+
+  it('uses the club timezone and a custom cutoff', () => {
+    const instant = at('2026-11-09T09:00:00Z'); // 4 AM New York, 1 AM Los Angeles, 9 AM UTC
+    expect(clubNightDate('America/New_York', instant)).toBe('2026-11-08');
+    expect(clubNightDate('America/Los_Angeles', instant)).toBe('2026-11-08');
+    expect(clubNightDate('UTC', instant)).toBe('2026-11-09');
+    expect(clubNightDate('America/New_York', instant, 0)).toBe('2026-11-09'); // cutoff 0 = calendar date
+    expect(clubNightDate('America/New_York', instant, 180)).toBe('2026-11-09'); // 3 AM cutoff
+  });
+});
+
+describe('planningMonth', () => {
+  it('is next month from the 20th on, else this month', () => {
+    expect(planningMonth('2026-11-01')).toBe('2026-11');
+    expect(planningMonth('2026-11-19')).toBe('2026-11');
+    expect(planningMonth('2026-11-20')).toBe('2026-12');
+    expect(planningMonth('2026-12-31')).toBe('2027-01');
+  });
+});
+
+describe('comedian-facing show times', () => {
+  it('formats shows before midnight plainly', () => {
+    expect(showStartDate('2026-11-08', 1260)).toBe('2026-11-08');
+    expect(afterMidnightLabel('2026-11-08', 1260)).toBeNull();
+    expect(formatShowTime('2026-11-08', 1260)).toBe('9 PM');
+    expect(formatShowWhen('2026-11-08', 1260)).toBe('Sun, Nov 8 · 9 PM');
+    expect(formatShowWhen('2026-11-08', 1410)).toBe('Sun, Nov 8 · 11:30 PM');
+  });
+
+  it('adds the real calendar day to after-midnight shows', () => {
+    expect(showStartDate('2026-11-08', 1500)).toBe('2026-11-09');
+    expect(afterMidnightLabel('2026-11-08', 1500)).toBe('early Mon, Nov 9');
+    expect(formatShowTime('2026-11-08', 1500)).toBe('1 AM (early Mon, Nov 9)');
+    expect(formatShowWhen('2026-11-08', 1500)).toBe('Sun, Nov 8 · 1 AM (early Mon, Nov 9)');
+    expect(formatShowWhen('2026-11-08', 1440)).toBe('Sun, Nov 8 · 12 AM (early Mon, Nov 9)');
+    // Month and year boundaries.
+    expect(formatShowWhen('2026-11-30', 1470)).toBe('Mon, Nov 30 · 12:30 AM (early Tue, Dec 1)');
+    expect(formatShowWhen('2026-12-31', 1530)).toBe('Thu, Dec 31 · 1:30 AM (early Fri, Jan 1)');
+  });
+
+  it('has long-weekday and separator variants for emails', () => {
+    expect(formatShowWhen('2026-11-08', 1500, { weekday: 'long', separator: ' — ' })).toBe(
+      'Sunday, Nov 8 — 1 AM (early Monday, Nov 9)',
+    );
+    expect(formatShowWhen('2026-11-08', 1260, { weekday: 'long' })).toBe('Sunday, Nov 8 · 9 PM');
+    expect(formatShowTime('2026-11-08', 1500, { weekday: 'long' })).toBe('1 AM (early Monday, Nov 9)');
   });
 });

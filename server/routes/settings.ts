@@ -2,14 +2,16 @@
  * F6 Settings API (spec §6 F6). Shapes live in shared/api/settings.ts.
  *
  *   GET  /api/settings                    any booker — never returns the SMTP password
- *   PUT  /api/settings                    any booker — partial update; blank smtpPass keeps it
+ *   PUT  /api/settings                    any booker — partial update; blank smtpPass keeps it.
+ *                                         Email settings + app URL (ADMIN_ONLY_SETTINGS) are admin-only
  *   POST /api/settings/test-email         any booker — sends the test template via sendEmail
+ *                                         (non-admins only to their own address)
  *   GET  /api/email-log, /email-log/:id   admin — holds comedians' sign-in codes and links (how
  *                                         dev users read the outbox)
  *   GET/POST /api/users, PATCH/DELETE /api/users/:id, POST /api/users/:id/resend-invite   admin
  *   GET  /api/backup                      admin — VACUUM INTO a temp file, streamed as a download
  */
-import { and, count, desc, eq, isNotNull, like, ne, or, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, isNotNull, like, ne, or, type SQL } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
@@ -18,12 +20,15 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { isValidAvailabilityRange } from '../../shared/availability';
 import {
+  ADMIN_ONLY_SETTINGS,
+  SMTP_CONNECTION_FIELDS,
   emailLogQuerySchema,
   inviteUserSchema,
   resendInviteSchema,
   testEmailSchema,
   updateSettingsSchema,
   updateUserSchema,
+  type AdminOnlySetting,
   type BookerUserDto,
   type BookerUserStatus,
   type EmailLogDetail,
@@ -33,18 +38,20 @@ import {
   type TestEmailResponse,
 } from '../../shared/api/settings';
 import { emailSchema } from '../../shared/schemas';
+import { weekStartOf } from '../../shared/time';
 import type { OkResponse } from '../../shared/types';
 import { createInvite, regenerateInvite, sendBookerInvite, type InviteResult } from '../auth/invites';
 import { requireAdmin, requireBooker } from '../auth/middleware';
 import { deleteSessionsFor } from '../auth/sessions';
 import type { AppEnv } from '../context';
 import type { DbOrTx } from '../db/client';
-import { emailLog, users, type EmailLogEntry, type User } from '../db/schema';
+import { emailLog, jobRuns, users, type EmailLogEntry, type User } from '../db/schema';
 import { getMailConfig, sendEmail, type SendEmailResult } from '../email/mailer';
 import { testEmail } from '../email/templates';
 import { httpError, orNotFound, parseId } from '../lib/http';
-import { clubToday, getAppUrl, getSettings, updateSettings, type SettingsUpdate } from '../lib/settings';
+import { clubToday, getAppUrl, getSettings, updateSettings, type Settings, type SettingsUpdate } from '../lib/settings';
 import { validate } from '../lib/validate';
+import { confirmationsJobKey } from '../services/scheduler';
 
 export const settingsRoutes = new Hono<AppEnv>();
 
@@ -63,6 +70,14 @@ export function toSettingsDto(db: DbOrTx): SettingsDto {
     .orderBy(desc(emailLog.id))
     .limit(1)
     .get();
+  // Weeks from this one on whose automatic send already ran (job_runs `confirmations:<Monday>`).
+  const thisWeek = confirmationsJobKey(weekStartOf(clubToday(db)));
+  const confirmationWeeksSent = db
+    .select({ key: jobRuns.key })
+    .from(jobRuns)
+    .where(and(like(jobRuns.key, 'confirmations:%'), gte(jobRuns.key, thisWeek)))
+    .all()
+    .map((r) => r.key.slice('confirmations:'.length));
   return {
     clubName: s.clubName,
     timezone: s.timezone,
@@ -86,6 +101,9 @@ export function toSettingsDto(db: DbOrTx): SettingsDto {
     confirmationsEnabled: s.confirmationsEnabled,
     confirmationDay: s.confirmationDay,
     confirmationTimeMin: s.confirmationTimeMin,
+    catchUpEnabled: s.catchUpEnabled,
+    allowDeclines: s.allowDeclines,
+    confirmationWeeksSent,
   };
 }
 
@@ -97,14 +115,52 @@ const SMTP_FIELDS = ['smtpHost', 'smtpUser', 'fromEmail'] as const;
 
 settingsRoutes.get('/settings', requireBooker, (c) => c.json(toSettingsDto(c.var.db)));
 
+/**
+ * The admin-only fields this (validated) body would change. Unchanged values are fine, so a
+ * booker's form may send them back as they are.
+ */
+export function adminOnlyChanges(
+  input: Partial<Record<AdminOnlySetting, unknown>>,
+  current: Settings,
+): AdminOnlySetting[] {
+  return ADMIN_ONLY_SETTINGS.filter((field) => {
+    const value = input[field];
+    if (value === undefined) return false;
+    if (field === 'smtpPass') return typeof value === 'string' && value.trim() !== '';
+    if (field === 'clearSmtpPass') return value === true && current.smtpPass !== '';
+    return value !== current[field];
+  });
+}
+
 settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSchema), (c) => {
   const db = c.var.db;
-  const { smtpPass, clearSmtpPass, ...fields } = c.req.valid('json');
+  const input = c.req.valid('json');
+  const { smtpPass, clearSmtpPass, ...fields } = input;
   const current = getSettings(db);
+
+  // Email settings decide where sign-in links, codes and confirmations go (and hold the SMTP
+  // password); the app URL starts every emailed link. Only admins may redirect them.
+  if (c.var.booker.role !== 'admin') {
+    const blocked = adminOnlyChanges(input, current);
+    if (blocked.length > 0) {
+      throw httpError(403, 'Only admins can change email settings and the app address', 'admin_only', {
+        fields: blocked,
+      });
+    }
+  }
 
   const patch: SettingsUpdate = { ...fields };
   if (clearSmtpPass) patch.smtpPass = '';
   else if (smtpPass !== undefined && smtpPass.trim() !== '') patch.smtpPass = smtpPass;
+  // A saved password is only ever sent to the server it was entered for: pointing the
+  // connection somewhere else without typing it again removes it.
+  if (
+    patch.smtpPass === undefined &&
+    current.smtpPass !== '' &&
+    SMTP_CONNECTION_FIELDS.some((f) => patch[f] !== undefined && patch[f] !== current[f])
+  ) {
+    patch.smtpPass = '';
+  }
 
   // Cross-field checks run against the merged result (the body may hold only one side).
   const merged = { ...current, ...patch };
@@ -182,6 +238,10 @@ settingsRoutes.post('/settings/test-email', requireBooker, validate('json', test
   const db = c.var.db;
   const me = c.var.booker;
   const to = c.req.valid('json').to ?? me.email;
+  // Bookers test with their own inbox; only admins may send it elsewhere.
+  if (to !== me.email && me.role !== 'admin') {
+    throw httpError(403, 'You can only send the test email to yourself', 'forbidden');
+  }
   const config = getMailConfig(db);
   const content = testEmail({ clubName: getSettings(db).clubName, name: to === me.email ? me.name : undefined });
 

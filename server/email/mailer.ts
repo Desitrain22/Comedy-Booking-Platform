@@ -4,10 +4,11 @@
  * and printed to the server console, so the app is fully usable without email.
  * Every message (sent, failed or outbox) is recorded in `email_log`.
  */
+import { and, asc, eq, isNotNull } from 'drizzle-orm';
 import nodemailer, { type Transporter } from 'nodemailer';
 import type { EmailKind, EmailStatus } from '../../shared/types';
 import type { DbOrTx } from '../db/client';
-import { emailLog } from '../db/schema';
+import { emailLog, users } from '../db/schema';
 import { env } from '../env';
 import { getSettings } from '../lib/settings';
 
@@ -18,6 +19,8 @@ export interface SendEmailInput {
   text: string;
   kind: EmailKind;
   comedianId?: number | null;
+  /** Reply-To for this message; defaults to the configured one (`MailConfig.replyTo`). */
+  replyTo?: string;
 }
 
 export interface SendEmailResult {
@@ -76,6 +79,25 @@ export function getMailConfig(db: DbOrTx): MailConfig | null {
 
 export function isEmailConfigured(db: DbOrTx): boolean {
   return getMailConfig(db) !== null;
+}
+
+/**
+ * Reply-To that always reaches a person: the configured one (settings.replyTo or
+ * SMTP_REPLY_TO), else the email of the club's first admin who has signed up, else ''.
+ * For confirmation emails, where "Can't make one? Reply to this email" is the only way out
+ * when declines are off: `sendEmail(db, { …, replyTo: replyToWithAdminFallback(db) || undefined })`.
+ */
+export function replyToWithAdminFallback(db: DbOrTx): string {
+  const configured = (getMailConfig(db)?.replyTo ?? getSettings(db).replyTo).trim();
+  if (configured) return configured;
+  const admin = db
+    .select({ email: users.email })
+    .from(users)
+    .where(and(eq(users.role, 'admin'), isNotNull(users.passwordHash)))
+    .orderBy(asc(users.createdAt), asc(users.id))
+    .limit(1)
+    .get();
+  return admin?.email ?? '';
 }
 
 // ---------------------------------------------------------------------------
@@ -183,7 +205,7 @@ export async function sendEmail(db: DbOrTx, input: SendEmailInput): Promise<Send
     await getTransport(config).sendMail({
       from: config.from || undefined,
       to: input.to,
-      replyTo: config.replyTo || undefined,
+      replyTo: input.replyTo || config.replyTo || undefined,
       subject: input.subject,
       html: input.html,
       text: input.text,

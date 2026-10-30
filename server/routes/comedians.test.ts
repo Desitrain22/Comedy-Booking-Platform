@@ -4,22 +4,26 @@ import {
   checkBulkRows,
   parseBulkLines,
   type BulkAddResult,
+  type BulkLoginLinkResult,
   type BulkUpdateResult,
   type ComedianAvailability,
   type ComedianBooking,
   type ComedianCard,
   type ComedianDetail,
   type ComedianListItem,
+  type CreateComedianResponse,
   type NoteDto,
   type SendLoginLinkResponse,
   type TagSummary,
   type TagWithCount,
 } from '../../shared/api/comedians';
-import { addDays, addMonths, monthOf } from '../../shared/time';
+import { addDays, addMonths, monthOf, planningMonth, weekStartOf } from '../../shared/time';
 import { TAG_PALETTE, type MagicLinkResponse } from '../../shared/types';
+import { issueLoginCode } from '../auth/codes';
 import { createSession } from '../auth/sessions';
-import { comedians, comedianTags, notes, sessions, tags } from '../db/schema';
-import { clubToday } from '../lib/settings';
+import { createConfirmLink, createLoginLink } from '../auth/tokens';
+import { comedians, comedianTags, loginCodes, notes, sessions, tags, tokens } from '../db/schema';
+import { clubNight, clubToday } from '../lib/settings';
 import {
   TEST_APP_URL,
   cookieFrom,
@@ -80,6 +84,7 @@ describe('guards', () => {
     ['POST', '/api/comedians/bulk'],
     ['POST', '/api/comedians/bulk-tag'],
     ['POST', '/api/comedians/bulk-archive'],
+    ['POST', '/api/comedians/bulk-send-login-link'],
     ['GET', '/api/comedians/1'],
     ['PATCH', '/api/comedians/1'],
     ['PUT', '/api/comedians/1/tags'],
@@ -126,9 +131,11 @@ describe('guards', () => {
 // ---------------------------------------------------------------------------
 
 describe('GET /api/comedians', () => {
-  it('lists active comedians by name with tags, next-month submission and upcoming count', async () => {
+  it('lists active comedians by name with tags, planning-month submission and upcoming count', async () => {
     const today = clubToday(t.db);
-    const nextMonth = addMonths(monthOf(today), 1);
+    // The month the club is planning (next month from the 20th on), as on the dashboard (ux#B8).
+    const planning = planningMonth(today);
+    const other = planning === monthOf(today) ? addMonths(planning, 1) : monthOf(today);
     const zed = createComedian(t.db, { name: 'zed Alpha', email: 'zed@example.test' });
     const amy = createComedian(t.db, { name: 'Amy Beta', email: 'amy@example.test' });
     createComedian(t.db, { name: 'Old Timer', email: 'old@example.test', archived: true });
@@ -136,8 +143,8 @@ describe('GET /api/comedians', () => {
     const allStars = createTag(t.db, { name: 'All Stars' });
     tagComedian(t.db, amy.id, hosts.id);
     tagComedian(t.db, amy.id, allStars.id);
-    createSubmission(t.db, amy.id, nextMonth);
-    createSubmission(t.db, zed.id, monthOf(today)); // this month doesn't count
+    createSubmission(t.db, amy.id, planning);
+    createSubmission(t.db, zed.id, other); // another month doesn't count
 
     const location = createLocation(t.db);
     const future = createShow(t.db, { locationId: location.id, date: addDays(today, 3) });
@@ -152,14 +159,14 @@ describe('GET /api/comedians', () => {
       id: amy.id,
       email: 'amy@example.test',
       archived: false,
-      nextMonthSubmitted: true,
+      planningMonthSubmitted: true,
       upcomingCount: 2, // today + future; not past or cancelled
       tags: [
         { id: allStars.id, name: 'All Stars', color: allStars.color },
         { id: hosts.id, name: 'Hosts', color: hosts.color },
       ],
     });
-    expect(list[1]).toMatchObject({ nextMonthSubmitted: false, upcomingCount: 0, tags: [] });
+    expect(list[1]).toMatchObject({ planningMonthSubmitted: false, upcomingCount: 0, tags: [] });
   });
 
   it('includes archived comedians only with archived=1', async () => {
@@ -222,6 +229,29 @@ describe('POST /api/comedians', () => {
       lastLoginAt: null,
     });
     expect(t.db.select().from(comedians).where(eq(comedians.id, body.id)).get()?.email).toBe('jason@example.test');
+  });
+
+  it('creates without emailing unless sendLoginLink is set (ux#A6)', async () => {
+    const quiet = await ok<CreateComedianResponse>(
+      send('POST', '/api/comedians', { name: 'Quiet One', email: 'quiet@example.test' }),
+      201,
+    );
+    expect(quiet.loginLink).toBeNull();
+    expect(emailsTo(t.db, 'quiet@example.test')).toEqual([]);
+
+    const invited = await ok<CreateComedianResponse>(
+      send('POST', '/api/comedians', { name: 'Jason Lee', email: 'jason@example.test', sendLoginLink: true }),
+      201,
+    );
+    expect(invited).toMatchObject({ name: 'Jason Lee', email: 'jason@example.test', loginLink: { status: 'outbox' } });
+    const mail = latestEmail(t.db, 'jason@example.test');
+    expect(mail).toMatchObject({ kind: 'login_link', comedianId: invited.id, status: 'outbox' });
+    // The link in the email signs them in.
+    const token = /\/portal\/magic\/([A-Za-z0-9_-]+)/.exec(mail!.bodyText)?.[1];
+    const magic = await send('POST', '/api/auth/magic', { token }, { cookie: '' });
+    expect((await ok<MagicLinkResponse>(magic)).comedian.id).toBe(invited.id);
+
+    expect((await send('POST', '/api/comedians', { name: 'X', email: 'x@example.test', sendLoginLink: 'yes' })).status).toBe(400);
   });
 
   it('409s email_taken (case-insensitively, including archived comedians)', async () => {
@@ -307,6 +337,39 @@ describe('GET/PATCH /api/comedians/:id', () => {
     await ok(send('PATCH', `/api/comedians/${comic.id}`, { archived: false }));
     expect((await ok<ComedianListItem[]>(get('/api/comedians'))).map((c) => c.id)).toEqual([comic.id]);
   });
+
+  it('changing the email signs them out and voids old links and codes (security#6)', async () => {
+    const comic = createComedian(t.db, { name: 'Jason', email: 'old@example.test' });
+    const other = createComedian(t.db, { name: 'Other', email: 'other@example.test' });
+    const { headers: comedianHeaders } = await loginAsComedian(t, comic.id);
+    const { headers: otherHeaders } = await loginAsComedian(t, other.id);
+    const magicUrl = createLoginLink(t.db, comic.id);
+    createConfirmLink(t.db, comic.id, weekStartOf(clubToday(t.db)));
+    createLoginLink(t.db, other.id);
+    expect(issueLoginCode(t.db, comic.id).ok).toBe(true);
+    expect(issueLoginCode(t.db, other.id).ok).toBe(true);
+    const mine = <T extends { comedianId: number }>(rows: T[]) => rows.filter((r) => r.comedianId === comic.id);
+    expect(mine(t.db.select().from(tokens).all())).toHaveLength(2);
+
+    // Editing anything else keeps them signed in.
+    await ok(send('PATCH', `/api/comedians/${comic.id}`, { name: 'Jason Lee', email: 'OLD@example.test' }));
+    expect((await readJson<{ comedian: unknown }>(await get('/api/auth/me', comedianHeaders))).comedian).not.toBeNull();
+    expect(mine(t.db.select().from(tokens).all())).toHaveLength(2);
+
+    const updated = await ok<ComedianDetail>(send('PATCH', `/api/comedians/${comic.id}`, { email: 'new@example.test' }));
+    expect(updated.email).toBe('new@example.test');
+    // Old session, magic/confirm links and login codes are gone…
+    expect((await readJson<{ comedian: unknown }>(await get('/api/auth/me', comedianHeaders))).comedian).toBeNull();
+    expect(t.db.select().from(sessions).all().filter((r) => r.kind === 'comedian' && r.subjectId === comic.id)).toEqual([]);
+    expect(mine(t.db.select().from(tokens).all())).toEqual([]);
+    expect(mine(t.db.select().from(loginCodes).all())).toEqual([]);
+    const token = /\/portal\/magic\/([A-Za-z0-9_-]+)/.exec(magicUrl)![1];
+    expect((await send('POST', '/api/auth/magic', { token }, { cookie: '' })).status).not.toBe(200);
+    // …while other comedians are untouched.
+    expect((await readJson<{ comedian: unknown }>(await get('/api/auth/me', otherHeaders))).comedian).not.toBeNull();
+    expect(t.db.select().from(tokens).all().filter((r) => r.comedianId === other.id)).toHaveLength(1);
+    expect(t.db.select().from(loginCodes).all().filter((r) => r.comedianId === other.id)).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -387,6 +450,33 @@ describe('bulk add', () => {
     const again = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows: [rows[0], rows[5]] }));
     expect(again.created).toEqual([]);
     expect(again.skipped.map((s) => s.reason)).toEqual(['email_taken', 'email_taken']);
+  });
+
+  it('emails sign-in links to the comedians it creates when sendLoginLinks is set (ux#A6)', async () => {
+    createComedian(t.db, { name: 'Already Here', email: 'here@example.test' });
+    const rows = [
+      { name: 'New One', email: 'one@example.test' },
+      { name: 'Here Again', email: 'here@example.test' },
+      { name: 'New Two', email: 'two@example.test' },
+    ];
+    const preview = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows, dryRun: true, sendLoginLinks: true }));
+    expect(preview.loginLinks).toBeNull();
+    expect(emailsTo(t.db)).toEqual([]);
+
+    const result = await ok<BulkAddResult>(send('POST', '/api/comedians/bulk', { rows, sendLoginLinks: true }), 201);
+    expect(result.loginLinks).toEqual({ sent: 0, outbox: 2, failed: 0, skipped: 0 });
+    expect(emailsTo(t.db).map((m) => [m.toEmail, m.kind]).sort()).toEqual([
+      ['one@example.test', 'login_link'],
+      ['two@example.test', 'login_link'],
+    ]);
+
+    // Without the flag nobody is emailed.
+    const quiet = await ok<BulkAddResult>(
+      send('POST', '/api/comedians/bulk', { rows: [{ name: 'Three', email: 'three@example.test' }] }),
+      201,
+    );
+    expect(quiet.loginLinks).toBeNull();
+    expect(emailsTo(t.db, 'three@example.test')).toEqual([]);
   });
 
   it('validates the envelope', async () => {
@@ -644,8 +734,9 @@ describe('GET /api/comedians/:id/availability', () => {
     const jan = await ok<ComedianAvailability>(get(`/api/comedians/${comic.id}/availability?month=2027-01`));
     expect(jan).toMatchObject({ entries: [], submittedAt: null, bookings: [] });
 
+    // No month → the planning month (next month from the 20th on), like the portal (ux#B8).
     const current = await ok<ComedianAvailability>(get(`/api/comedians/${comic.id}/availability`));
-    expect(current.month).toBe(monthOf(clubToday(t.db)));
+    expect(current.month).toBe(planningMonth(clubToday(t.db)));
     expect(current.today).toBe(clubToday(t.db));
 
     expect((await get(`/api/comedians/${comic.id}/availability?month=2026-13`)).status).toBe(400);
@@ -653,8 +744,8 @@ describe('GET /api/comedians/:id/availability', () => {
 });
 
 describe('GET /api/comedians/:id/bookings', () => {
-  it('upcoming=1 lists scheduled spots from today on, soonest first, with derived status', async () => {
-    const today = clubToday(t.db);
+  it('upcoming=1 lists scheduled spots from tonight on, soonest first, with derived status', async () => {
+    const today = clubNight(t.db); // the club night: still yesterday before 6 AM
     const comic = createComedian(t.db);
     const cellar = createLocation(t.db, { name: 'The Cellar', address: '1 Main St', color: '#7c5cff' });
     const tonight = createShow(t.db, { locationId: cellar.id, date: today, startMin: 1140, name: 'Early' });
@@ -721,6 +812,36 @@ describe('POST /api/comedians/:id/send-login-link', () => {
     const res = await send('POST', `/api/comedians/${comic.id}/send-login-link`);
     expect(res.status).toBe(409);
     expect(await readJson(res)).toMatchObject({ code: 'archived' });
+    expect(emailsTo(t.db)).toEqual([]);
+  });
+});
+
+describe('POST /api/comedians/bulk-send-login-link (ux#A6)', () => {
+  it('emails each selected active comedian a working sign-in link and skips archived ones', async () => {
+    const a = createComedian(t.db, { name: 'Amy Beta', email: 'amy@example.test' });
+    const b = createComedian(t.db, { name: 'Bo Chen', email: 'bo@example.test' });
+    const gone = createComedian(t.db, { name: 'Old Timer', email: 'old@example.test', archived: true });
+    createComedian(t.db, { name: 'Not Selected', email: 'nope@example.test' });
+
+    const res = await ok<BulkLoginLinkResult>(
+      send('POST', '/api/comedians/bulk-send-login-link', { comedianIds: [a.id, b.id, gone.id, a.id] }),
+    );
+    expect(res).toEqual({ sent: 0, outbox: 2, failed: 0, skipped: 1 });
+    expect(emailsTo(t.db).map((m) => m.toEmail).sort()).toEqual(['amy@example.test', 'bo@example.test']);
+    expect(emailsTo(t.db).every((m) => m.kind === 'login_link')).toBe(true);
+
+    const mail = latestEmail(t.db, 'bo@example.test')!;
+    const token = /\/portal\/magic\/([A-Za-z0-9_-]+)/.exec(mail.bodyText)?.[1];
+    const magic = await send('POST', '/api/auth/magic', { token }, { cookie: '' });
+    expect((await ok<MagicLinkResponse>(magic)).comedian.id).toBe(b.id);
+  });
+
+  it('validates the ids', async () => {
+    const a = createComedian(t.db);
+    expect((await send('POST', '/api/comedians/bulk-send-login-link', { comedianIds: [] })).status).toBe(400);
+    const unknown = await send('POST', '/api/comedians/bulk-send-login-link', { comedianIds: [a.id, 999] });
+    expect(unknown.status).toBe(400);
+    expect(await readJson(unknown)).toMatchObject({ code: 'unknown_comedian', missing: [999] });
     expect(emailsTo(t.db)).toEqual([]);
   });
 });

@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { eq } from 'drizzle-orm';
 import { mkdtempSync, readdirSync, writeFileSync } from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import type { SendMailOptions, Transporter } from 'nodemailer';
@@ -15,9 +16,11 @@ import type {
 } from '../../shared/api/settings';
 import type { ApiErrorBody, MeResponse } from '../../shared/types';
 import { createInvite } from '../auth/invites';
-import { notes, sessions, users } from '../db/schema';
+import { addDays, weekStartOf } from '../../shared/time';
+import { jobRuns, notes, sessions, users } from '../db/schema';
 import { setTransportFactory } from '../email/mailer';
-import { getSettings, updateSettings } from '../lib/settings';
+import { clubToday, getSettings, updateSettings } from '../lib/settings';
+import { catchUpJobKey, confirmationsJobKey } from '../services/scheduler';
 import {
   TEST_APP_URL,
   createComedian,
@@ -164,14 +167,33 @@ describe('GET/PUT /api/settings', () => {
 
   it('keeps the saved password when smtpPass is blank or omitted, replaces it when given, clears it on request', async () => {
     configureSmtp();
-    expect((await put({ smtpHost: 'smtp.other.test', smtpPass: '' })).status).toBe(200);
+    expect((await put({ smtpPass: '   ', fromName: 'Bookings' })).status).toBe(200);
+    expect(getSettings(t.db).smtpPass).toBe('hunter2-secret');
+
+    // Sending the connection fields back unchanged (the Email tab always does) keeps it too.
+    expect(
+      (await put({ smtpHost: 'smtp.example.test', smtpPort: 465, smtpSecure: true, smtpUser: 'mailer@example.test', smtpPass: '' }))
+        .status,
+    ).toBe(200);
+    expect(getSettings(t.db).smtpPass).toBe('hunter2-secret');
+
+    // A new server/port/security/username without the password again removes the saved one:
+    // it is only ever sent to the server it was entered for (security#1).
+    for (const change of [
+      { smtpHost: 'smtp.other.test' },
+      { smtpPort: 587 },
+      { smtpSecure: false },
+      { smtpUser: 'new@example.test' },
+    ]) {
+      configureSmtp();
+      expect((await put({ ...change, smtpPass: '' })).status).toBe(200);
+      expect(getSettings(t.db).smtpPass, JSON.stringify(change)).toBe('');
+      expect((await getSettingsDto()).smtpPassSet).toBe(false);
+    }
+    // …unless it comes with the password.
+    configureSmtp();
+    expect((await put({ smtpHost: 'smtp.other.test', smtpPass: 'hunter2-secret' })).status).toBe(200);
     expect(getSettings(t.db)).toMatchObject({ smtpHost: 'smtp.other.test', smtpPass: 'hunter2-secret' });
-
-    expect((await put({ smtpPass: '   ' })).status).toBe(200);
-    expect(getSettings(t.db).smtpPass).toBe('hunter2-secret');
-
-    expect((await put({ smtpUser: 'new@example.test' })).status).toBe(200);
-    expect(getSettings(t.db).smtpPass).toBe('hunter2-secret');
 
     const replaced = await readJson<SettingsDto>(await put({ smtpPass: 'abcd efgh ijkl mnop' }));
     expect(replaced.smtpPassSet).toBe(true);
@@ -211,7 +233,46 @@ describe('GET/PUT /api/settings', () => {
       name: 'The Laugh Track',
       timezone: 'America/Los_Angeles',
       allNight: { startMin: 1200, endMin: 1440 },
+      allowDeclines: false,
     });
+  });
+
+  it('lists the weeks (this one on) whose automatic send already ran, for the Confirmations tab', async () => {
+    const thisWeek = weekStartOf(clubToday(t.db));
+    expect((await getSettingsDto()).confirmationWeeksSent).toEqual([]);
+    for (const week of [addDays(thisWeek, -7), thisWeek, addDays(thisWeek, 7)]) {
+      t.db.insert(jobRuns).values({ key: confirmationsJobKey(week), ranAt: 1 }).run();
+    }
+    t.db.insert(jobRuns).values({ key: catchUpJobKey(thisWeek), ranAt: 1 }).run();
+    expect((await getSettingsDto()).confirmationWeeksSent).toEqual([thisWeek, addDays(thisWeek, 7)]);
+  });
+
+  it('defaults catch-up on and declines off, saves both, and exposes allowDeclines as club info', async () => {
+    expect(await getSettingsDto()).toMatchObject({ catchUpEnabled: true, allowDeclines: false });
+
+    const res = await put({ catchUpEnabled: false, allowDeclines: true });
+    expect(res.status).toBe(200);
+    expect(await readJson(res)).toMatchObject({ catchUpEnabled: false, allowDeclines: true });
+    expect(getSettings(t.db)).toMatchObject({ catchUpEnabled: false, allowDeclines: true });
+    // Other confirmation settings are untouched by a partial save.
+    expect(await getSettingsDto()).toMatchObject({ confirmationsEnabled: true, confirmationDay: 1, confirmationTimeMin: 600 });
+
+    // Comedians (portal) and bookers learn about declines from the public club info.
+    const comedian = createComedian(t.db);
+    const { headers } = await loginAsComedian(t, comedian.id);
+    const me = await readJson<MeResponse>(await t.request('/api/auth/me', { headers }));
+    expect(me.club.allowDeclines).toBe(true);
+
+    // Any booker can change them; they're booleans only.
+    const booker = await loginAsBooker(t, { role: 'booker' });
+    expect((await put({ allowDeclines: false }, booker.headers)).status).toBe(200);
+    expect(getSettings(t.db).allowDeclines).toBe(false);
+    for (const body of [{ catchUpEnabled: 'yes' }, { allowDeclines: 1 }, { allowDeclines: null }]) {
+      const bad = await put(body);
+      expect(bad.status, JSON.stringify(body)).toBe(400);
+      expect(await readJson(bad)).toMatchObject({ code: 'validation_error' });
+    }
+    expect(getSettings(t.db)).toMatchObject({ catchUpEnabled: false, allowDeclines: false });
   });
 
   it('accepts an empty body and an empty app URL', async () => {
@@ -292,6 +353,141 @@ describe('GET/PUT /api/settings', () => {
   });
 });
 
+describe('email settings and the app URL are admin-only (security#1)', () => {
+  it('rejects a booker changing any of them with 403 admin_only, saving nothing', async () => {
+    configureSmtp();
+    const before = getSettings(t.db);
+    const { headers } = await loginAsBooker(t, { role: 'booker' });
+    for (const json of [
+      { appUrl: 'https://evil.example' },
+      { smtpHost: '127.0.0.1' },
+      { smtpPort: 2525 },
+      { smtpSecure: false },
+      { smtpUser: 'attacker@evil.test' },
+      { smtpPass: 'mine-now' },
+      { clearSmtpPass: true },
+      { fromName: 'IT Support' },
+      { fromEmail: 'it@evil.test' },
+      { replyTo: 'me@evil.test' },
+      // Mixed with allowed fields: the whole request is refused.
+      { clubName: 'Renamed', appUrl: 'https://evil.example' },
+    ]) {
+      const res = await put(json, headers);
+      expect(res.status, JSON.stringify(json)).toBe(403);
+      const body = await readJson<ApiErrorBody & { fields: string[] }>(res);
+      expect(body.code).toBe('admin_only');
+      expect(body.error).toBe('Only admins can change email settings and the app address');
+      expect(body.fields.length).toBe(1);
+    }
+    expect(getSettings(t.db)).toEqual(before);
+  });
+
+  it('lets a booker save other settings, and send email fields back unchanged', async () => {
+    configureSmtp();
+    const { headers } = await loginAsBooker(t, { role: 'booker' });
+    const dto = await getSettingsDto(headers);
+    const res = await put(
+      {
+        clubName: 'Renamed',
+        timezone: 'America/Chicago',
+        allNightStartMin: 1200,
+        appUrl: `${dto.appUrl}/`, // normalised to the saved value
+        smtpHost: dto.smtpHost,
+        smtpPort: dto.smtpPort,
+        smtpSecure: dto.smtpSecure,
+        smtpUser: dto.smtpUser,
+        smtpPass: '',
+        clearSmtpPass: false,
+        fromName: dto.fromName,
+        fromEmail: dto.fromEmail,
+        replyTo: dto.replyTo,
+        confirmationDay: 2,
+        catchUpEnabled: false,
+      },
+      headers,
+    );
+    expect(res.status).toBe(200);
+    expect(getSettings(t.db)).toMatchObject({
+      clubName: 'Renamed',
+      timezone: 'America/Chicago',
+      confirmationDay: 2,
+      catchUpEnabled: false,
+      smtpPass: 'hunter2-secret',
+      appUrl: TEST_APP_URL,
+    });
+  });
+
+  it('the proof of concept: a booker can no longer harvest the SMTP password or relay mail', async () => {
+    // A fake SMTP server that advertises AUTH without TLS and records every line.
+    const captured: string[] = [];
+    const server = net.createServer((sock) => {
+      let inData = false;
+      let buf = '';
+      sock.write('220 evil ESMTP\r\n');
+      sock.on('data', (d) => {
+        buf += d.toString();
+        let i: number;
+        while ((i = buf.indexOf('\r\n')) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          captured.push(line);
+          if (inData) {
+            if (line === '.') {
+              inData = false;
+              sock.write('250 ok\r\n');
+            }
+            continue;
+          }
+          const cmd = line.split(' ')[0]!.toUpperCase();
+          if (cmd === 'EHLO') sock.write('250-evil\r\n250 AUTH PLAIN LOGIN\r\n');
+          else if (cmd === 'AUTH') sock.write('235 ok\r\n');
+          else if (cmd === 'DATA') {
+            inData = true;
+            sock.write('354 go\r\n');
+          } else if (cmd === 'QUIT') {
+            sock.write('221 bye\r\n');
+            sock.end();
+          } else sock.write('250 ok\r\n');
+        }
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as net.AddressInfo).port;
+    const SECRET = 'S3cret-App-Pass';
+    const leaked = () =>
+      captured.some((line) => line.includes(SECRET) || /^AUTH PLAIN /i.test(line) && Buffer.from(line.split(' ')[2] ?? '', 'base64').toString().includes(SECRET));
+
+    try {
+      updateSettings(t.db, {
+        smtpHost: 'smtp.gmail.com',
+        smtpPort: 465,
+        smtpSecure: true,
+        smtpUser: 'club@gmail.com',
+        smtpPass: SECRET,
+      });
+      const booker = await loginAsBooker(t, { role: 'booker' });
+      const attack = await put({ smtpHost: '127.0.0.1', smtpPort: port, smtpSecure: false, appUrl: 'https://evil.example' }, booker.headers);
+      expect(attack.status).toBe(403);
+      expect(getSettings(t.db)).toMatchObject({ smtpHost: 'smtp.gmail.com', smtpPass: SECRET, appUrl: TEST_APP_URL });
+
+      // Even an admin repointing the server (by mistake, or a stolen admin session) doesn't
+      // carry the saved password along: it's removed unless typed again.
+      const repoint = await put({ smtpHost: '127.0.0.1', smtpPort: port, smtpSecure: false });
+      expect(repoint.status).toBe(200);
+      expect(getSettings(t.db).smtpPass).toBe('');
+      const test = await t.request('/api/settings/test-email', { method: 'POST', headers: admin.headers, json: {} });
+      // With no password there's nothing to log in with: the send fails before any AUTH.
+      expect(test.status).toBe(502);
+      expect(await readJson(test)).toMatchObject({ code: 'email_failed', smtpError: expect.stringMatching(/credentials/i) });
+      expect(captured.some((line) => line.startsWith('EHLO'))).toBe(true); // it did reach the server…
+      expect(captured.some((line) => /^AUTH/i.test(line))).toBe(false); // …but never tried to log in
+      expect(leaked()).toBe(false);
+    } finally {
+      server.close();
+    }
+  });
+});
+
 describe('POST /api/settings/test-email', () => {
   it('sends the test email to the signed-in booker', async () => {
     configureSmtp();
@@ -334,6 +530,29 @@ describe('POST /api/settings/test-email', () => {
 
     const bad = await t.request('/api/settings/test-email', { method: 'POST', headers: admin.headers, json: { to: 'x' } });
     expect(bad.status).toBe(400);
+  });
+
+  it('lets bookers send it only to themselves (admins anywhere)', async () => {
+    const { headers } = await loginAsBooker(t, { role: 'booker', email: 'bo@example.test' });
+    const other = await t.request('/api/settings/test-email', {
+      method: 'POST',
+      headers,
+      json: { to: 'victim@elsewhere.test' },
+    });
+    expect(other.status).toBe(403);
+    expect(await readJson(other)).toMatchObject({ code: 'forbidden' });
+    expect(emailsTo(t.db, 'victim@elsewhere.test')).toHaveLength(0);
+
+    const self = await t.request('/api/settings/test-email', { method: 'POST', headers, json: { to: 'BO@example.test' } });
+    expect(self.status).toBe(200);
+    expect(await readJson(self)).toMatchObject({ to: 'bo@example.test' });
+
+    const byAdmin = await t.request('/api/settings/test-email', {
+      method: 'POST',
+      headers: admin.headers,
+      json: { to: 'owner@elsewhere.test' },
+    });
+    expect(byAdmin.status).toBe(200);
   });
 
   it('goes to the outbox when email is not configured', async () => {

@@ -11,6 +11,7 @@ import {
   formatMonthName,
   formatTime,
   monthOf,
+  planningMonth,
   todayInTz,
 } from '../../../shared/time';
 import { MonthGrid } from '../../components/MonthGrid';
@@ -27,8 +28,10 @@ function shortLocation(name: string): string {
 export function AvailabilityCard({ comedianId }: { comedianId: number }) {
   const club = useClub();
   const timezone = club?.timezone ?? 'America/New_York';
-  const thisMonth = monthOf(todayInTz(timezone));
-  const [month, setMonth] = useState(thisMonth);
+  const today = todayInTz(timezone);
+  const thisMonth = monthOf(today);
+  // Opens on the month the club is planning (next month from the 20th on), like the portal.
+  const [month, setMonth] = useState(() => planningMonth(today));
   const query = useQuery(comedianAvailabilityQuery(comedianId, month));
   const data = query.data?.month === month ? query.data : undefined;
 

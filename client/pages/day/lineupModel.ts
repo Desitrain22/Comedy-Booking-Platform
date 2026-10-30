@@ -3,13 +3,14 @@
  * optimistic cache transforms that mirror the server (`server/routes/lineup.ts`), and the
  * plain-text lineup for the clipboard. No React here, so it is unit-tested directly.
  */
-import type {
-  BookingRestore,
-  DayComedian,
-  DayResponse,
-  DayShow,
-  LineupBooking,
-  UnavailableConflict,
+import {
+  BOOKING_OVERLAP_MIN,
+  type BookingRestore,
+  type DayComedian,
+  type DayResponse,
+  type DayShow,
+  type LineupBooking,
+  type UnavailableConflict,
 } from '../../../shared/api/lineup';
 import { availabilityState, isAvailableFor, type AvailabilityState } from '../../../shared/availability';
 import { bookingStatus } from '../../../shared/bookingStatus';
@@ -52,6 +53,8 @@ export type DropPlan =
       position: number;
       /** The booking that trades places, when the target slot is occupied. */
       swapWith: LineupBooking | null;
+      /** A declined occupant in another show: unbooked instead of swapped (Undo restores them). */
+      replacing: LineupBooking | null;
       conflicts: UnavailableConflict[];
     }
   | { kind: 'unbook'; bookingId: number };
@@ -64,7 +67,7 @@ export interface DayIndex {
   shows: Map<number, DayShow>;
   bookings: Map<number, LineupBooking>;
   comedians: Map<number, DayComedian>;
-  /** comedianId → their bookings today, by show time. */
+  /** comedianId → their bookings today, by show time (declined ones included). */
   bookingsByComedian: Map<number, LineupBooking[]>;
 }
 
@@ -137,6 +140,109 @@ export function showFit(day: DayResponse, comedianId: number, show: DayShow): Sh
   return isAvailableFor(comedian.availability, show.startMin) ? 'available' : 'unavailable';
 }
 
+/** Their bookings tonight that still stand (a declined spot doesn't keep them busy). */
+export function activeBookings(day: DayResponse, comedianId: number): LineupBooking[] {
+  return (indexDay(day).bookingsByComedian.get(comedianId) ?? []).filter((b) => b.declinedAt == null);
+}
+
+/** Another booking of theirs the same night, close enough in time to clash. */
+export interface Overlap {
+  booking: LineupBooking;
+  show: DayShow;
+  /** Minutes between the two start times (always < BOOKING_OVERLAP_MIN). */
+  gap: number;
+}
+
+/**
+ * The comedian's closest other (non-declined) booking tonight that starts less than
+ * `BOOKING_OVERLAP_MIN` minutes from `show` — the "Also booked 7 PM · Cellar" warning.
+ * `exceptBookingId`: a booking that is moving into `show` (it won't be where it was).
+ */
+export function overlapFor(
+  day: DayResponse,
+  comedianId: number,
+  show: Pick<DayShow, 'id' | 'startMin'>,
+  exceptBookingId?: number,
+): Overlap | null {
+  const index = indexDay(day);
+  let best: Overlap | null = null;
+  for (const booking of activeBookings(day, comedianId)) {
+    if (booking.showId === show.id || booking.id === exceptBookingId) continue;
+    const other = index.shows.get(booking.showId);
+    if (!other) continue;
+    const gap = Math.abs(other.startMin - show.startMin);
+    if (gap < BOOKING_OVERLAP_MIN && (!best || gap < best.gap)) best = { booking, show: other, gap };
+  }
+  return best;
+}
+
+/**
+ * How a comedian fits one show's time: `fits` (marked a range covering it), `outside` their
+ * marked hours, `unavailable` (submitted the month, left the date blank), `not_marked`
+ * (hasn't submitted), or already `in_show`.
+ */
+export type FitKind = 'in_show' | 'fits' | 'outside' | 'unavailable' | 'not_marked';
+
+export interface FitInfo {
+  kind: FitKind;
+  /** A booking elsewhere tonight starting within `BOOKING_OVERLAP_MIN` minutes. */
+  overlap: Overlap | null;
+  /** Booked in any show tonight (declines don't count). */
+  bookedTonight: boolean;
+  /** Said "can't make it" to a spot tonight: not suggested as free. */
+  declinedTonight: boolean;
+}
+
+/** Declined a spot tonight (any show). */
+export function declinedTonight(day: DayResponse, comedianId: number): boolean {
+  return (indexDay(day).bookingsByComedian.get(comedianId) ?? []).some((b) => b.declinedAt != null);
+}
+
+export function fitFor(day: DayResponse, comedian: DayComedian, show: DayShow): FitInfo {
+  const inShow = show.bookings.some((b) => b.comedianId === comedian.id);
+  const kind: FitKind = inShow
+    ? 'in_show'
+    : isAvailableFor(comedian.availability, show.startMin)
+      ? 'fits'
+      : comedian.availability
+        ? 'outside'
+        : comedian.submittedMonth
+          ? 'unavailable'
+          : 'not_marked';
+  return {
+    kind,
+    overlap: inShow ? null : overlapFor(day, comedian.id, show),
+    bookedTonight: activeBookings(day, comedian.id).length > 0,
+    declinedTonight: declinedTonight(day, comedian.id),
+  };
+}
+
+/** Free for `show`: fits its time, isn't in it, no clash with another booking, didn't decline tonight. */
+export function isFreeFor(fit: FitInfo): boolean {
+  return fit.kind === 'fits' && fit.overlap == null && !fit.declinedTonight;
+}
+
+/** "Heads up: Maria is also booked at 7 PM · The Cellar (30 min earlier)." — or null. */
+export function overlapWarning(
+  day: DayResponse,
+  comedianId: number,
+  show: DayShow,
+  exceptBookingId?: number,
+): string | null {
+  const overlap = overlapFor(day, comedianId, show, exceptBookingId);
+  if (!overlap) return null;
+  const name = indexDay(day).comedians.get(comedianId)?.name ?? overlap.booking.comedianName;
+  const when =
+    overlap.gap === 0 ? 'at the same time' : `${overlap.gap} min ${overlap.show.startMin < show.startMin ? 'earlier' : 'later'}`;
+  return `${firstName(name)} is also booked at ${formatTime(overlap.show.startMin)} · ${overlap.show.location.name} (${when}).`;
+}
+
+/** "7 PM · The Cellar": where a booking is, for badges. */
+export function bookingPlace(day: DayResponse, booking: Pick<LineupBooking, 'showId'>): string {
+  const show = indexDay(day).shows.get(booking.showId);
+  return show ? `${formatTime(show.startMin)} · ${show.location.name}` : '';
+}
+
 // ---------------------------------------------------------------------------
 // Planning a drop
 // ---------------------------------------------------------------------------
@@ -192,6 +298,10 @@ export function planDrop(day: DayResponse, source: LineupSource, target: LineupT
   const sourceShow = index.shows.get(booking.showId)!;
   const sameShow = booking.showId === show.id;
   const conflicts: UnavailableConflict[] = [];
+  // Someone who declined only holds the slot: a comedian from another show replaces them (as
+  // the server does) rather than sending them to a show they never agreed to.
+  const replacing = !sameShow && occupant?.declinedAt != null ? occupant : null;
+  const swapWith = replacing ? null : occupant;
 
   if (!sameShow) {
     if (show.bookings.some((b) => b.comedianId === booking.comedianId)) {
@@ -200,16 +310,19 @@ export function planDrop(day: DayResponse, source: LineupSource, target: LineupT
         reason: `${firstName(booking.comedianName)} is already in the ${showTitle(show)} lineup.`,
       };
     }
-    if (occupant && sourceShow.bookings.some((b) => b.comedianId === occupant.comedianId)) {
+    if (replacing && replacing.id < 0) {
+      return { kind: 'reject', reason: `Slot ${target.position + 1} is still saving. Try again in a moment.` };
+    }
+    if (swapWith && sourceShow.bookings.some((b) => b.comedianId === swapWith.comedianId)) {
       return {
         kind: 'reject',
-        reason: `Can't swap: ${firstName(occupant.comedianName)} is already in the ${showTitle(sourceShow)} lineup.`,
+        reason: `Can't swap: ${firstName(swapWith.comedianName)} is already in the ${showTitle(sourceShow)} lineup.`,
       };
     }
     const mover = index.comedians.get(booking.comedianId);
     const moverConflict = mover ? conflictFor(day, mover, show) : null;
     if (moverConflict) conflicts.push(moverConflict);
-    const other = occupant ? index.comedians.get(occupant.comedianId) : undefined;
+    const other = swapWith ? index.comedians.get(swapWith.comedianId) : undefined;
     const otherConflict = other ? conflictFor(day, other, sourceShow) : null;
     if (otherConflict) conflicts.push(otherConflict);
   }
@@ -219,7 +332,8 @@ export function planDrop(day: DayResponse, source: LineupSource, target: LineupT
     bookingId: booking.id,
     showId: show.id,
     position: target.position,
-    swapWith: occupant,
+    swapWith,
+    replacing,
     conflicts,
   };
 }
@@ -266,8 +380,10 @@ export function replaceBooking(day: DayResponse, tempId: number, booking: Lineup
   return upsertBookings(removeBooking(day, tempId), [booking]);
 }
 
+const NOT_DECLINED = { declinedAt: null, declineNote: '' } as const;
+
 function freshStatus(day: DayResponse) {
-  return bookingStatus({ confirmedAt: null, confirmationSentAt: null }, day.date, day.today);
+  return bookingStatus({ confirmedAt: null, confirmationSentAt: null, declinedAt: null }, day.date, day.today);
 }
 
 /**
@@ -304,6 +420,8 @@ export function applyBook(
       confirmedAt: restore?.confirmedAt ?? null,
       confirmedBy: restore?.confirmedBy ?? null,
       confirmationSentAt: restore?.confirmationSentAt ?? null,
+      declinedAt: restore?.declinedAt ?? null,
+      declineNote: restore?.declineNote ?? '',
     },
   ]);
 }
@@ -318,7 +436,12 @@ export function applyMove(
   if (!moving || !target) return day;
   const source = index.shows.get(moving.showId)!;
   const sameShow = source.id === target.id;
-  const occupant = target.bookings.find((b) => b.position === input.position && b.id !== moving.id) ?? null;
+  const found = target.bookings.find((b) => b.position === input.position && b.id !== moving.id) ?? null;
+  // A declined occupant in another show is replaced, not swapped (see planDrop).
+  if (found && !sameShow && found.declinedAt != null) {
+    return applyMove(removeBooking(day, found.id), input);
+  }
+  const occupant = found;
 
   // A different show is a different spot: confirmation starts over, override re-evaluated.
   const reset = (booking: LineupBooking, show: DayShow): Partial<LineupBooking> => {
@@ -328,6 +451,7 @@ export function applyMove(
       confirmedAt: null,
       confirmedBy: null,
       confirmationSentAt: null,
+      ...NOT_DECLINED,
       status: freshStatus(day),
       overrideUnavailable: comedian ? !isAvailableFor(comedian.availability, show.startMin) : booking.overrideUnavailable,
     };
@@ -373,24 +497,75 @@ export function dayText(day: DayResponse): string {
 export interface PoolFilter {
   search: string;
   tagIds: number[];
+  /** No focused show: marked available that date. A focused show: fits its start time. */
   availableOnly: boolean;
 }
 
-/** Search by name (or tag name), any of the selected tags, then available first by name. */
-export function filterPool(comedians: DayComedian[], filter: PoolFilter): DayComedian[] {
+/**
+ * Where a comedian sorts in the pool (lower first).
+ * - No focused show: available and not booked tonight, then available but already booked (or
+ *   who declined a spot tonight), then everyone else.
+ * - A focused show (a selected slot): fits its time and not booked tonight, fits but booked
+ *   elsewhere, fits but clashes with another booking (or declined a spot tonight), outside
+ *   their hours, unavailable, not marked, already in that show.
+ */
+export function poolRank(day: DayResponse, comedian: DayComedian, focus: DayShow | null): number {
+  const booked = activeBookings(day, comedian.id).length > 0;
+  const declined = declinedTonight(day, comedian.id);
+  if (!focus) return comedian.availability ? (booked || declined ? 1 : 0) : 2;
+  const fit = fitFor(day, comedian, focus);
+  switch (fit.kind) {
+    case 'fits':
+      return fit.overlap || declined ? 2 : booked ? 1 : 0;
+    case 'outside':
+      return 3;
+    case 'unavailable':
+      return 4;
+    case 'not_marked':
+      return 5;
+    case 'in_show':
+      return 6;
+  }
+}
+
+/** Search by name (or tag name), any of the selected tags, then sorted by `poolRank` and name. */
+export function filterPool(day: DayResponse, filter: PoolFilter, focus: DayShow | null = null): DayComedian[] {
   const q = filter.search.trim().toLowerCase();
   const tagIds = new Set(filter.tagIds);
-  return comedians
-    .filter((c) => !filter.availableOnly || c.availability != null)
+  const available = (c: DayComedian) =>
+    focus ? isAvailableFor(c.availability, focus.startMin) : c.availability != null;
+  return day.comedians
+    .filter((c) => !filter.availableOnly || available(c))
     .filter((c) => tagIds.size === 0 || c.tags.some((t) => tagIds.has(t.id)))
     .filter(
       (c) => !q || c.name.toLowerCase().includes(q) || c.tags.some((t) => t.name.toLowerCase().startsWith(q)),
     )
-    .sort(
-      (a, b) =>
-        Number(b.availability != null) - Number(a.availability != null) ||
-        a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }),
-    );
+    .map((c) => ({ c, rank: poolRank(day, c, focus) }))
+    .sort((a, b) => a.rank - b.rank || a.c.name.localeCompare(b.c.name, undefined, { sensitivity: 'base' }))
+    .map(({ c }) => c);
+}
+
+export interface PoolCounts {
+  total: number;
+  /** No focus: marked available, not booked or declined tonight. Focus: `isFreeFor` the show. */
+  free: number;
+  /** Booked in at least one show tonight (declines don't count). */
+  booked: number;
+}
+
+/** The honest numbers for the pool header ("12 free · 9 booked", "8 free at 9 PM"). */
+export function poolCounts(day: DayResponse, focus: DayShow | null = null): PoolCounts {
+  let free = 0;
+  let booked = 0;
+  for (const comedian of day.comedians) {
+    const isBooked = activeBookings(day, comedian.id).length > 0;
+    if (isBooked) booked++;
+    const isFree = focus
+      ? isFreeFor(fitFor(day, comedian, focus))
+      : comedian.availability != null && !isBooked && !declinedTonight(day, comedian.id);
+    if (isFree) free++;
+  }
+  return { total: day.comedians.length, free, booked };
 }
 
 // ---------------------------------------------------------------------------

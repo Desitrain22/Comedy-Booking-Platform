@@ -6,14 +6,16 @@
  *   GET  /api/dashboard                               DashboardResponse
  *   POST /api/confirmations/send                      SendConfirmationsInput → SendConfirmationsResponse
  *   POST /api/confirmations/resend                    ResendConfirmationInput → ResendConfirmationResponse
- *                                                     (404 `not_found` for an unknown comedian)
+ *                                                     (404 `not_found` for an unknown comedian;
+ *                                                     `status: 'archived'` and no email for an archived one)
  *   POST /api/availability-requests                   CreateAvailabilityRequestInput → 201 CreateAvailabilityRequestResponse
  *                                                     (400 `unknown_tag`, 409 `no_recipients`)
  *   GET  /api/availability-requests[?month]           AvailabilityRequestSummary[] (newest first)
  *   GET  /api/availability-requests/preview?month&message[&kind][&audience]
  *                                                     AvailabilityRequestPreview
  *
- * "Mark confirmed" on the dashboard uses F2's `POST /api/bookings/:id/confirm`.
+ * "Mark confirmed" on the dashboard uses F2's `POST /api/bookings/:id/confirm`; its Undo uses
+ * `POST /api/bookings/:id/unconfirm` with the booking's prior `{confirmedAt, confirmedBy}`.
  */
 import { z } from 'zod';
 import type { BookingStatus } from '../bookingStatus';
@@ -106,18 +108,44 @@ export interface DashboardLocation {
   color: string;
 }
 
-/** One unconfirmed booking on a scheduled show today ("John · 7 PM @ The Cellar · unconfirmed"). */
+/**
+ * One unconfirmed booking on a scheduled show tonight ("John · 7 PM @ The Cellar · unconfirmed").
+ * Declined spots are not here (see `needsReplacement`).
+ */
 export interface UnconfirmedTonightRow {
   bookingId: number;
   showId: number;
   comedianId: number;
   comedianName: string;
   comedianEmail: string;
+  /** Archived comedians are never emailed: the dashboard offers no Resend for them. */
+  comedianArchived: boolean;
   startMin: number;
   showName: string;
   location: DashboardLocation;
   /** When the weekly confirmation email covering this spot was last sent (null = never). */
   confirmationSentAt: number | null;
+}
+
+/**
+ * A declined spot on a scheduled show from tonight on: the comedian said they can't make it,
+ * the booking keeps its slot until the booker replaces them ("Needs a replacement").
+ */
+export interface NeedsReplacementRow {
+  bookingId: number;
+  showId: number;
+  /** The show's (club night) date. */
+  date: string;
+  startMin: number;
+  showName: string;
+  location: DashboardLocation;
+  /** 0-based slot index. */
+  position: number;
+  comedianId: number;
+  comedianName: string;
+  declinedAt: number;
+  /** The comedian's optional reason ('' when none). */
+  declineNote: string;
 }
 
 export interface TonightBooking {
@@ -147,10 +175,14 @@ export interface WeekDayStats {
   date: string;
   shows: number;
   slots: number;
+  /** Every booking, declined ones included (they still hold their slot). */
   booked: number;
   openSlots: number;
   confirmed: number;
+  /** Still have to confirm (not confirmed, not declined). */
   unconfirmed: number;
+  /** Declined: need a replacement. */
+  declined: number;
 }
 
 export interface NextConfirmationSend {
@@ -176,6 +208,14 @@ export interface ConfirmationsInfo {
   pendingComedians: number;
   /** …of whom have at least one such spot that was never emailed (the `onlyUnsent` audience). */
   unsentComedians: number;
+  /**
+   * Spots from tonight to Sunday that still have to be confirmed and were never emailed
+   * (scheduled shows, non-archived comedians): the "N booked this week haven't been emailed
+   * yet – Send" nudge, which sends with `onlyUnsent`.
+   */
+  unsentBookings: number;
+  /** The daily catch-up send of those spots is on (setting `catchUpEnabled`). */
+  catchUpEnabled: boolean;
 }
 
 export interface DashboardWeek {
@@ -231,22 +271,48 @@ export interface DashboardTag {
   color: string;
 }
 
+/** Counts behind the "Getting started" checklist on a new club's dashboard. */
+export interface DashboardSetup {
+  /** Active (non-archived) locations. */
+  locations: number;
+  /** Active (non-archived) comedians. */
+  comedians: number;
+  /** Shows ever created (any status). */
+  shows: number;
+  /** Availability requests and reminders ever sent. */
+  availabilityRequests: number;
+}
+
 /** `GET /api/dashboard` */
 export interface DashboardResponse {
-  /** Today in the club timezone. */
+  /**
+   * Tonight in the club: the club *night* (`clubNightDate`), so until 6 AM it is still the
+   * previous date and its after-midnight shows stay on the dashboard.
+   */
   today: string;
+  /**
+   * The month the club is planning (`planningMonth` of the club's calendar date): the
+   * default month for availability requests.
+   */
+  planningMonth: string;
   /** Club-local minutes after midnight right now. */
   nowMin: number;
   /** False → emails go to the outbox. */
   emailConfigured: boolean;
   /** Ordered by time, then location, then slot. */
   unconfirmedTonight: UnconfirmedTonightRow[];
+  /** Declined spots from tonight on, soonest first (by date, time, location, slot). */
+  needsReplacement: NeedsReplacementRow[];
   /** Today's shows: scheduled first (by time, then location), then cancelled. */
   tonight: TonightShow[];
   week: DashboardWeek;
-  /** Current month, then next month. */
+  /**
+   * This month, the planning month and the month after it, oldest first (no repeats):
+   * on Oct 5 that is October and November; on Oct 30 October, November and December.
+   */
   availability: MonthAvailabilityProgress[];
   tags: DashboardTag[];
+  setup: DashboardSetup;
 }
 
 /** `POST /api/confirmations/send` */
@@ -260,8 +326,11 @@ export interface SendConfirmationsResponse {
 
 /** `POST /api/confirmations/resend` */
 export interface ResendConfirmationResponse {
-  /** `skipped`: the comedian has no unconfirmed spots left that week. */
-  status: EmailStatus | 'skipped';
+  /**
+   * `skipped`: the comedian has no unconfirmed spots left that week.
+   * `archived`: the comedian is archived, so nothing was sent (archived comedians are never emailed).
+   */
+  status: EmailStatus | 'skipped' | 'archived';
   bookingCount: number;
   error?: string;
 }

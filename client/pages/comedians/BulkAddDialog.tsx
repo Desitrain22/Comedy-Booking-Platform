@@ -14,7 +14,10 @@ import {
 import { Badge, Button, Dialog, Spinner, Textarea } from '../../components/ui';
 import { api } from '../../lib/api';
 import { cn } from '../../lib/cn';
+import { useBooker } from '../../lib/useMe';
+import { bulkLinksToast } from './loginLinks';
 import { invalidateComedians } from './queries';
+import { SendLinkCheckbox } from './SendLinkCheckbox';
 
 export interface BulkAddDialogProps {
   open: boolean;
@@ -36,10 +39,15 @@ function useDebounced<T>(value: T, delayMs: number): T {
 
 type RowStatus = { kind: 'new' } | { kind: 'skip'; reason: BulkSkipReason; detail?: string };
 
-/** Paste `Name, email` / `Name <email>` lines → live preview (invalid/duplicate flagged) → create. */
+/**
+ * Paste `Name, email` / `Name <email>` lines → live preview (invalid/duplicate flagged) →
+ * create, emailing each new comedian a sign-in link unless unchecked.
+ */
 export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   const queryClient = useQueryClient();
+  const isAdmin = useBooker().role === 'admin';
   const [text, setText] = useState('');
+  const [sendLinks, setSendLinks] = useState(true);
 
   const parsed = useMemo(() => parseBulkLines(text), [text]);
   const rows = useMemo(() => parsed.map(({ name, email }) => ({ name, email })), [parsed]);
@@ -77,13 +85,17 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   const skipCount = statuses.length - newCount;
 
   const create = useMutation({
-    mutationFn: () => api.post<BulkAddResult>('/comedians/bulk', { rows }),
+    mutationFn: () => api.post<BulkAddResult>('/comedians/bulk', { rows, sendLoginLinks: sendLinks }),
     onSuccess: (result) => {
       invalidateComedians(queryClient);
       const added = result.created.length;
       const skipped = result.skipped.length;
+      const lead = `Added ${added} comedian${added === 1 ? '' : 's'}${skipped ? ` · skipped ${skipped}` : ''}`;
       if (added === 0) toast.info(`Nothing added — all ${skipped} rows were skipped.`);
-      else toast.success(`Added ${added} comedian${added === 1 ? '' : 's'}${skipped ? ` · skipped ${skipped}` : ''}`);
+      else if (result.loginLinks) {
+        const t = bulkLinksToast(lead, result.loginLinks, isAdmin);
+        toast[t.tone](t.title, { description: t.description });
+      } else toast.success(lead);
       close(false);
     },
   });
@@ -91,6 +103,7 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
   function close(next: boolean) {
     if (!next) {
       setText('');
+      setSendLinks(true);
       create.reset();
     }
     onOpenChange(next);
@@ -141,6 +154,8 @@ export function BulkAddDialog({ open, onOpenChange }: BulkAddDialogProps) {
           aria-label="Comedians to add, one per line"
           className="font-mono text-[13px] sm:text-[13px]"
         />
+
+        <SendLinkCheckbox checked={sendLinks} onChange={setSendLinks} many />
 
         {rows.length > 0 && (
           <div>

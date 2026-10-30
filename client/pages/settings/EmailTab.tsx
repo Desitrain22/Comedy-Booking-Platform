@@ -2,6 +2,11 @@
  * Settings → Email: connect an SMTP server (with provider presets), see whether email is
  * set up, send a test email, and (admins only) read the email log, outbox included. The log
  * holds comedians' sign-in codes and links, so other bookers see a short note instead.
+ *
+ * Only admins can change the email settings (they decide where every sign-in link and
+ * confirmation goes); other bookers see them read-only and can send themselves a test.
+ * Changing the server, port, security or username needs the password again: the server
+ * drops a saved password rather than send it somewhere new.
  */
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { Inbox, Lock, Mail, Send, Unplug } from 'lucide-react';
@@ -20,6 +25,7 @@ import {
   Button,
   Card,
   CardBody,
+  CardFooter,
   CardHeader,
   ConfirmDialog,
   Field,
@@ -191,11 +197,20 @@ interface EmailSettingsFormProps {
 
 function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: EmailSettingsFormProps) {
   const booker = useBooker();
+  const canEdit = booker.role === 'admin';
   const initial = draftFrom(saved);
   const { draft, set, setDraft, errors, setErrors, reset, dirty } = useDraft<EmailDraft>(initial);
   const save = useSaveSettings();
   const [confirmDisconnect, setConfirmDisconnect] = useState(false);
   const provider = draft.provider ? getEmailProvider(draft.provider) : null;
+  /** The saved password won't survive this draft unless it's typed again (see the server's PUT /settings). */
+  const passNeededAgain =
+    saved.smtpPassSet &&
+    !draft.clearPass &&
+    ((draft.provider ? draft.smtpHost.trim() : '') !== saved.smtpHost ||
+      Number(draft.smtpPort) !== saved.smtpPort ||
+      draft.smtpSecure !== saved.smtpSecure ||
+      draft.smtpUser.trim() !== saved.smtpUser);
 
   function chooseProvider(id: EmailProviderId) {
     const preset = getEmailProvider(id);
@@ -241,14 +256,18 @@ function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: Emai
     const found: FieldErrors = {};
     if (provider?.tokenAsUserAndPass) {
       if (!patch.smtpUser) found.smtpUser = `Paste your ${provider.userLabel}`;
-      else if (patch.smtpUser !== saved.smtpUser || !saved.smtpPassSet) patch.smtpPass = patch.smtpUser;
+      else if (patch.smtpUser !== saved.smtpUser || !saved.smtpPassSet || passNeededAgain) {
+        patch.smtpPass = patch.smtpUser;
+      }
     } else {
       const pass = provider?.stripPassSpaces ? draft.smtpPass.replace(/\s+/g, '') : draft.smtpPass;
-      const hasPassword = saved.smtpPassSet && !draft.clearPass;
+      const hasPassword = saved.smtpPassSet && !draft.clearPass && !passNeededAgain;
       if (pass) patch.smtpPass = pass;
       else if (draft.clearPass) patch.clearSmtpPass = true;
-      if (!pass && !hasPassword && provider && provider.id !== 'custom') {
-        found.smtpPass = `Paste your ${provider.passLabel}`;
+      if (!pass && !hasPassword && provider && (provider.id !== 'custom' || (passNeededAgain && patch.smtpUser))) {
+        found.smtpPass = passNeededAgain
+          ? `Enter the ${provider.passLabel.toLowerCase()} again — needed when the server, port or username changes`
+          : `Paste your ${provider.passLabel}`;
       }
     }
     if (provider) {
@@ -285,7 +304,7 @@ function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: Emai
 
   async function handleTest() {
     test.clear();
-    if (dirty && !(await saveDraft())) return;
+    if (canEdit && dirty && !(await saveDraft())) return;
     test.run();
   }
 
@@ -307,203 +326,237 @@ function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: Emai
         <CardBody className="space-y-5">
           <EmailStatus settings={settings} bookerEmail={booker.email} canReadLog={onOpenEmail != null} />
 
-          <fieldset>
-            <legend className="mb-2 text-[13px] font-medium text-fg">Email provider</legend>
-            <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
-              {EMAIL_PROVIDERS.map((p) => (
-                <label
-                  key={p.id}
-                  className={cn(
-                    'relative flex cursor-pointer flex-col gap-0.5 rounded-lg border px-3 py-2.5 transition-colors',
-                    'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent',
-                    draft.provider === p.id
-                      ? 'border-accent bg-accent-soft'
-                      : 'border-border-strong bg-surface hover:bg-surface-2/60',
-                  )}
-                >
-                  <input
-                    type="radio"
-                    name="email-provider"
-                    value={p.id}
-                    checked={draft.provider === p.id}
-                    onChange={() => chooseProvider(p.id)}
-                    className="sr-only"
-                  />
-                  <span className={cn('text-sm font-medium', draft.provider === p.id ? 'text-accent' : 'text-fg')}>
-                    {p.label}
-                  </span>
-                  <span className="text-xs text-fg-muted">{p.tagline}</span>
-                </label>
-              ))}
-            </div>
-          </fieldset>
+          {!canEdit && (
+            <Callout icon={Lock} title="Only admins can change email settings">
+              They decide where sign-in links and confirmations are sent from. You can still send yourself a test
+              email to check it works.
+            </Callout>
+          )}
 
-          {provider && (
-            <>
-              <ProviderHelp id={provider.id} />
-
-              <div className="grid gap-4 sm:grid-cols-2">
-                {provider.id === 'custom' ? (
-                  <>
-                    <Field label="SMTP server" error={errors.smtpHost} className="sm:col-span-2">
-                      <Input
-                        value={draft.smtpHost}
-                        onChange={(e) => set('smtpHost', e.target.value)}
-                        placeholder="smtp.yourprovider.com"
-                        autoCapitalize="none"
-                        spellCheck={false}
-                      />
-                    </Field>
-                    <Field label="Port" error={errors.smtpPort}>
-                      <Input
-                        inputMode="numeric"
-                        value={draft.smtpPort}
-                        onChange={(e) => changePort(e.target.value.replace(/\D/g, ''))}
-                        placeholder="587"
-                      />
-                    </Field>
-                    <Field label="Security" hint="Match your provider: 465 uses SSL/TLS, 587 uses STARTTLS.">
-                      <Select
-                        value={draft.smtpSecure ? 'tls' : 'starttls'}
-                        onChange={(e) => set('smtpSecure', e.target.value === 'tls')}
-                        options={[
-                          { value: 'tls', label: 'SSL/TLS (usually port 465)' },
-                          { value: 'starttls', label: 'STARTTLS (usually port 587)' },
-                        ]}
-                      />
-                    </Field>
-                  </>
-                ) : (
-                  <p className="text-xs text-fg-muted sm:col-span-2">
-                    Server <span className="font-mono text-fg">{provider.host}</span>, port{' '}
-                    <span className="font-mono text-fg">{provider.port}</span>,{' '}
-                    {provider.secure ? 'SSL/TLS' : 'STARTTLS'}
-                    {provider.fixedUser && (
-                      <>
-                        , username <span className="font-mono text-fg">{provider.fixedUser}</span>
-                      </>
+          <fieldset disabled={!canEdit} className="m-0 min-w-0 space-y-5 border-0 p-0">
+            <fieldset>
+              <legend className="mb-2 text-[13px] font-medium text-fg">Email provider</legend>
+              <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+                {EMAIL_PROVIDERS.map((p) => (
+                  <label
+                    key={p.id}
+                    className={cn(
+                      'relative flex flex-col gap-0.5 rounded-lg border px-3 py-2.5 transition-colors',
+                      'has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent',
+                      canEdit ? 'cursor-pointer' : 'cursor-not-allowed',
+                      draft.provider === p.id
+                        ? 'border-accent bg-accent-soft'
+                        : cn('border-border-strong bg-surface', canEdit ? 'hover:bg-surface-2/60' : 'opacity-60'),
                     )}
-                    . These are filled in for you.
-                  </p>
-                )}
-
-                {provider.tokenAsUserAndPass ? (
-                  <Field
-                    label={provider.userLabel}
-                    error={errors.smtpUser ?? errors.smtpPass}
-                    hint="Used as both the username and the password."
-                    className="sm:col-span-2"
                   >
-                    <Input
-                      type="password"
-                      autoComplete="new-password"
-                      value={draft.smtpUser}
-                      onChange={(e) => set('smtpUser', e.target.value)}
-                      placeholder={provider.userPlaceholder}
-                      spellCheck={false}
+                    <input
+                      type="radio"
+                      name="email-provider"
+                      value={p.id}
+                      checked={draft.provider === p.id}
+                      onChange={() => chooseProvider(p.id)}
+                      className="sr-only"
                     />
-                  </Field>
-                ) : (
-                  <>
-                    {!provider.fixedUser && (
-                      <Field label={provider.userLabel} error={errors.smtpUser}>
+                    <span className={cn('text-sm font-medium', draft.provider === p.id ? 'text-accent' : 'text-fg')}>
+                      {p.label}
+                    </span>
+                    <span className="text-xs text-fg-muted">{p.tagline}</span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+
+            {provider && (
+              <>
+                {canEdit && <ProviderHelp id={provider.id} />}
+
+                <div className="grid gap-4 sm:grid-cols-2">
+                  {provider.id === 'custom' ? (
+                    <>
+                      <Field label="SMTP server" error={errors.smtpHost} className="sm:col-span-2">
                         <Input
-                          autoComplete="off"
+                          value={draft.smtpHost}
+                          onChange={(e) => set('smtpHost', e.target.value)}
+                          placeholder="smtp.yourprovider.com"
                           autoCapitalize="none"
                           spellCheck={false}
-                          value={draft.smtpUser}
-                          onChange={(e) => set('smtpUser', e.target.value)}
-                          placeholder={provider.userPlaceholder}
                         />
                       </Field>
-                    )}
+                      <Field label="Port" error={errors.smtpPort}>
+                        <Input
+                          inputMode="numeric"
+                          value={draft.smtpPort}
+                          onChange={(e) => changePort(e.target.value.replace(/\D/g, ''))}
+                          placeholder="587"
+                        />
+                      </Field>
+                      <Field label="Security" hint="Match your provider: 465 uses SSL/TLS, 587 uses STARTTLS.">
+                        <Select
+                          value={draft.smtpSecure ? 'tls' : 'starttls'}
+                          onChange={(e) => set('smtpSecure', e.target.value === 'tls')}
+                          options={[
+                            { value: 'tls', label: 'SSL/TLS (usually port 465)' },
+                            { value: 'starttls', label: 'STARTTLS (usually port 587)' },
+                          ]}
+                        />
+                      </Field>
+                    </>
+                  ) : (
+                    <p className="text-xs text-fg-muted sm:col-span-2">
+                      Server <span className="font-mono text-fg">{provider.host}</span>, port{' '}
+                      <span className="font-mono text-fg">{provider.port}</span>,{' '}
+                      {provider.secure ? 'SSL/TLS' : 'STARTTLS'}
+                      {provider.fixedUser && (
+                        <>
+                          , username <span className="font-mono text-fg">{provider.fixedUser}</span>
+                        </>
+                      )}
+                      . These are filled in for you.
+                    </p>
+                  )}
+
+                  {provider.tokenAsUserAndPass ? (
                     <Field
-                      label={provider.passLabel}
-                      error={errors.smtpPass}
-                      className={provider.fixedUser ? 'sm:col-span-2' : undefined}
-                      hint={
-                        !saved.smtpPassSet
-                          ? undefined
-                          : draft.clearPass
-                            ? 'The saved password will be removed when you save.'
-                            : 'Saved. Leave blank to keep it, or paste a new one to replace it.'
-                      }
-                      aside={
-                        saved.smtpPassSet ? (
-                          <Button variant="link" className="text-xs" onClick={() => set('clearPass', !draft.clearPass)}>
-                            {draft.clearPass ? 'Undo' : 'Remove saved'}
-                          </Button>
-                        ) : undefined
-                      }
+                      label={provider.userLabel}
+                      error={errors.smtpUser ?? errors.smtpPass}
+                      hint="Used as both the username and the password."
+                      className="sm:col-span-2"
                     >
                       <Input
                         type="password"
                         autoComplete="new-password"
+                        value={draft.smtpUser}
+                        onChange={(e) => set('smtpUser', e.target.value)}
+                        placeholder={provider.userPlaceholder}
                         spellCheck={false}
-                        value={draft.smtpPass}
-                        onChange={(e) => set('smtpPass', e.target.value)}
-                        placeholder={saved.smtpPassSet && !draft.clearPass ? '•••••••• (saved)' : provider.passPlaceholder}
                       />
                     </Field>
-                  </>
-                )}
-              </div>
-            </>
-          )}
+                  ) : (
+                    <>
+                      {!provider.fixedUser && (
+                        <Field label={provider.userLabel} error={errors.smtpUser}>
+                          <Input
+                            autoComplete="off"
+                            autoCapitalize="none"
+                            spellCheck={false}
+                            value={draft.smtpUser}
+                            onChange={(e) => set('smtpUser', e.target.value)}
+                            placeholder={provider.userPlaceholder}
+                          />
+                        </Field>
+                      )}
+                      <Field
+                        label={provider.passLabel}
+                        error={errors.smtpPass}
+                        className={provider.fixedUser ? 'sm:col-span-2' : undefined}
+                        hint={
+                          !saved.smtpPassSet
+                            ? undefined
+                            : draft.clearPass
+                              ? 'The saved password will be removed when you save.'
+                              : passNeededAgain
+                                ? 'Enter it again: a saved password only goes to the server it was entered for.'
+                                : canEdit
+                                  ? 'Saved. Leave blank to keep it, or paste a new one to replace it.'
+                                  : 'Saved.'
+                        }
+                        aside={
+                          saved.smtpPassSet && canEdit ? (
+                            <Button variant="link" className="text-xs" onClick={() => set('clearPass', !draft.clearPass)}>
+                              {draft.clearPass ? 'Undo' : 'Remove saved'}
+                            </Button>
+                          ) : undefined
+                        }
+                      >
+                        <Input
+                          type="password"
+                          autoComplete="new-password"
+                          spellCheck={false}
+                          value={draft.smtpPass}
+                          onChange={(e) => set('smtpPass', e.target.value)}
+                          placeholder={
+                            saved.smtpPassSet && !draft.clearPass && !passNeededAgain
+                              ? '•••••••• (saved)'
+                              : canEdit
+                                ? provider.passPlaceholder
+                                : ''
+                          }
+                        />
+                      </Field>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
 
-          <div className="grid gap-4 border-t border-border pt-5 sm:grid-cols-2">
-            <Field label="From name" error={errors.fromName} hint="Comedians see this as the sender.">
-              <Input
-                value={draft.fromName}
-                onChange={(e) => set('fromName', e.target.value)}
-                placeholder={settings.clubName || 'Your club'}
-                maxLength={100}
-              />
-            </Field>
-            <Field label="From email" error={errors.fromEmail} hint={fromEmailHint(draft.provider)}>
-              <Input
-                type="email"
-                autoComplete="off"
-                value={draft.fromEmail}
-                onChange={(e) => set('fromEmail', e.target.value)}
-                placeholder={emailSchema.safeParse(draft.smtpUser).success ? draft.smtpUser : 'bookings@yourclub.com'}
-              />
-            </Field>
-            <Field
-              label="Reply-to"
-              error={errors.replyTo}
-              hint="Optional. Where replies go — comedians reply to confirmations when they can't make a spot."
-              className="sm:col-span-2"
-            >
-              <Input
-                type="email"
-                autoComplete="off"
-                value={draft.replyTo}
-                onChange={(e) => set('replyTo', e.target.value)}
-                placeholder="you@yourclub.com"
-                className="sm:max-w-sm"
-              />
-            </Field>
-          </div>
+            <div className="grid gap-4 border-t border-border pt-5 sm:grid-cols-2">
+              <Field label="From name" error={errors.fromName} hint="Comedians see this as the sender.">
+                <Input
+                  value={draft.fromName}
+                  onChange={(e) => set('fromName', e.target.value)}
+                  placeholder={settings.clubName || 'Your club'}
+                  maxLength={100}
+                />
+              </Field>
+              <Field label="From email" error={errors.fromEmail} hint={fromEmailHint(draft.provider)}>
+                <Input
+                  type="email"
+                  autoComplete="off"
+                  value={draft.fromEmail}
+                  onChange={(e) => set('fromEmail', e.target.value)}
+                  placeholder={emailSchema.safeParse(draft.smtpUser).success ? draft.smtpUser : 'bookings@yourclub.com'}
+                />
+              </Field>
+              <Field
+                label="Reply-to"
+                error={errors.replyTo}
+                hint="Optional. Where replies go — comedians reply to confirmations when they can't make a spot."
+                className="sm:col-span-2"
+              >
+                <Input
+                  type="email"
+                  autoComplete="off"
+                  value={draft.replyTo}
+                  onChange={(e) => set('replyTo', e.target.value)}
+                  placeholder="you@yourclub.com"
+                  className="sm:max-w-sm"
+                />
+              </Field>
+            </div>
+          </fieldset>
 
           {test.result && <TestResultCallout result={test.result} onOpenEmail={onOpenEmail} />}
         </CardBody>
 
-        <SaveFooter
-          dirty={dirty}
-          saving={save.isPending}
-          onDiscard={() => {
-            reset();
-            test.clear();
-          }}
-          start={
-            saved.smtpHost ? (
-              <Button variant="ghost" onClick={() => setConfirmDisconnect(true)} className="text-fg-muted">
-                <Unplug aria-hidden /> Disconnect
+        {canEdit ? (
+          <SaveFooter
+            dirty={dirty}
+            saving={save.isPending}
+            onDiscard={() => {
+              reset();
+              test.clear();
+            }}
+            start={
+              saved.smtpHost ? (
+                <Button variant="ghost" onClick={() => setConfirmDisconnect(true)} className="text-fg-muted">
+                  <Unplug aria-hidden /> Disconnect
+                </Button>
+              ) : undefined
+            }
+            end={
+              <Button
+                variant="secondary"
+                onClick={() => void handleTest()}
+                loading={test.pending}
+                title={`Sends a test email to ${booker.email}`}
+              >
+                <Send aria-hidden />
+                {dirty ? 'Save & send test' : 'Send test email'}
               </Button>
-            ) : undefined
-          }
-          end={
+            }
+          />
+        ) : (
+          <CardFooter>
             <Button
               variant="secondary"
               onClick={() => void handleTest()}
@@ -511,10 +564,10 @@ function EmailSettingsForm({ settings, saved, test, onOpenEmail, onSaved }: Emai
               title={`Sends a test email to ${booker.email}`}
             >
               <Send aria-hidden />
-              {dirty ? 'Save & send test' : 'Send test email'}
+              Send test email to me
             </Button>
-          }
-        />
+          </CardFooter>
+        )}
       </Card>
 
       <ConfirmDialog
@@ -579,8 +632,10 @@ function EmailStatus({
       <Callout tone="warning" icon={Inbox} title="Not configured — emails go to the outbox">
         Nothing reaches inboxes yet. Every email — sign-in codes, availability requests, confirmations, invites — is
         saved in the <a href="#email-log">Email log</a>
-        {canReadLog ? ' below, where you can open and read it' : ', which admins can open and read'}. Pick your email
-        provider to start sending for real.
+        {canReadLog ? ' below, where you can open and read it' : ', which admins can open and read'}.{' '}
+        {canReadLog
+          ? 'Pick your email provider to start sending for real.'
+          : 'An admin can connect an email provider to start sending for real.'}
       </Callout>
     );
   }
@@ -590,8 +645,10 @@ function EmailStatus({
   if (last?.status === 'failed') {
     return (
       <Callout tone="danger" title={`${title} — but the last email failed`}>
-        {formatRelative(last.createdAt)}: <span className="font-mono text-xs break-words">{last.error}</span>. Fix the
-        settings below, then send a test email to {bookerEmail}.
+        {formatRelative(last.createdAt)}: <span className="font-mono text-xs break-words">{last.error}</span>.{' '}
+        {canReadLog
+          ? `Fix the settings below, then send a test email to ${bookerEmail}.`
+          : 'Ask an admin to fix the settings below.'}
       </Callout>
     );
   }

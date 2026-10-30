@@ -52,7 +52,12 @@ function EditForm({ comedian, onDone }: { comedian: ComedianDetail; onDone: () =
     onSuccess: (updated) => {
       queryClient.setQueryData(comedianKeys.detail(comedian.id), updated);
       invalidateComedians(queryClient);
-      toast.success('Saved');
+      toast.success(
+        'Saved',
+        updated.email !== comedian.email
+          ? { description: `${comedian.name} was signed out; send a sign-in link to ${updated.email}.` }
+          : undefined,
+      );
       onDone();
     },
     onError: (err) => {
@@ -95,6 +100,7 @@ function EditForm({ comedian, onDone }: { comedian: ComedianDetail; onDone: () =
   }
 
   const previewUrl = values.headshotUrl.trim();
+  const emailChanging = values.email.trim().toLowerCase() !== comedian.email;
 
   return (
     <form onSubmit={submit} className="space-y-4" noValidate>
@@ -102,7 +108,15 @@ function EditForm({ comedian, onDone }: { comedian: ComedianDetail; onDone: () =
         <Field label="Name" error={errors.name}>
           <Input value={values.name} onChange={(e) => set('name', e.target.value)} autoComplete="off" />
         </Field>
-        <Field label="Email" error={errors.email} hint="Where sign-in codes and booking emails go.">
+        <Field
+          label="Email"
+          error={errors.email}
+          hint={
+            emailChanging
+              ? 'Saving signs them out and voids their old sign-in and confirmation links.'
+              : 'Where sign-in codes and booking emails go.'
+          }
+        >
           <Input type="email" value={values.email} onChange={(e) => set('email', e.target.value)} autoComplete="off" />
         </Field>
       </div>

@@ -1,20 +1,26 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import type {
-  BulkCreateShowsResponse,
-  CopyPatternResponse,
-  ShowDetail,
-  ShowDto,
-  UpdateShowResponse,
+import {
+  isMatchingShow,
+  type BulkCreateShowsResponse,
+  type BulkDeleteShowsResponse,
+  type BulkShowStatusResponse,
+  type CopyPatternResponse,
+  type ShowDetail,
+  type ShowDto,
+  type UpdateShowResponse,
 } from '../../shared/api/shows';
+import type { DayResponse } from '../../shared/api/lineup';
 import { addDays, addMonths, datesForWeekday, daysInMonth, monthOf, weekdayOf } from '../../shared/time';
 import { bookings, shows } from '../db/schema';
-import { clubToday } from '../lib/settings';
+import { clubNight, clubToday } from '../lib/settings';
 import {
+  createAvailability,
   createBooking,
   createComedian,
   createLocation,
   createShow,
+  createSubmission,
   loginAsBooker,
   loginAsComedian,
   makeTestApp,
@@ -69,6 +75,8 @@ describe('auth', () => {
       ['GET', `/api/shows/${show.id}`],
       ['PATCH', `/api/shows/${show.id}`, { name: 'X' }],
       ['DELETE', `/api/shows/${show.id}`],
+      ['POST', '/api/shows/bulk-delete', { ids: [show.id] }],
+      ['POST', '/api/shows/bulk-status', { ids: [show.id], status: 'cancelled' }],
     ];
     for (const [method, path, json] of calls) {
       expect((await t.request(path, { method, json })).status, `${method} ${path}`).toBe(401);
@@ -128,8 +136,8 @@ describe('GET /api/shows', () => {
     expect(scheduledOnly.map((s) => s.id)).toEqual([s1.id]);
   });
 
-  it("counts today's unconfirmed bookings, but not on cancelled shows", async () => {
-    const today = clubToday(t.db);
+  it("counts tonight's unconfirmed bookings, but not on cancelled shows", async () => {
+    const today = clubNight(t.db);
     const location = createLocation(t.db);
     const tonight = createShow(t.db, { locationId: location.id, date: today, startMin: 1200 });
     const cancelled = createShow(t.db, { locationId: location.id, date: today, startMin: 1320, status: 'cancelled' });
@@ -522,7 +530,7 @@ describe('PATCH /api/shows/:id', () => {
   });
 
   it('cancels (keeping bookings) and restores', async () => {
-    const show = createShow(t.db, { date: clubToday(t.db) });
+    const show = createShow(t.db, { date: clubNight(t.db) });
     createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id });
 
     const cancelled = await readJson<UpdateShowResponse>(await patch(show.id, { status: 'cancelled' }));
@@ -588,4 +596,245 @@ describe('DELETE /api/shows/:id', () => {
 it('fixture months fall where the tests expect', () => {
   expect(weekdayOf('2030-11-01')).toBe(5);
   expect(weekdayOf('2030-12-04')).toBe(3);
+});
+
+// ---------------------------------------------------------------------------
+// Fix round: availability on a time change (correctness #1), bulk edit/delete/cancel (UX A4)
+// ---------------------------------------------------------------------------
+
+function bookingRow(id: number) {
+  return t.db.select().from(bookings).where(eq(bookings.id, id)).get()!;
+}
+
+/** A comedian who submitted the month and marked `startMin`–`endMin` on `date` (or nothing). */
+function markedComic(name: string, date: string, range?: [number, number]) {
+  const comedian = createComedian(t.db, { name });
+  createSubmission(t.db, comedian.id, monthOf(date));
+  if (range) createAvailability(t.db, { comedianId: comedian.id, date, startMin: range[0], endMin: range[1] });
+  return comedian;
+}
+
+describe('GET /api/shows/:id — availability for the editor', () => {
+  it('includes what each booked comedian marked for the date, and declines', async () => {
+    const show = createShow(t.db, { date: '2030-11-01' });
+    const early = markedComic('Early', '2030-11-01', [1140, 1260]);
+    const blank = markedComic('Blank', '2030-11-01');
+    const unknown = createComedian(t.db, { name: 'Unknown' });
+    createBooking(t.db, { showId: show.id, comedianId: early.id, position: 0 });
+    createBooking(t.db, { showId: show.id, comedianId: blank.id, position: 1, declinedAt: 9 });
+    createBooking(t.db, { showId: show.id, comedianId: unknown.id, position: 2 });
+    const body = await readJson<ShowDetail>(await t.request(`/api/shows/${show.id}`, { headers }));
+    expect(body.bookings.map((b) => [b.comedianName, b.availability, b.submittedMonth, b.status, b.declinedAt])).toEqual([
+      ['Early', { startMin: 1140, endMin: 1260 }, true, 'not_sent', null],
+      ['Blank', null, true, 'declined', 9],
+      ['Unknown', null, false, 'not_sent', null],
+    ]);
+  });
+
+  it("doesn't count declined bookings as unconfirmed tonight", async () => {
+    const show = createShow(t.db, { date: clubNight(t.db) });
+    createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id });
+    createBooking(t.db, { showId: show.id, comedianId: createComedian(t.db).id, declinedAt: 1 });
+    const today = clubNight(t.db);
+    const [dto] = await list(`from=${today}&to=${today}`);
+    expect(dto).toMatchObject({ bookedCount: 2, unconfirmedTodayCount: 1 });
+  });
+});
+
+describe('PATCH /api/shows/:id — a new start time re-checks availability (correctness #1)', () => {
+  it('flags comedians the new time is outside of, clears stale flags, in the same save', async () => {
+    const date = '2030-11-01';
+    const show = createShow(t.db, { date, startMin: 1260 }); // 9 PM
+    const early = markedComic('Early Bird', date, [1140, 1260]); // 7–9 PM: fits 9 PM, not 11 PM
+    const late = markedComic('Night Owl', date, [1320, 1500]); // 10 PM–1 AM: booked anyway at 9 PM
+    const blank = markedComic('Blank', date); // submitted, didn't mark the date
+    const allNight = markedComic('All Night', date, [1140, 1500]);
+    const bEarly = createBooking(t.db, { showId: show.id, comedianId: early.id, position: 0 });
+    const bLate = createBooking(t.db, { showId: show.id, comedianId: late.id, position: 1, overrideUnavailable: true });
+    const bBlank = createBooking(t.db, { showId: show.id, comedianId: blank.id, position: 2, overrideUnavailable: true });
+    const bAll = createBooking(t.db, { showId: show.id, comedianId: allNight.id, position: 3 });
+
+    const res = await patch(show.id, { startMin: 1380 }); // 11 PM
+    expect(res.status).toBe(200);
+    const body = await readJson<UpdateShowResponse>(res);
+    // Early Bird now needs the ⚠; Night Owl's is gone; Blank keeps theirs (already flagged, not "new").
+    expect(body.newlyUnavailable).toEqual([
+      {
+        showId: show.id,
+        bookingId: bEarly.id,
+        comedianId: early.id,
+        comedianName: 'Early Bird',
+        availability: { startMin: 1140, endMin: 1260 },
+        submittedMonth: true,
+      },
+    ]);
+    expect([bEarly, bLate, bBlank, bAll].map((b) => bookingRow(b.id).overrideUnavailable)).toEqual([true, false, true, false]);
+    expect(body.bookings.map((b) => b.overrideUnavailable)).toEqual([true, false, true, false]);
+
+    // The lineup board reads the same flags.
+    const day = await readJson<DayResponse>(await t.request(`/api/days/${date}`, { headers }));
+    expect(day.shows[0]!.bookings.map((b) => b.overrideUnavailable)).toEqual([true, false, true, false]);
+
+    // And back to 9 PM: Early Bird fits again, Night Owl doesn't.
+    const back = await readJson<UpdateShowResponse>(await patch(show.id, { startMin: 1260 }));
+    expect(back.newlyUnavailable.map((c) => c.comedianName)).toEqual(['Night Owl']);
+    expect([bEarly, bLate, bBlank, bAll].map((b) => bookingRow(b.id).overrideUnavailable)).toEqual([false, true, true, false]);
+  });
+
+  it('leaves the flags alone when the time does not change', async () => {
+    const date = '2030-11-01';
+    const show = createShow(t.db, { date, startMin: 1260 });
+    const b = createBooking(t.db, { showId: show.id, comedianId: markedComic('Blank', date).id, overrideUnavailable: false });
+    const body = await readJson<UpdateShowResponse>(await patch(show.id, { name: 'Late', startMin: 1260 }));
+    expect(body).toMatchObject({ newlyUnavailable: [], matching: null, confirmationsReset: 0 });
+    expect(bookingRow(b.id).overrideUnavailable).toBe(false);
+  });
+});
+
+describe('PATCH /api/shows/:id — applyToMatching (UX A4)', () => {
+  it('carries name, time and slots to the month’s other shows at the same place, weekday and time', async () => {
+    const cellar = createLocation(t.db, { name: 'Cellar' });
+    const annex = createLocation(t.db, { name: 'Annex' });
+    const fridays = datesForWeekday(NOV, 5); // 2030-11-01, 08, 15, 22, 29
+    const [first, ...rest] = fridays.map((date) =>
+      createShow(t.db, { locationId: cellar.id, date, startMin: 1200, slotCount: 6, name: 'Early' }),
+    );
+    const otherRoom = createShow(t.db, { locationId: annex.id, date: fridays[1]!, startMin: 1200 });
+    const otherTime = createShow(t.db, { locationId: cellar.id, date: fridays[2]!, startMin: 1140 });
+    const saturday = createShow(t.db, { locationId: cellar.id, date: '2030-11-02', startMin: 1200 });
+    const december = createShow(t.db, { locationId: cellar.id, date: '2030-12-06', startMin: 1200 });
+    const cancelled = createShow(t.db, { locationId: cellar.id, date: fridays[3]!, startMin: 1200, status: 'cancelled' });
+
+    // One matching show already has a 10 PM show in the way; another has slot 7 booked.
+    const blocker = createShow(t.db, { locationId: cellar.id, date: fridays[3]!, startMin: 1320 });
+    createBooking(t.db, { showId: rest[0]!.id, comedianId: createComedian(t.db).id, position: 6 });
+    // A comedian on a matching show who can't do 10 PM.
+    const early = markedComic('Early Bird', fridays[4]!, [1140, 1260]);
+    const bEarly = createBooking(t.db, { showId: rest[3]!.id, comedianId: early.id, position: 0, confirmedAt: 5, confirmedBy: 'comedian' });
+
+    const res = await patch(first!.id, { name: 'Late', startMin: 1320, slotCount: 5, notes: 'Only this one', applyToMatching: true });
+    expect(res.status).toBe(200);
+    const body = await readJson<UpdateShowResponse>(res);
+    expect(body).toMatchObject({ name: 'Late', startMin: 1320, slotCount: 5, notes: 'Only this one' });
+    expect(body.matching).toEqual({
+      updatedIds: [rest[1]!.id, rest[3]!.id],
+      skipped: [
+        { id: rest[0]!.id, date: fridays[1], reason: 'slots_occupied' },
+        { id: rest[2]!.id, date: fridays[3], reason: 'duplicate_show' },
+      ],
+    });
+    expect(body.confirmationsReset).toBe(1);
+    expect(body.newlyUnavailable.map((c) => [c.showId, c.comedianName])).toEqual([[rest[3]!.id, 'Early Bird']]);
+    expect(bookingRow(bEarly.id)).toMatchObject({ overrideUnavailable: true, confirmedAt: null });
+
+    const byId = new Map(allShows().map((s) => [s.id, s]));
+    for (const id of [rest[1]!.id, rest[3]!.id]) {
+      expect(byId.get(id)).toMatchObject({ name: 'Late', startMin: 1320, slotCount: 5, notes: '' });
+    }
+    for (const id of [rest[0]!.id, rest[2]!.id]) expect(byId.get(id)).toMatchObject({ name: 'Early', startMin: 1200, slotCount: 6 });
+    for (const s of [otherRoom, otherTime, saturday, december, cancelled, blocker]) {
+      expect(byId.get(s.id)).toMatchObject({ name: s.name, startMin: s.startMin, slotCount: s.slotCount });
+    }
+  });
+
+  it('without applyToMatching only the one show changes; notes alone never spread', async () => {
+    const cellar = createLocation(t.db);
+    const [a, b] = datesForWeekday(NOV, 5).map((date) => createShow(t.db, { locationId: cellar.id, date, startMin: 1200 }));
+    expect((await readJson<UpdateShowResponse>(await patch(a!.id, { name: 'Solo' }))).matching).toBeNull();
+    const notesOnly = await readJson<UpdateShowResponse>(await patch(a!.id, { notes: 'Hi', applyToMatching: true }));
+    expect(notesOnly.matching).toEqual({ updatedIds: [], skipped: [] });
+    expect(allShows().find((s) => s.id === b!.id)).toMatchObject({ name: '', notes: '' });
+    expect((await patch(a!.id, { applyToMatching: true })).status).toBe(400);
+  });
+
+  it('isMatchingShow: same location, weekday, start time and month, scheduled, from today on', () => {
+    const show = { id: 1, locationId: 1, date: '2030-11-08', startMin: 1200 };
+    const ok = { id: 2, locationId: 1, date: '2030-11-15', startMin: 1200, status: 'scheduled' as const };
+    expect(isMatchingShow(show, ok, '2030-11-01')).toBe(true);
+    expect(isMatchingShow(show, { ...ok, id: 1 }, '2030-11-01')).toBe(false);
+    expect(isMatchingShow(show, { ...ok, locationId: 2 }, '2030-11-01')).toBe(false);
+    expect(isMatchingShow(show, { ...ok, startMin: 1260 }, '2030-11-01')).toBe(false);
+    expect(isMatchingShow(show, { ...ok, date: '2030-11-16' }, '2030-11-01')).toBe(false); // Saturday
+    expect(isMatchingShow(show, { ...ok, date: '2030-12-06' }, '2030-11-01')).toBe(false); // next month
+    expect(isMatchingShow(show, { ...ok, status: 'cancelled' }, '2030-11-01')).toBe(false);
+    expect(isMatchingShow(show, { ...ok, date: '2030-11-01' }, '2030-11-08')).toBe(false); // past
+  });
+});
+
+describe('POST /api/shows/bulk-delete (Undo of a bulk create)', () => {
+  it('deletes the shows that have no bookings and keeps (and reports) the rest', async () => {
+    const [a, b, c] = [createShow(t.db), createShow(t.db), createShow(t.db)];
+    const keep = createShow(t.db);
+    createBooking(t.db, { showId: b.id, comedianId: createComedian(t.db).id });
+    const res = await post('/api/shows/bulk-delete', { ids: [a.id, b.id, c.id, c.id, 999] });
+    expect(res.status).toBe(200);
+    expect(await readJson<BulkDeleteShowsResponse>(res)).toEqual({
+      deleted: [a.id, c.id],
+      kept: [{ id: b.id, bookingCount: 1 }],
+    });
+    expect(allShows().map((s) => s.id).sort()).toEqual([b.id, keep.id].sort());
+  });
+
+  it('validates the ids', async () => {
+    for (const json of [{}, { ids: [] }, { ids: ['x'] }, { ids: Array.from({ length: 401 }, (_, i) => i + 1) }]) {
+      expect((await post('/api/shows/bulk-delete', json)).status, JSON.stringify(json).slice(0, 40)).toBe(400);
+    }
+  });
+
+  it('undoes a bulk create end to end', async () => {
+    const location = createLocation(t.db);
+    const created = await readJson<BulkCreateShowsResponse>(
+      await post('/api/shows/bulk', { locationId: location.id, startMin: 1200, dates: ['2030-11-01', '2030-11-08'] }),
+    );
+    const ids = created.created.map((s) => s.id);
+    expect((await readJson<BulkDeleteShowsResponse>(await post('/api/shows/bulk-delete', { ids }))).deleted).toEqual(ids);
+    expect(allShows()).toHaveLength(0);
+  });
+});
+
+describe('POST /api/shows/bulk-status ("Cancel all shows this day")', () => {
+  it('cancels several shows at once (keeping lineups) and restores them', async () => {
+    const date = '2030-11-27';
+    const [a, b] = [createShow(t.db, { date, startMin: 1140 }), createShow(t.db, { date, startMin: 1260 })];
+    const booking = createBooking(t.db, { showId: a.id, comedianId: createComedian(t.db).id, confirmedAt: 3, confirmedBy: 'comedian' });
+
+    const cancel = await post('/api/shows/bulk-status', { ids: [a.id, b.id, 999], status: 'cancelled' });
+    expect(cancel.status).toBe(200);
+    expect(await readJson<BulkShowStatusResponse>(cancel)).toEqual({
+      updatedIds: [a.id, b.id],
+      skipped: [{ id: 999, reason: 'not_found' }],
+    });
+    expect(allShows().map((s) => s.status)).toEqual(['cancelled', 'cancelled']);
+    expect((await readJson<DayResponse>(await t.request(`/api/days/${date}`, { headers }))).shows).toEqual([]);
+
+    const undo = await readJson<BulkShowStatusResponse>(await post('/api/shows/bulk-status', { ids: [a.id, b.id], status: 'scheduled' }));
+    expect(undo).toEqual({ updatedIds: [a.id, b.id], skipped: [] });
+    expect(allShows().map((s) => s.status)).toEqual(['scheduled', 'scheduled']);
+    expect(bookingRow(booking.id)).toMatchObject({ showId: a.id, confirmedAt: 3 });
+  });
+
+  it('reports a show that already had the status as unchanged, so Undo leaves it alone', async () => {
+    const date = '2030-11-28';
+    const [a, b] = [createShow(t.db, { date, startMin: 1140 }), createShow(t.db, { date, startMin: 1260, status: 'cancelled' })];
+    const cancel = await readJson<BulkShowStatusResponse>(
+      await post('/api/shows/bulk-status', { ids: [a.id, b.id], status: 'cancelled' }),
+    );
+    expect(cancel).toEqual({ updatedIds: [a.id], skipped: [{ id: b.id, reason: 'unchanged' }] });
+    await post('/api/shows/bulk-status', { ids: cancel.updatedIds, status: 'scheduled' });
+    expect(allShows().map((s) => [s.id, s.status])).toEqual([
+      [a.id, 'scheduled'],
+      [b.id, 'cancelled'],
+    ]);
+  });
+
+  it('never restores a show into a place and time that is taken again', async () => {
+    const location = createLocation(t.db);
+    const old = createShow(t.db, { locationId: location.id, startMin: 1260, status: 'cancelled' });
+    const replacement = createShow(t.db, { locationId: location.id, startMin: 1260 });
+    const res = await readJson<BulkShowStatusResponse>(await post('/api/shows/bulk-status', { ids: [old.id], status: 'scheduled' }));
+    expect(res).toEqual({ updatedIds: [], skipped: [{ id: old.id, reason: 'duplicate_show' }] });
+    expect(allShows().find((s) => s.id === old.id)?.status).toBe('cancelled');
+    expect(allShows().find((s) => s.id === replacement.id)?.status).toBe('scheduled');
+    expect((await post('/api/shows/bulk-status', { ids: [old.id], status: 'gone' })).status).toBe(400);
+  });
 });

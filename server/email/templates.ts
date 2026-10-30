@@ -108,7 +108,8 @@ ${preheader}
 
 export function loginCodeEmail(params: { clubName: string; name: string; code: string }): EmailContent {
   const { clubName, name, code } = params;
-  const subject = `${code} is your ${clubName} sign-in code`;
+  // "…for The Laugh Track", never "your The Laugh Track sign-in code" (club names often start with "The").
+  const subject = `${code} is your sign-in code for ${clubName}`;
   const html = renderEmailLayout({
     clubName,
     preheader: `Your sign-in code is ${code}. It expires in 10 minutes.`,
@@ -122,7 +123,7 @@ export function loginCodeEmail(params: { clubName: string; name: string; code: s
   });
   const text = `Hey ${firstName(name)},
 
-Your ${clubName} sign-in code is: ${code}
+Your sign-in code for ${clubName} is: ${code}
 
 It expires in 10 minutes. If you didn't try to sign in, you can ignore this email.`;
   return { subject, html, text };

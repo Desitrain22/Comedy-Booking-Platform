@@ -3,8 +3,15 @@ import nodemailer from 'nodemailer';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { updateSettings } from '../lib/settings';
 import { smtpErrorHint } from '../routes/settings';
-import { latestEmail, makeTestApp, type TestApp } from '../test/helpers';
-import { SMTP_TIMEOUTS, getMailConfig, sendEmail, setTransportFactory, smtpTransportOptions } from './mailer';
+import { createUser, latestEmail, makeTestApp, type TestApp } from '../test/helpers';
+import {
+  SMTP_TIMEOUTS,
+  getMailConfig,
+  replyToWithAdminFallback,
+  sendEmail,
+  setTransportFactory,
+  smtpTransportOptions,
+} from './mailer';
 
 let t: TestApp;
 beforeEach(() => {
@@ -46,5 +53,39 @@ describe('SMTP timeouts', () => {
       for (const socket of sockets) socket.destroy();
       await new Promise((resolve) => server.close(resolve));
     }
+  });
+});
+
+describe('Reply-To', () => {
+  function captureSends() {
+    const sent: { replyTo?: unknown }[] = [];
+    setTransportFactory(() => ({
+      sendMail: (async (mail: { replyTo?: unknown }) => {
+        sent.push(mail);
+        return {};
+      }) as never,
+    }));
+    updateSettings(t.db, { smtpHost: 'smtp.example.test', fromEmail: 'club@example.test' });
+    return sent;
+  }
+
+  it('uses the configured Reply-To unless the message overrides it', async () => {
+    const sent = captureSends();
+    await sendEmail(t.db, message);
+    updateSettings(t.db, { replyTo: 'desk@example.test' });
+    await sendEmail(t.db, message);
+    await sendEmail(t.db, { ...message, replyTo: 'booker@example.test' });
+    expect(sent.map((m) => m.replyTo)).toEqual([undefined, 'desk@example.test', 'booker@example.test']);
+  });
+
+  it('falls back to the first active admin when no Reply-To is configured', () => {
+    expect(replyToWithAdminFallback(t.db)).toBe('');
+    createUser(t.db, { role: 'booker', email: 'booker@example.test', createdAt: 1 });
+    createUser(t.db, { role: 'admin', email: 'invited@example.test', passwordHash: null, createdAt: 2 });
+    createUser(t.db, { role: 'admin', email: 'second@example.test', createdAt: 4 });
+    createUser(t.db, { role: 'admin', email: 'first@example.test', createdAt: 3 });
+    expect(replyToWithAdminFallback(t.db)).toBe('first@example.test');
+    updateSettings(t.db, { replyTo: 'desk@example.test' });
+    expect(replyToWithAdminFallback(t.db)).toBe('desk@example.test');
   });
 });

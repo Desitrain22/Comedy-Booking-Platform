@@ -77,6 +77,24 @@ describe('first-run setup', () => {
     expect(t.db.select().from(users).all()).toHaveLength(1);
   });
 
+  it('lets only one of two simultaneous first-run requests through (security#7)', async () => {
+    const owner = { ...input, admin: { ...input.admin, email: 'owner@club.test' } };
+    const attacker = { ...input, clubName: 'Hijacked', admin: { ...input.admin, email: 'attacker@evil.test' } };
+    const [a, b] = await Promise.all([postSetup(owner), postSetup(attacker)]);
+    expect([a.status, b.status].sort()).toEqual([201, 409]);
+    const loser = a.status === 409 ? a : b;
+    expect(await readJson(loser)).toMatchObject({ code: 'already_setup' });
+    expect(loser.headers.getSetCookie()).toEqual([]);
+
+    // Exactly one admin and one location: the loser's transaction saved nothing.
+    const admins = t.db.select().from(users).all();
+    expect(admins).toHaveLength(1);
+    expect(t.db.select().from(locations).all()).toHaveLength(1);
+    const winner = a.status === 201 ? owner : attacker;
+    expect(admins[0]!.email).toBe(winner.admin.email);
+    expect(getSettings(t.db).clubName).toBe(winner.clubName);
+  });
+
   it('is refused on an app that is already set up', async () => {
     t.close();
     t = makeTestApp();

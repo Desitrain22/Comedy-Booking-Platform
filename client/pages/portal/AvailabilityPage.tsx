@@ -8,11 +8,17 @@
  * until Save, which sends the whole month and records a submission (even with zero
  * nights). Unsaved changes are guarded on unload, in-app navigation and month switches.
  *
+ * Painting is immediate (tap or drag, no press-and-hold). The sticky bar's **Undo** takes
+ * back the last drag or weekday tap (Ctrl/⌘+Z too), and **Discard** returns to what's
+ * saved (itself undoable) — so a phone swipe that painted instead of scrolling is one tap
+ * to fix. While the bar is on screen it sets `--toast-bottom-offset` so phone toasts sit
+ * above it.
+ *
  * Month: `?month=`, else next month from the 20th on, else the current month.
  */
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { ArrowRight, Check, ChevronLeft, ChevronRight, Clock, Moon, RotateCw, X } from 'lucide-react';
-import { useEffect, useState, type ReactNode } from 'react';
+import { ArrowRight, Check, ChevronLeft, ChevronRight, Clock, Moon, RotateCw, Undo2, X } from 'lucide-react';
+import { useEffect, useReducer, useRef, useState, type ReactNode } from 'react';
 import { Link, useSearchParams } from 'react-router';
 import { toast } from 'sonner';
 import { DEFAULT_CUSTOM_RANGE, defaultAvailabilityMonth, type PortalAvailabilityResponse } from '../../../shared/api/portal';
@@ -41,16 +47,16 @@ import { useClub } from '../../lib/useMe';
 import {
   dayLabel,
   draftFromEntries,
+  editorReducer,
   END_OPTIONS,
   entriesFromDraft,
-  paint,
+  initEditor,
   paintableWeekdayDates,
   sameDraft,
   START_OPTIONS,
   withEnd,
   withStart,
   type BrushKind,
-  type Draft,
 } from './availabilityDraft';
 import { portalKeys, useAvailability, usePortalMe } from './portalQueries';
 import { useUnsavedChangesGuard } from './useUnsavedChangesGuard';
@@ -176,14 +182,16 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
   const timeZone = useClub()?.timezone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
   const { month, today, allNight } = data;
   const [saved, setSaved] = useState(() => ({ source: data, draft: draftFromEntries(data.entries) }));
-  const [draft, setDraft] = useState<Draft>(saved.draft);
+  const [editor, dispatch] = useReducer(editorReducer, saved.draft, initEditor);
+  const draft = editor.draft;
   const dirty = !sameDraft(saved.draft, draft);
+  const canUndo = editor.history.length > 0;
 
   // Fresh server data arrived while nothing is unsaved (e.g. a refetch): adopt it.
   if (data !== saved.source && !dirty) {
     const fresh = draftFromEntries(data.entries);
     setSaved({ source: data, draft: fresh });
-    setDraft(fresh);
+    dispatch({ type: 'reset', draft: fresh });
   }
 
   const save = useMutation({
@@ -192,6 +200,7 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
     meta: { silent: true }, // errors are shown by the caller (toast or the leave dialog)
     onSuccess: (res) => {
       setSaved({ source: res, draft: draftFromEntries(res.entries) });
+      dispatch({ type: 'saved' });
       queryClient.setQueryData(portalKeys.availability(month), res);
       void queryClient.invalidateQueries({ queryKey: portalKeys.me });
       toast.success('Saved — the club can see it now');
@@ -207,12 +216,17 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
     saveNow().catch((err: unknown) => toast.error(errorMessage(err, "Couldn't save. Try again.")));
   }
 
-  // Ctrl/⌘+S saves.
+  // Ctrl/⌘+S saves; Ctrl/⌘+Z undoes the last stroke (not while typing in a field).
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 's') {
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const key = e.key.toLowerCase();
+      if (key === 's') {
         e.preventDefault();
         document.getElementById('availability-save')?.click();
+      } else if (key === 'z' && !e.shiftKey && !(e.target instanceof Element && e.target.closest('input, textarea, select'))) {
+        e.preventDefault();
+        dispatch({ type: 'undo' });
       }
     }
     window.addEventListener('keydown', onKeyDown);
@@ -227,6 +241,7 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
   });
 
   const monthOver = lastDayOfMonth(month) < today;
+  const barRef = useToastOffset(!monthOver);
   const range: AvailabilityRange | null = brush === 'allNight' ? allNight : brush === 'custom' ? custom : null;
   const isPast = (date: string) => date < today;
   const nights = draft.size;
@@ -270,7 +285,7 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
                     disabled={dates.length === 0}
                     aria-label={`${range ? 'Mark' : 'Clear'} every ${name}`}
                     title={`${range ? 'Mark' : 'Clear'} every ${name}`}
-                    onClick={() => setDraft((d) => paint(d, dates, range))}
+                    onClick={() => dispatch({ type: 'paint', dates, range })}
                     className={cn(
                       'h-11 min-w-0 rounded-lg border border-border bg-surface text-xs font-semibold text-fg-muted transition-colors',
                       'hover:border-accent hover:text-fg active:bg-surface-2 disabled:cursor-not-allowed disabled:opacity-40',
@@ -297,7 +312,8 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
         isDisabled={(date) => monthOver || isPast(date)}
         isSelected={(date) => draft.has(date)}
         dayClassName={(date) => draft.has(date) && PAINTED_CELL}
-        onPaint={monthOver ? undefined : (dates) => setDraft((d) => paint(d, dates, range))}
+        onPaint={monthOver ? undefined : (dates, gesture) => dispatch({ type: 'paint', dates, range, stroke: gesture.id })}
+        onPaintEnd={(gesture) => dispatch({ type: 'strokeEnd', stroke: gesture.id })}
         renderDay={(date) => {
           const night = draft.get(date);
           if (!night) return null;
@@ -325,13 +341,15 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
 
       {!monthOver && (
         <div
+          ref={barRef}
           className={cn(
             'sticky bottom-0 z-10 -mx-4 -mb-5 mt-4 border-t border-border bg-surface/95 px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] backdrop-blur',
             'sm:mx-0 sm:mb-0 sm:rounded-xl sm:border sm:pb-3 sm:shadow-lg',
           )}
         >
-          <div className="flex items-center justify-between gap-3">
-            <p className="min-w-0 text-sm" aria-live="polite" data-testid="availability-status">
+          <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+            {/* Natural width: when Undo/Discard don't fit beside it (phones), the buttons wrap below. */}
+            <p className="min-w-0 flex-auto text-sm" aria-live="polite" data-testid="availability-status">
               {dirty ? (
                 <>
                   <span className="font-medium text-awaiting-fg">
@@ -351,16 +369,41 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
                 </span>
               )}
             </p>
-            <Button
-              id="availability-save"
-              size="lg"
-              className="px-7 sm:h-10"
-              onClick={handleSave}
-              disabled={!canSave}
-              loading={save.isPending}
-            >
-              Save
-            </Button>
+            <div className="ml-auto flex items-center gap-1.5 sm:gap-2">
+              {canUndo && (
+                <Button
+                  variant="ghost"
+                  size="lg"
+                  className="px-3 text-fg-muted hover:text-fg sm:h-10"
+                  onClick={() => dispatch({ type: 'undo' })}
+                  title="Undo the last change (Ctrl+Z)"
+                >
+                  <Undo2 /> Undo
+                </Button>
+              )}
+              {dirty && (
+                <Button
+                  variant="ghost"
+                  size="lg"
+                  className="px-3 text-fg-muted hover:text-fg sm:h-10"
+                  onClick={() => dispatch({ type: 'discard', saved: saved.draft })}
+                  disabled={save.isPending}
+                  title="Go back to what you last saved"
+                >
+                  Discard
+                </Button>
+              )}
+              <Button
+                id="availability-save"
+                size="lg"
+                className="px-7 sm:h-10"
+                onClick={handleSave}
+                disabled={!canSave}
+                loading={save.isPending}
+              >
+                Save
+              </Button>
+            </div>
           </div>
         </div>
       )}
@@ -368,6 +411,28 @@ function AvailabilityEditor({ data, nav, brush, onBrushChange, custom, onCustomC
       {guard.dialog}
     </>
   );
+}
+
+/**
+ * While the sticky bar is mounted, publish its height as `--toast-bottom-offset` (read by
+ * the phone Toaster in main.tsx) so toasts land just above it instead of on top of it.
+ */
+function useToastOffset(active: boolean) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const bar = ref.current;
+    if (!active || !bar) return;
+    const root = document.documentElement;
+    const update = () => root.style.setProperty('--toast-bottom-offset', `${Math.ceil(bar.offsetHeight) + 12}px`);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(bar);
+    return () => {
+      observer.disconnect();
+      root.style.removeProperty('--toast-bottom-offset');
+    };
+  }, [active]);
+  return ref;
 }
 
 // ---------------------------------------------------------------------------

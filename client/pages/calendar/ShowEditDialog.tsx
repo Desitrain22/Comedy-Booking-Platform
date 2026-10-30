@@ -1,7 +1,11 @@
 /**
  * Edit one show (opened from a calendar pill or `/app/calendar?show=<id>`): name, start
  * time, slot count, notes; cancel/restore; delete when it has no bookings. Changing the
- * start time resets its bookings' confirmations (the server does it; we warn first).
+ * start time resets its bookings' confirmations and re-checks who is available at the new
+ * time (the server does both; we warn first, naming who'd be "booked anyway").
+ *
+ * "Also apply to …" carries the name, time and slot count to the month's other shows at the
+ * same location, weekday and time (from today on) in one save.
  */
 import { useQueryClient } from '@tanstack/react-query';
 import { ArrowUpRight, Ban, Minus, Plus, RotateCcw, Trash2, TriangleAlert } from 'lucide-react';
@@ -15,10 +19,21 @@ import {
   SHOW_START_PICKER_MAX,
   SHOW_START_STEP,
   SLOT_COUNT_MAX,
+  isMatchingShow,
   type ShowDetail,
   type UpdateShowInput,
+  type UpdateShowResponse,
 } from '../../../shared/api/shows';
-import { formatDateLong, formatTime, timeOptions } from '../../../shared/time';
+import {
+  WEEKDAY_NAMES,
+  formatDateLong,
+  formatDateShort,
+  formatRange,
+  formatTime,
+  monthOf,
+  timeOptions,
+  weekdayOf,
+} from '../../../shared/time';
 import { BookingStatusBadge } from '../../components/BookingStatusBadge';
 import {
   Badge,
@@ -31,12 +46,22 @@ import {
   Input,
   Select,
   Spinner,
+  Switch,
   Textarea,
   buttonClasses,
 } from '../../components/ui';
 import { api, errorMessage, isApiError } from '../../lib/api';
-import { plural } from '../shows/showFormat';
-import { invalidateShowData, useDeleteShow, useShowDetail, useUpdateShow } from '../shows/showsData';
+import { cn } from '../../lib/cn';
+import { BOOKING_STATUS_CLASSES } from '../../lib/statusStyles';
+import { namesPhrase, plural, timeChangeEffects } from '../shows/showFormat';
+import {
+  invalidateShowData,
+  useClubToday,
+  useDeleteShow,
+  useMonthShows,
+  useShowDetail,
+  useUpdateShow,
+} from '../shows/showsData';
 
 export interface ShowEditDialogProps {
   /** The show to edit; null = closed. */
@@ -92,6 +117,14 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
   const [notes, setNotes] = useState(show.notes);
   const [confirming, setConfirming] = useState<'cancel' | 'delete' | null>(null);
   const [serverError, setServerError] = useState<string | null>(null);
+  const [applyToMatching, setApplyToMatching] = useState(false);
+  const today = useClubToday();
+  const monthShows = useMonthShows(monthOf(show.date));
+  // The month's other shows at this location, weekday and time, from today on.
+  const matching = useMemo(
+    () => (monthShows.data ?? []).filter((other) => isMatchingShow(show, other, today)),
+    [monthShows.data, show, today],
+  );
 
   const queryClient = useQueryClient();
   const update = useUpdateShow(show.id);
@@ -114,6 +147,9 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
   if (slotCount !== show.slotCount) patch.slotCount = slotCount;
   if (notes.trim() !== show.notes) patch.notes = notes.trim();
   const dirty = Object.keys(patch).length > 0;
+  // Only the name, time and slots spread to matching shows (notes and status stay per show).
+  const spreadable = patch.name !== undefined || patch.startMin !== undefined || patch.slotCount !== undefined;
+  const spreading = applyToMatching && spreadable && matching.length > 0;
 
   const slotError =
     slotCount < show.minSlotCount
@@ -123,6 +159,7 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
         : undefined;
   const confirmedCount = show.bookings.filter((b) => b.confirmedAt != null).length;
   const timeChanged = startMin !== show.startMin;
+  const effects = timeChanged ? timeChangeEffects(show.bookings, startMin) : null;
   const where = `${formatDateLong(show.date)} · ${formatTime(show.startMin)} at ${show.location.name}`;
 
   async function save(e: FormEvent) {
@@ -130,11 +167,10 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
     if (!dirty || slotError) return;
     setServerError(null);
     try {
-      const result = await update.mutateAsync(patch);
-      toast.success('Show updated', {
-        description: result.confirmationsReset
-          ? `${plural(result.confirmationsReset, 'comedian')} will need to confirm the new time.`
-          : undefined,
+      const result = await update.mutateAsync(spreading ? { ...patch, applyToMatching: true } : patch);
+      toast.success(result.matching?.updatedIds.length ? `Updated ${plural(result.matching.updatedIds.length + 1, 'show')}` : 'Show updated', {
+        description: saveSummary(result) || undefined,
+        duration: result.newlyUnavailable.length || result.matching?.skipped.length ? 10_000 : undefined,
       });
       onClose();
     } catch (err) {
@@ -266,17 +302,64 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
           </div>
 
           {timeChanged && show.bookedCount > 0 && (
-            <p
+            <div
               role="status"
               className="flex gap-2 rounded-lg border border-awaiting/40 bg-awaiting-soft px-3 py-2 text-sm text-awaiting-fg"
             >
               <TriangleAlert className="mt-0.5 size-4 shrink-0" aria-hidden />
-              <span>
-                Moving to {formatTime(startMin)} resets confirmations: {show.bookedCount === 1 ? 'the' : 'all'}{' '}
-                {plural(show.bookedCount, 'booked comedian')} will need to confirm the new time
-                {confirmedCount ? ` (${confirmedCount} already confirmed ${formatTime(show.startMin)})` : ''}.
-              </span>
-            </p>
+              <div className="space-y-1">
+                <p>
+                  Moving to {formatTime(startMin)} resets confirmations: {show.bookedCount === 1 ? 'the' : 'all'}{' '}
+                  {plural(show.bookedCount, 'booked comedian')} will need to confirm the new time
+                  {confirmedCount ? ` (${confirmedCount} already confirmed ${formatTime(show.startMin)})` : ''}.
+                </p>
+                {effects && effects.newlyUnavailable.length > 0 && (
+                  <p>
+                    <strong className="font-semibold">
+                      {namesPhrase(effects.newlyUnavailable.map((b) => b.comedianName))}{' '}
+                      {effects.newlyUnavailable.length === 1 ? 'isn’t' : 'aren’t'} available at {formatTime(startMin)}
+                    </strong>{' '}
+                    ({effects.newlyUnavailable
+                      .map((b) => {
+                        const who = b.comedianName.split(' ')[0];
+                        if (b.availability) return `${who} marked ${formatRange(b.availability.startMin, b.availability.endMin)}`;
+                        return b.submittedMonth ? `${who} didn’t mark this date` : `${who} hasn’t submitted`;
+                      })
+                      .join('; ')}
+                    ) and will show as booked anyway.
+                  </p>
+                )}
+                {effects && effects.nowAvailable.length > 0 && (
+                  <p>
+                    {namesPhrase(effects.nowAvailable.map((b) => b.comedianName))}{' '}
+                    {effects.nowAvailable.length === 1 ? 'is' : 'are'} available at {formatTime(startMin)}, so the “booked
+                    anyway” flag goes away.
+                  </p>
+                )}
+              </div>
+            </div>
+          )}
+
+          {matching.length > 0 && (
+            <div className="rounded-lg border border-border px-3 py-2.5">
+              <Switch
+                checked={applyToMatching}
+                onCheckedChange={setApplyToMatching}
+                disabled={!spreadable}
+                label={
+                  <span className="text-sm text-fg">
+                    Also apply to the {matching.length === 1 ? 'other' : `${matching.length} other`}{' '}
+                    {WEEKDAY_NAMES[weekdayOf(show.date)]}{' '}
+                    {formatTime(show.startMin)} {matching.length === 1 ? 'show' : 'shows'} at {show.location.name} this month
+                  </span>
+                }
+              />
+              <p className="mt-1 pl-11 text-xs text-fg-muted">
+                {spreadable
+                  ? `Name, start time and slots (${matching.map((m) => formatDateShort(m.date)).join(', ')}). Notes stay on this show.`
+                  : 'Change the name, start time or slots to apply them to all of them.'}
+              </p>
+            </div>
           )}
 
           <Field label="Notes" hint="Only bookers see these.">
@@ -323,6 +406,24 @@ function ShowEditForm({ show, onClose }: { show: ShowDetail; onClose: () => void
       </ConfirmDialog>
     </>
   );
+}
+
+/** The toast description after saving: confirmations, availability, matching shows. */
+function saveSummary(result: UpdateShowResponse): string {
+  const parts: string[] = [];
+  if (result.confirmationsReset) {
+    parts.push(`${plural(result.confirmationsReset, 'comedian')} will need to confirm the new time.`);
+  }
+  if (result.newlyUnavailable.length) {
+    const names = namesPhrase([...new Set(result.newlyUnavailable.map((c) => c.comedianName))]);
+    parts.push(`${names} ${result.newlyUnavailable.length === 1 ? 'isn’t' : 'aren’t'} available at the new time (booked anyway).`);
+  }
+  const skipped = result.matching?.skipped ?? [];
+  if (skipped.length) {
+    const why = (reason: string) => (reason === 'duplicate_show' ? 'another show is already there' : 'a booked slot');
+    parts.push(`Skipped ${skipped.map((s) => `${formatDateShort(s.date)} (${why(s.reason)})`).join(', ')}.`);
+  }
+  return parts.join(' ');
 }
 
 function SlotStepper({
@@ -401,7 +502,9 @@ function Lineup({ show }: { show: ShowDetail }) {
               <span className="w-4 shrink-0 text-right text-xs text-fg-subtle tabular-nums">{position + 1}</span>
               {booking ? (
                 <>
-                  <span className="min-w-0 flex-1 truncate text-fg">{booking.comedianName}</span>
+                  <span className={cn('min-w-0 flex-1 truncate text-fg', BOOKING_STATUS_CLASSES[booking.status].name)}>
+                    {booking.comedianName}
+                  </span>
                   <BookingStatusBadge status={booking.status} short />
                 </>
               ) : (

@@ -2,8 +2,9 @@
  * Day data (`['days', date]`) and the lineup mutations, all optimistic:
  * the cache changes first, the request follows, and a failure rolls back.
  *
- * Removing someone, or replacing them by dropping a pool comedian on their slot, toasts an
- * Undo that re-creates the removed booking exactly (`restore`: confirmation included).
+ * Removing someone, or replacing them by dropping a pool comedian on their slot (or a
+ * comedian from another show on a declined slot), toasts an Undo that re-creates the
+ * removed booking exactly (`restore`: confirmation included).
  *
  * Several mutations can be in flight at once (fast drags). Each snapshots the cache; a
  * failure restores its snapshot only when it is the sole pending lineup mutation (otherwise
@@ -18,6 +19,7 @@ import {
   type CreateBookingResponse,
   type DayResponse,
   type DeleteBookingResponse,
+  type LineupBooking,
   type MoveBookingResponse,
   type RemovedBooking,
   type UnavailableConflict,
@@ -136,6 +138,36 @@ export function useLineupActions(date: string, handlers: LineupHandlers) {
     });
   }
 
+  /**
+   * Undo of a move that replaced a declined booking. Moving back would reset the mover's
+   * confirmation (a different show is a new spot), so instead: remove the moved booking,
+   * re-create it where and how it was (`from`, before the move), then restore `replaced`.
+   */
+  async function undoReplacingMove(movedId: number, from: LineupBooking, replaced: RemovedBooking) {
+    try {
+      const { booking: moved } = await api.del<DeleteBookingResponse>(`/bookings/${movedId}`);
+      const { overrideUnavailable, confirmationSentAt, confirmedAt, confirmedBy, declinedAt, declineNote } = from;
+      const original = { overrideUnavailable, confirmationSentAt, confirmedAt, confirmedBy, declinedAt, declineNote };
+      for (const [booking, restore] of [
+        [from, { ...restoreOf(moved), ...original }],
+        [replaced, restoreOf(replaced)],
+      ] as const) {
+        await api.post<CreateBookingResponse>('/bookings', {
+          comedianId: booking.comedianId,
+          showId: booking.showId,
+          position: booking.position,
+          force: true,
+          restore,
+        });
+      }
+    } catch (err) {
+      toast.error(errorMessage(err));
+    } finally {
+      void queryClient.invalidateQueries({ queryKey: key });
+      settle();
+    }
+  }
+
   const book = useMutation({
     mutationKey,
     mutationFn: ({ tempId: _tempId, ...vars }: BookVars & { tempId: number }) =>
@@ -169,10 +201,22 @@ export function useLineupActions(date: string, handlers: LineupHandlers) {
     mutationFn: ({ bookingId, showId, position, force }: MoveVars) =>
       api.patch<MoveBookingResponse>(`/bookings/${bookingId}`, { showId, position, force }),
     onMutate: (vars) => begin((day) => applyMove(day, vars)),
-    onSuccess: ({ booking, swapped }) => {
-      queryClient.setQueryData<DayResponse>(key, (day) =>
-        day ? upsertBookings(day, swapped ? [booking, swapped] : [booking]) : day,
-      );
+    onSuccess: ({ booking, swapped, replaced }, _vars, context) => {
+      queryClient.setQueryData<DayResponse>(key, (day) => {
+        if (!day) return day;
+        const next = upsertBookings(day, swapped ? [booking, swapped] : [booking]);
+        return replaced ? removeBooking(next, replaced.id) : next;
+      });
+      // Moved onto someone who declined: they were unbooked. Undo puts both back exactly.
+      const before = context?.previous ? indexDay(context.previous) : undefined;
+      const from = before?.bookings.get(booking.id);
+      const show = replaced ? before?.shows.get(replaced.showId) : undefined;
+      if (replaced && from && show) {
+        toast(`Replaced ${replaced.comedianName} with ${booking.comedianName} in the ${showTitle(show)}`, {
+          id: `replace-${replaced.id}`,
+          action: { label: 'Undo', onClick: () => void undoReplacingMove(booking.id, from, replaced) },
+        });
+      }
     },
     onError: (err, vars, snapshot) => {
       rollback(snapshot);

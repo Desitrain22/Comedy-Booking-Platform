@@ -1,28 +1,38 @@
 /**
- * Request availability / Remind dialog: month, audience (everyone or a tag), optional
- * personal message, and a live preview of the email the first recipient will get.
+ * Request availability / Remind dialog: month, request-or-reminder, audience (everyone or a
+ * tag), optional personal message, and a live preview of the email the first recipient will
+ * get. When the month was already asked for it says so ("You asked on Oct 22 · 18 of 29 have
+ * submitted") and starts on Reminder, so a second click doesn't quietly re-email everyone.
  */
-import { Send } from 'lucide-react';
+import { BellRing, History, Megaphone, Send } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import {
   AVAILABILITY_MESSAGE_MAX,
   type AudienceProgress,
   type DashboardResponse,
 } from '../../../shared/api/dashboard';
-import { addMonths, formatMonthLong, formatMonthName, monthOf } from '../../../shared/time';
+import { formatMonthLong, formatMonthName } from '../../../shared/time';
 import type { AvailabilityAudience, AvailabilityRequestKind } from '../../../shared/types';
 import { Button, Dialog, Field, Select, Spinner, Textarea } from '../../components/ui';
 import { errorMessage } from '../../lib/api';
-import { plural } from './format';
+import { cn } from '../../lib/cn';
+import { useClub } from '../../lib/useMe';
+import { askedLine, defaultRequestKind, plural } from './format';
 import { outboxNote, useAvailabilityPreview, useSendAvailabilityRequest } from './useDashboard';
 
 export interface AvailabilityRequestDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  /** Where the dialog starts; the booker can switch between request and reminder. */
   kind: AvailabilityRequestKind;
   initialMonth: string;
   data: DashboardResponse;
 }
+
+const KIND_OPTIONS: { value: AvailabilityRequestKind; label: string; icon: typeof Megaphone }[] = [
+  { value: 'request', label: 'Request', icon: Megaphone },
+  { value: 'reminder', label: 'Reminder', icon: BellRing },
+];
 
 function useDebouncedValue<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -39,12 +49,20 @@ function audienceCount(a: AudienceProgress | undefined, kind: AvailabilityReques
   return kind === 'reminder' ? a.total - a.submitted : a.total;
 }
 
-export function AvailabilityRequestDialog({ open, onOpenChange, kind, initialMonth, data }: AvailabilityRequestDialogProps) {
-  const thisMonth = monthOf(data.today);
-  const months = [0, 1, 2].map((i) => addMonths(thisMonth, i));
+export function AvailabilityRequestDialog({
+  open,
+  onOpenChange,
+  kind: initialKind,
+  initialMonth,
+  data,
+}: AvailabilityRequestDialogProps) {
+  const timeZone = useClub()?.timezone ?? 'America/New_York';
+  // The months the dashboard tracks: this month through the month after the planning month.
+  const months = data.availability.map((p) => p.month);
   if (!months.includes(initialMonth)) months.push(initialMonth);
 
   const [month, setMonth] = useState(initialMonth);
+  const [kind, setKind] = useState<AvailabilityRequestKind>(initialKind);
   const [audience, setAudience] = useState<AvailabilityAudience>('all');
   const [message, setMessage] = useState('');
   const debouncedMessage = useDebouncedValue(message.trim(), 400);
@@ -53,6 +71,14 @@ export function AvailabilityRequestDialog({ open, onOpenChange, kind, initialMon
   const send = useSendAvailabilityRequest(data.emailConfigured);
 
   const progress = data.availability.find((p) => p.month === month);
+  const asked = askedLine(progress, timeZone);
+
+  function changeMonth(next: string) {
+    setMonth(next);
+    // Each month starts on its own sensible kind (a reminder once it has been asked for).
+    setKind(defaultRequestKind(data.availability.find((p) => p.month === next)));
+  }
+
   const audienceOptions = [
     { value: 'all', label: 'Everyone', count: audienceCount(progress?.audiences[0], kind) },
     ...data.tags.map((tag) => ({
@@ -108,10 +134,46 @@ export function AvailabilityRequestDialog({ open, onOpenChange, kind, initialMon
           <Field label="Month">
             <Select
               value={month}
-              onChange={(e) => setMonth(e.target.value)}
-              options={months.map((m) => ({ value: m, label: formatMonthLong(m) }))}
+              onChange={(e) => changeMonth(e.target.value)}
+              options={months.map((m) => ({
+                value: m,
+                label: `${formatMonthLong(m)}${m === data.planningMonth ? ' (planning)' : ''}`,
+              }))}
             />
           </Field>
+          {asked && (
+            <p className="-mt-2 flex items-start gap-1.5 text-xs text-fg-muted" data-testid="asked-line">
+              <History className="mt-px size-3.5 shrink-0" aria-hidden />
+              <span>{asked}</span>
+            </p>
+          )}
+          <div role="radiogroup" aria-label="What to send" className="grid grid-cols-2 gap-1 rounded-lg bg-surface-2 p-1">
+            {KIND_OPTIONS.map((option) => {
+              const selected = option.value === kind;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  onClick={() => setKind(option.value)}
+                  className={cn(
+                    'inline-flex h-8 items-center justify-center gap-1.5 rounded-md px-2 text-xs font-medium transition-colors',
+                    selected ? 'bg-surface text-fg shadow-xs' : 'text-fg-muted hover:text-fg',
+                  )}
+                >
+                  <option.icon className="size-3.5" aria-hidden />
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+          {!reminder && progress?.lastRequest && progress.submitted > 0 && (
+            <p className="rounded-md border border-awaiting/35 bg-awaiting-soft px-2.5 py-2 text-xs text-awaiting-fg">
+              {monthName} was already requested. Asking again emails everyone in the audience, including the{' '}
+              {progress.submitted} who already submitted.
+            </p>
+          )}
           <Field
             label="Send to"
             hint={reminder ? 'Only those who haven’t submitted are emailed.' : 'Archived comedians are never emailed.'}

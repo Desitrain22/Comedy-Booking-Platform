@@ -16,6 +16,7 @@ import type {
   SendConfirmationsResponse,
   UnconfirmedTonightRow,
 } from '../../../shared/api/dashboard';
+import type { BookingConfirmationState, ConfirmBookingResponse, UnconfirmBookingInput } from '../../../shared/api/lineup';
 import { firstNameOf, plural } from './format';
 import { api, errorMessage } from '../../lib/api';
 
@@ -43,14 +44,34 @@ export function outboxNote(emailConfigured: boolean): string | undefined {
 }
 
 // ---------------------------------------------------------------------------
-// Unconfirmed tonight: Mark confirmed (F2's endpoint) and Resend
+// Unconfirmed tonight: Mark confirmed (F2's endpoint, with Undo) and Resend
 // ---------------------------------------------------------------------------
 
-/** Mark a booking confirmed (booker override). Optimistically drops the red row. */
-export function useMarkConfirmed() {
+/** What "Mark confirmed" found on a row that was unconfirmed (the Undo fallback). */
+const UNCONFIRMED: BookingConfirmationState = { confirmedAt: null, confirmedBy: null, declinedAt: null, declineNote: '' };
+
+/** Undo "Mark confirmed": `POST /bookings/:id/unconfirm` with the state before. */
+export function useUndoConfirm() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (row: UnconfirmedTonightRow) => api.post(`/bookings/${row.bookingId}/confirm`),
+    mutationFn: (input: { row: UnconfirmedTonightRow; previous: BookingConfirmationState }) =>
+      api.post(`/bookings/${input.row.bookingId}/unconfirm`, input.previous satisfies UnconfirmBookingInput),
+    onSuccess: (_data, { row }) => {
+      toast.info(`${row.comedianName} is back to unconfirmed`);
+    },
+    onError: (err, { row }) => {
+      toast.error(`Couldn't undo ${firstNameOf(row.comedianName)}'s confirmation`, { description: errorMessage(err) });
+    },
+    onSettled: () => invalidateBookingViews(queryClient),
+  });
+}
+
+/** Mark a booking confirmed (booker override). Optimistically drops the red row; the toast offers Undo. */
+export function useMarkConfirmed() {
+  const queryClient = useQueryClient();
+  const undo = useUndoConfirm();
+  return useMutation({
+    mutationFn: (row: UnconfirmedTonightRow) => api.post<ConfirmBookingResponse>(`/bookings/${row.bookingId}/confirm`),
     onMutate: async (row) => {
       await queryClient.cancelQueries({ queryKey: DASHBOARD_KEY });
       const previous = queryClient.getQueryData<DashboardResponse>(DASHBOARD_KEY);
@@ -75,8 +96,11 @@ export function useMarkConfirmed() {
       if (context?.previous) queryClient.setQueryData(DASHBOARD_KEY, context.previous);
       toast.error(`Couldn't confirm ${firstNameOf(row.comedianName)}`, { description: errorMessage(err) });
     },
-    onSuccess: (_data, row) => {
-      toast.success(`${row.comedianName} is confirmed for tonight`);
+    onSuccess: (data, row) => {
+      const previous = data?.previous ?? UNCONFIRMED;
+      toast.success(`${row.comedianName} is confirmed for tonight`, {
+        action: { label: 'Undo', onClick: () => undo.mutate({ row, previous }) },
+      });
     },
     onSettled: () => invalidateBookingViews(queryClient),
   });
@@ -94,6 +118,10 @@ export function useResendConfirmation(emailConfigured: boolean) {
       const first = firstNameOf(input.comedianName);
       if (result.status === 'failed') {
         toast.error(`Couldn't email ${first}`, { description: result.error });
+      } else if (result.status === 'archived') {
+        toast.warning(`${first} is archived, so they don't get emails`, {
+          description: 'Restore them from their profile, or replace them in the lineup.',
+        });
       } else if (result.status === 'skipped') {
         toast.info(`${first} has nothing left to confirm this week`);
       } else {
@@ -118,9 +146,13 @@ export function useSendConfirmations(emailConfigured: boolean) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (input: SendConfirmationsInput) => api.post<SendConfirmationsResponse>('/confirmations/send', input),
-    onSuccess: (result) => {
+    onSuccess: (result, input) => {
       if (result.sent === 0 && result.failed === 0) {
-        toast.info('Nobody to email: every spot this week is confirmed');
+        toast.info(
+          input.onlyUnsent
+            ? 'Nobody to email: every spot this week has been emailed'
+            : 'Nobody to email: every spot this week is confirmed',
+        );
       } else if (result.failed > 0) {
         toast.warning(`Sent ${plural(result.sent, 'confirmation email')}; ${result.failed} failed`, {
           description: 'Check Settings → Email for the error.',

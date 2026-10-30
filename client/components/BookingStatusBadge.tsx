@@ -13,7 +13,11 @@ export interface BookingStatusBadgeProps {
   className?: string;
 }
 
-/** Status pill with a colored dot: Confirmed / Awaiting / Not sent / Unconfirmed (today, red). */
+/**
+ * Status pill with a colored dot: Confirmed / Awaiting / Not sent / Unconfirmed (today, red) /
+ * Declined (muted violet, dashed border — pair it with `BOOKING_STATUS_CLASSES.declined.name`
+ * on the comedian's name to strike it through).
+ */
 export function BookingStatusBadge({ status, short = false, className }: BookingStatusBadgeProps) {
   const classes = BOOKING_STATUS_CLASSES[status];
   return (

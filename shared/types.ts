@@ -102,6 +102,8 @@ export interface ClubInfo {
   name: string;
   timezone: string;
   allNight: AvailabilityRange;
+  /** settings.allowDeclines: comedians can decline single spots ("Can't make it"). */
+  allowDeclines: boolean;
 }
 
 /** `GET /api/auth/me` */

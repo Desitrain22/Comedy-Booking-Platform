@@ -1,6 +1,8 @@
 /**
  * Comedian one-time sign-in codes: 6 digits, 10-minute expiry, stored hashed,
- * max 5 attempts per code, max 5 codes per comedian per 15 minutes.
+ * max 5 attempts per code, max 5 codes per comedian per 15 minutes. Only the newest code
+ * works: asking for another one retires the older ones, so a guess is only ever checked
+ * against one code. (The sign-in route also caps wrong guesses per email and per IP.)
  */
 import { and, desc, eq, gt, isNull, lt, or } from 'drizzle-orm';
 import type { DbOrTx } from '../db/client';
@@ -29,6 +31,11 @@ export function issueLoginCode(db: DbOrTx, comedianId: number, now = Date.now())
   if (recent.length >= CODE_RATE_LIMIT) return { ok: false, reason: 'rate_limited' };
 
   const code = randomDigits(CODE_LENGTH);
+  // Retire older live codes (kept as rows so they still count towards the rate limit).
+  db.update(loginCodes)
+    .set({ expiresAt: now })
+    .where(and(eq(loginCodes.comedianId, comedianId), isNull(loginCodes.consumedAt), gt(loginCodes.expiresAt, now)))
+    .run();
   db.insert(loginCodes)
     .values({ comedianId, codeHash: hashCode(comedianId, code), expiresAt: now + CODE_TTL_MS, createdAt: now })
     .run();
@@ -38,8 +45,8 @@ export function issueLoginCode(db: DbOrTx, comedianId: number, now = Date.now())
 export type VerifyCodeResult = 'ok' | 'invalid' | 'too_many_attempts';
 
 /**
- * Check a code against every live (unexpired, unconsumed) code for the comedian, so an
- * older email arriving late still works. A wrong guess counts against all live codes.
+ * Check a code against the comedian's live (unexpired, unconsumed) code — normally just
+ * the newest one (see `issueLoginCode`). A wrong guess counts against every live code.
  */
 export function verifyLoginCode(db: DbOrTx, comedianId: number, code: string, now = Date.now()): VerifyCodeResult {
   const live = db
@@ -69,6 +76,11 @@ export function verifyLoginCode(db: DbOrTx, comedianId: number, code: string, no
     db.update(loginCodes).set({ attempts: row.attempts + 1 }).where(eq(loginCodes.id, row.id)).run();
   }
   return usable.every((row) => row.attempts + 1 >= CODE_MAX_ATTEMPTS) ? 'too_many_attempts' : 'invalid';
+}
+
+/** Remove every code for a comedian (e.g. their email changed: codes sent to the old one die). */
+export function deleteLoginCodesFor(db: DbOrTx, comedianId: number): number {
+  return db.delete(loginCodes).where(eq(loginCodes.comedianId, comedianId)).run().changes;
 }
 
 /** Remove codes that are expired or used (housekeeping for the scheduler). */

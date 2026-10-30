@@ -6,8 +6,13 @@
  * that comedian, with Undo); drag a chip to another slot to move (onto an occupied slot to
  * swap); drag it back to the pool or click × to unbook (with Undo). Or
  * click to select, then click where it goes (keyboard / touch fallback). Booking someone who
- * isn't available asks first ("Book anyway?"). Every change is optimistic and persists
+ * isn't available asks first ("Book anyway?"); booking someone within 90 minutes of another
+ * spot that night warns (a toast, never a block). Every change is optimistic and persists
  * immediately.
+ *
+ * Selecting an empty (or declined) slot — or "Who's free at 9 PM" in a show's menu — focuses
+ * the pool on that show's time. The header nudges when spots booked this week were never
+ * emailed ("Send"), and the menu can cancel every show that night (with Undo).
  */
 import {
   DndContext,
@@ -19,19 +24,33 @@ import {
   type DragStartEvent,
   type DropAnimation,
 } from '@dnd-kit/core';
-import { useQueryClient } from '@tanstack/react-query';
-import { ArrowLeft, CalendarPlus, ChevronLeft, ChevronRight, Copy, Ellipsis, RotateCw } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import {
+  ArrowLeft,
+  Ban,
+  CalendarPlus,
+  ChevronLeft,
+  ChevronRight,
+  Copy,
+  Ellipsis,
+  MailWarning,
+  RotateCw,
+  Send,
+} from 'lucide-react';
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Link, useParams } from 'react-router';
 import { toast } from 'sonner';
+import type { SendConfirmationsInput, SendConfirmationsResponse } from '../../../shared/api/dashboard';
 import type { DayResponse, DayShow } from '../../../shared/api/lineup';
+import type { BulkShowStatusInput, BulkShowStatusResponse } from '../../../shared/api/shows';
 import { addDays, formatDateLong, formatDateMedium, formatMonthLong, isValidDate, monthOf } from '../../../shared/time';
 import {
   Badge,
   Button,
   buttonClasses,
   ColorDot,
+  ConfirmDialog,
   EmptyState,
   Menu,
   MenuContent,
@@ -39,10 +58,23 @@ import {
   MenuTrigger,
   PageHeader,
 } from '../../components/ui';
-import { errorMessage } from '../../lib/api';
+import { api, errorMessage } from '../../lib/api';
 import { cn } from '../../lib/cn';
+import { FULL_WIDTH_PAGE } from '../../layouts/BookerLayout';
+import { useClub } from '../../lib/useMe';
 import { usePageTitle } from '../../lib/usePageTitle';
-import { BoardContext, isSelected, type BoardState, type Selection } from './BoardContext';
+import { plural } from '../shows/showFormat';
+import { invalidateShowData } from '../shows/showsData';
+import {
+  BoardActionsContext,
+  BoardContext,
+  BoardLiveContext,
+  isSelected,
+  type BoardActions,
+  type BoardData,
+  type BoardLive,
+  type Selection,
+} from './BoardContext';
 import { BoardSkeleton, DragPreview, PoolSkeleton, SelectionBar, showGridStyle, StatusLegend } from './BoardChrome';
 import { ComedianPool } from './ComedianPool';
 import { SCREEN_READER_INSTRUCTIONS, lineupCollision, useLineupSensors, type DragData, type DropData } from './dnd';
@@ -50,7 +82,9 @@ import {
   dayText,
   indexDay,
   lineupText,
+  overlapWarning,
   planDrop,
+  showTitle,
   sourceComedianId,
   type DropPlan,
   type LineupSource,
@@ -109,12 +143,14 @@ function DayBoard({ date }: { date: string }) {
   const query = useDay(date);
   const day = query.data;
   const copy = useCopy();
+  const club = useClub();
 
   const [selection, setSelection] = useState<Selection | null>(null);
   const [dragging, setDragging] = useState<LineupSource | null>(null);
   const [over, setOver] = useState<LineupTarget | null>(null);
   const [dropAccepted, setDropAccepted] = useState(false);
   const [pending, setPending] = useState<PendingConflict | null>(null);
+  const [confirmCancel, setConfirmCancel] = useState(false);
   // Filters stick while paging between days (the component stays mounted).
   const [filter, setFilter] = useState<PoolFilter>(EMPTY_FILTER);
 
@@ -153,7 +189,7 @@ function DayBoard({ date }: { date: string }) {
     if (stale) setSelection(null);
   }, [day, selection]);
 
-  /** Carry out a planned drop; ask first when someone isn't available. */
+  /** Carry out a planned drop; ask first when someone isn't available; warn about clashes. */
   const attempt = useCallback(
     (plan: DropPlan) => {
       switch (plan.kind) {
@@ -167,38 +203,39 @@ function DayBoard({ date }: { date: string }) {
           return;
         case 'book':
         case 'move': {
-          const run = (force: boolean) =>
-            plan.kind === 'book'
-              ? actions.book({
-                  comedianId: plan.comedianId,
-                  showId: plan.showId,
-                  position: plan.position,
-                  replaceBookingId: plan.replacing?.id,
-                  force,
-                })
-              : actions.move({ bookingId: plan.bookingId, showId: plan.showId, position: plan.position, force });
+          // Who'd now be within 90 minutes of another of their spots (from the board as it is).
+          const warnings = day ? clashWarnings(day, plan) : [];
+          const run = (force: boolean) => {
+            if (plan.kind === 'book') {
+              actions.book({
+                comedianId: plan.comedianId,
+                showId: plan.showId,
+                position: plan.position,
+                replaceBookingId: plan.replacing?.id,
+                force,
+              });
+            } else {
+              actions.move({ bookingId: plan.bookingId, showId: plan.showId, position: plan.position, force });
+            }
+            for (const warning of warnings) toast.warning(warning, { id: `clash-${warning}` });
+          };
           if (plan.conflicts.length) setPending({ conflicts: plan.conflicts, confirm: () => run(true) });
           else run(false);
         }
       }
     },
-    [actions],
+    [actions, day],
   );
 
-  const board = useMemo<BoardState | null>(() => {
-    if (!day) return null;
-    const index = indexDay(day);
-    const slot = (showId: number, position: number): LineupTarget => ({ kind: 'slot', showId, position });
+  // The leaves get stable actions that read the latest state when called (UX D18).
+  const latest = useRef({ day, selection, attempt, actions, copy });
+  latest.current = { day, selection, attempt, actions, copy };
+  const boardActions = useMemo<BoardActions>(() => {
+    const slot = (showId: number, position: number) => ({ kind: 'slot' as const, showId, position });
     return {
-      day,
-      index,
-      dragging,
-      selection,
-      focusComedianId:
-        sourceComedianId(day, dragging) ??
-        (selection && selection.kind !== 'slot' ? sourceComedianId(day, selection) : null),
-      preview: (target) => (dragging ? planDrop(day, dragging, target) : { kind: 'none' }),
       clickComedian: (comedianId) => {
+        const { day, selection, attempt } = latest.current;
+        if (!day) return;
         const source: LineupSource = { kind: 'comedian', comedianId };
         if (selection?.kind === 'slot') {
           attempt(planDrop(day, source, selection));
@@ -208,40 +245,81 @@ function DayBoard({ date }: { date: string }) {
         }
       },
       clickBooking: (bookingId) => {
-        const booking = index.bookings.get(bookingId);
-        if (!booking || isTempId(bookingId)) return;
+        const { day, selection, attempt } = latest.current;
+        const booking = day ? indexDay(day).bookings.get(bookingId) : undefined;
+        if (!day || !booking || isTempId(bookingId)) return;
         const source: LineupSource = { kind: 'booking', bookingId };
         if (selection && selection.kind !== 'slot' && !isSelected(selection, source)) {
-          // Something is picked up: put it here (swap, or "slot taken" for a pool comedian).
+          // Something is picked up: put it here (swap, or replace for a pool comedian).
           const plan = planDrop(day, selection, slot(booking.showId, booking.position));
           attempt(plan);
           if (plan.kind !== 'reject') setSelection(null);
           return;
         }
+        if (booking.declinedAt != null) {
+          // A declined spot: select the slot, so the next comedian picked replaces them.
+          const target: Selection = slot(booking.showId, booking.position);
+          setSelection(isSelected(selection, target) ? null : target);
+          return;
+        }
         setSelection(isSelected(selection, source) ? null : source);
       },
       clickSlot: (showId, position) => {
+        const { day, selection, attempt } = latest.current;
+        if (!day) return;
         if (selection && selection.kind !== 'slot') {
           const plan = planDrop(day, selection, slot(showId, position));
           attempt(plan);
           if (plan.kind !== 'reject') setSelection(null);
           return;
         }
-        const target: Selection = { kind: 'slot', showId, position };
+        const target: Selection = slot(showId, position);
         setSelection(isSelected(selection, target) ? null : target);
       },
       unbook: (bookingId) => {
         if (isTempId(bookingId)) return;
-        actions.unbook(bookingId);
+        latest.current.actions.unbook(bookingId);
         setSelection((s) => (s?.kind === 'booking' && s.bookingId === bookingId ? null : s));
       },
-      setSlotCount: (showId, slotCount) => actions.setSlotCount(showId, slotCount),
+      setSlotCount: (showId, slotCount) => latest.current.actions.setSlotCount(showId, slotCount),
       copyLineup: (showId) => {
-        const show = index.shows.get(showId);
-        if (show) void copy(lineupText(day, show), 'Lineup');
+        const { day, copy } = latest.current;
+        const show = day ? indexDay(day).shows.get(showId) : undefined;
+        if (day && show) void copy(lineupText(day, show), 'Lineup');
+      },
+      focusShow: (showId) => {
+        const { day } = latest.current;
+        const show = day ? indexDay(day).shows.get(showId) : undefined;
+        if (!show) return;
+        const taken = new Map(show.bookings.map((b) => [b.position, b]));
+        const open = Array.from({ length: show.slotCount }, (_, i) => i).find((i) => !taken.has(i));
+        const declined = show.bookings.find((b) => b.declinedAt != null)?.position;
+        const position = open ?? declined;
+        if (position == null) {
+          toast(`The ${showTitle(show)} is full. Click a slot’s comedian to move or replace them.`);
+          return;
+        }
+        setSelection(slot(showId, position));
       },
     };
-  }, [day, dragging, selection, attempt, actions, copy]);
+  }, []);
+
+  const data = useMemo<BoardData | null>(
+    () => (day ? { day, index: indexDay(day), actions: boardActions } : null),
+    [day, boardActions],
+  );
+  const live = useMemo<BoardLive | null>(() => {
+    if (!day) return null;
+    return {
+      dragging,
+      selection,
+      focusComedianId:
+        sourceComedianId(day, dragging) ??
+        (selection && selection.kind !== 'slot' ? sourceComedianId(day, selection) : null),
+      focusShowId: selection?.kind === 'slot' && !dragging ? selection.showId : null,
+      preview: (target) => (dragging ? planDrop(day, dragging, target) : { kind: 'none' }),
+    };
+  }, [day, dragging, selection]);
 
   // ---- drag & drop -----------------------------------------------------------
 
@@ -276,6 +354,7 @@ function DayBoard({ date }: { date: string }) {
   const prev = addDays(date, -1);
   const next = addDays(date, 1);
   const isToday = day ? day.today === date : false;
+  const scheduledShows = day?.shows ?? [];
 
   const header = (
     <PageHeader
@@ -334,6 +413,9 @@ function DayBoard({ date }: { date: string }) {
                   <CalendarPlus /> Create shows
                 </Link>
               </MenuItem>
+              <MenuItem destructive onSelect={() => setConfirmCancel(true)}>
+                <Ban /> Cancel all shows this day
+              </MenuItem>
             </MenuContent>
           </Menu>
         </>
@@ -343,7 +425,7 @@ function DayBoard({ date }: { date: string }) {
 
   if (query.isError && !day) {
     return (
-      <div>
+      <div {...FULL_WIDTH_PAGE}>
         {header}
         <EmptyState
           title="Couldn’t load this day"
@@ -361,10 +443,15 @@ function DayBoard({ date }: { date: string }) {
   const poolClasses =
     'lg:sticky lg:top-6 lg:h-[calc(100dvh-3rem)] lg:w-64 lg:shrink-0 2xl:w-80 max-lg:max-h-[26rem] max-lg:order-first';
 
+  // Owner decision: with declines off there's no decline UI at all, legend included (a spot
+  // declined while they were on still reads "Declined" on its chip).
+  const showDeclined = Boolean(club?.allowDeclines);
+
   return (
-    <div>
+    <div {...FULL_WIDTH_PAGE}>
       {header}
-      {!board ? (
+      {day && <UnsentNudge day={day} />}
+      {!data || !live ? (
         <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
           <div className="min-w-0 flex-1">
             <BoardSkeleton />
@@ -374,69 +461,207 @@ function DayBoard({ date }: { date: string }) {
           </div>
         </div>
       ) : (
-        <BoardContext.Provider value={board}>
-          <DndContext
-            sensors={sensors}
-            collisionDetection={lineupCollision}
-            onDragStart={onDragStart}
-            onDragOver={onDragOver}
-            onDragEnd={onDragEnd}
-            onDragCancel={onDragCancel}
-            accessibility={{ announcements: ANNOUNCEMENTS, screenReaderInstructions: { draggable: SCREEN_READER_INSTRUCTIONS } }}
-          >
-            <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
-              <div className="min-w-0 flex-1">
-                {board.day.shows.length > 0 ? (
-                  <>
-                    <StatusLegend className="mb-4" />
-                    <LocationSections shows={board.day.shows} />
-                  </>
-                ) : (
-                  <NoShows date={date} />
+        <BoardContext.Provider value={data}>
+          <BoardActionsContext.Provider value={boardActions}>
+            <BoardLiveContext.Provider value={live}>
+              <DndContext
+                sensors={sensors}
+                collisionDetection={lineupCollision}
+                onDragStart={onDragStart}
+                onDragOver={onDragOver}
+                onDragEnd={onDragEnd}
+                onDragCancel={onDragCancel}
+                accessibility={{ announcements: ANNOUNCEMENTS, screenReaderInstructions: { draggable: SCREEN_READER_INSTRUCTIONS } }}
+              >
+                <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
+                  <div className="min-w-0 flex-1">
+                    {data.day.shows.length > 0 ? (
+                      <>
+                        <StatusLegend className="mb-4" showDeclined={showDeclined} />
+                        <LocationSections shows={data.day.shows} />
+                      </>
+                    ) : (
+                      <NoShows date={date} />
+                    )}
+                  </div>
+                  <ComedianPool
+                    filter={filter}
+                    onFilterChange={setFilter}
+                    onClearFocus={() => setSelection(null)}
+                    className={poolClasses}
+                  />
+                </div>
+                {createPortal(
+                  <DragOverlay dropAnimation={dropAccepted ? null : DROP_ANIMATION} zIndex={60}>
+                    {dragging && (
+                      <DragPreview day={data.day} source={dragging} plan={over ? planDrop(data.day, dragging, over) : null} />
+                    )}
+                  </DragOverlay>,
+                  document.body,
                 )}
-              </div>
-              <ComedianPool filter={filter} onFilterChange={setFilter} className={poolClasses} />
-            </div>
-            {createPortal(
-              <DragOverlay dropAnimation={dropAccepted ? null : DROP_ANIMATION} zIndex={60}>
-                {dragging && (
-                  <DragPreview day={board.day} source={dragging} plan={over ? planDrop(board.day, dragging, over) : null} />
-                )}
-              </DragOverlay>,
-              document.body,
-            )}
-          </DndContext>
-          <SelectionBar
-            day={board.day}
-            selection={selection}
-            onClear={() => setSelection(null)}
-            onUnbook={(id) => board.unbook(id)}
-          />
+              </DndContext>
+              <SelectionBar
+                day={data.day}
+                selection={selection}
+                onClear={() => setSelection(null)}
+                onUnbook={(id) => boardActions.unbook(id)}
+              />
+            </BoardLiveContext.Provider>
+          </BoardActionsContext.Provider>
         </BoardContext.Provider>
       )}
       <UnavailableDialog pending={pending} onClose={() => setPending(null)} />
+      <CancelDayDialog
+        open={confirmCancel}
+        onOpenChange={setConfirmCancel}
+        date={date}
+        shows={scheduledShows}
+      />
     </div>
   );
 }
 
-function DaySummary({ day }: { day: DayResponse }) {
-  const slots = day.shows.reduce((n, s) => n + s.slotCount, 0);
-  const filled = day.shows.reduce((n, s) => n + s.bookings.length, 0);
-  const unconfirmed = day.shows.reduce(
-    (n, s) => n + s.bookings.filter((b) => b.status === 'unconfirmed_today').length,
-    0,
+/** Toasts for anyone a drop leaves within 90 minutes of another of their spots (UX B11). */
+function clashWarnings(day: DayResponse, plan: Extract<DropPlan, { kind: 'book' | 'move' }>): string[] {
+  const index = indexDay(day);
+  const target = index.shows.get(plan.showId);
+  if (!target) return [];
+  if (plan.kind === 'book') {
+    const warning = overlapWarning(day, plan.comedianId, target);
+    return warning ? [`Heads up: ${warning}`] : [];
+  }
+  const moving = index.bookings.get(plan.bookingId);
+  const source = moving ? index.shows.get(moving.showId) : undefined;
+  if (!moving || !source || source.id === target.id) return [];
+  const warnings = [overlapWarning(day, moving.comedianId, target, moving.id)];
+  if (plan.swapWith) warnings.push(overlapWarning(day, plan.swapWith.comedianId, source, plan.swapWith.id));
+  return warnings.filter((w): w is string => w != null).map((w) => `Heads up: ${w}`);
+}
+
+/**
+ * "3 booked this week haven't been emailed yet – Send": spots booked after the weekly
+ * confirmations went out (the daily catch-up sends them too; this sends them now).
+ */
+function UnsentNudge({ day }: { day: DayResponse }) {
+  const queryClient = useQueryClient();
+  const { weekStart, weekEnd, count } = day.unsentThisWeek;
+  const send = useMutation({
+    mutationFn: () =>
+      api.post<SendConfirmationsResponse>('/confirmations/send', { weekStart, onlyUnsent: true } satisfies SendConfirmationsInput),
+    onSuccess: (result) => {
+      if (result.failed) {
+        toast.error(`Emailed ${plural(result.sent, 'comedian')}; ${result.failed} failed. See the email log.`);
+      } else {
+        toast.success(result.sent ? `Emailed ${plural(result.sent, 'comedian')} their spots this week` : 'Nothing left to email');
+      }
+    },
+    onSettled: () => {
+      void queryClient.invalidateQueries({ queryKey: ['days'] });
+      void queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+    },
+  });
+  // Only on this week's days, where it's about the spots in front of you.
+  if (count === 0 || day.date < weekStart || day.date > weekEnd) return null;
+  return (
+    <div
+      role="status"
+      className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-awaiting/40 bg-awaiting-soft px-3 py-2 text-sm text-awaiting-fg"
+    >
+      <MailWarning className="size-4 shrink-0" aria-hidden />
+      <span className="min-w-0 flex-1">
+        <strong className="font-semibold">{count}</strong> booked this week {count === 1 ? 'hasn’t' : 'haven’t'} been
+        emailed yet
+      </span>
+      <Button size="sm" variant="secondary" loading={send.isPending} onClick={() => send.mutate()}>
+        <Send aria-hidden /> Send
+      </Button>
+    </div>
   );
+}
+
+/** "Cancel all shows this day" — keeps the lineups; Undo restores them. */
+function CancelDayDialog({
+  open,
+  onOpenChange,
+  date,
+  shows,
+}: {
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+  date: string;
+  shows: DayShow[];
+}) {
+  const queryClient = useQueryClient();
+  const ids = shows.map((s) => s.id);
+  const booked = shows.reduce((n, s) => n + s.bookings.length, 0);
+  const setStatus = (showIds: number[], status: BulkShowStatusInput['status']) =>
+    api.post<BulkShowStatusResponse>('/shows/bulk-status', { ids: showIds, status } satisfies BulkShowStatusInput);
+
+  async function cancelAll() {
+    const result = await setStatus(ids, 'cancelled');
+    void invalidateShowData(queryClient);
+    const cancelled = result.updatedIds;
+    toast.success(`Cancelled ${plural(cancelled.length, 'show')} on ${formatDateMedium(date)}`, {
+      description: booked ? 'Lineups are kept. Booked comedians aren’t emailed, so let them know.' : undefined,
+      duration: 10_000,
+      action: {
+        label: 'Undo',
+        onClick: () =>
+          void setStatus(cancelled, 'scheduled')
+            .then((undo) => {
+              const blocked = undo.skipped.filter((s) => s.reason === 'duplicate_show').length;
+              return blocked
+                ? toast.warning(
+                    `Restored ${plural(undo.updatedIds.length, 'show')}; ${plural(blocked, 'show')} couldn’t come back (another show is there now).`,
+                  )
+                : toast.success(`Restored ${plural(undo.updatedIds.length, 'show')}`);
+            },
+              (err: unknown) => toast.error(errorMessage(err)),
+            )
+            .finally(() => void invalidateShowData(queryClient)),
+      },
+    });
+  }
+
+  return (
+    <ConfirmDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={`Cancel all ${plural(shows.length, 'show')} on ${formatDateLong(date)}?`}
+      confirmLabel="Cancel all shows"
+      cancelLabel="Keep them"
+      destructive
+      onConfirm={cancelAll}
+    >
+      <p className="text-sm text-fg-muted">
+        {booked
+          ? `The lineups (${booked} booked) are kept and you can restore the shows later. Booked comedians aren’t emailed, so let them know.`
+          : 'You can restore them later from the calendar.'}
+      </p>
+    </ConfirmDialog>
+  );
+}
+
+function DaySummary({ day }: { day: DayResponse }) {
+  const bookings = day.shows.flatMap((s) => s.bookings);
+  const slots = day.shows.reduce((n, s) => n + s.slotCount, 0);
+  const declined = bookings.filter((b) => b.declinedAt != null).length;
+  const filled = bookings.length - declined;
+  const unconfirmed = bookings.filter((b) => b.status === 'unconfirmed_today').length;
   if (day.shows.length === 0) return <>No shows scheduled</>;
   return (
     <span className="tabular-nums">
       {day.shows.length} {day.shows.length === 1 ? 'show' : 'shows'} · {filled} of {slots} slots filled
       {unconfirmed > 0 && <span className="text-unconfirmed-fg"> · {unconfirmed} unconfirmed tonight</span>}
+      {declined > 0 && (
+        <span className="text-declined-fg"> · {declined} declined, {declined === 1 ? 'needs' : 'need'} a replacement</span>
+      )}
     </span>
   );
 }
 
 /** Shows grouped by location, keeping the server's order (location sort order, then time). */
-function LocationSections({ shows }: { shows: DayShow[] }) {
+const LocationSections = memo(function LocationSections({ shows }: { shows: DayShow[] }) {
   const groups: { location: DayShow['location']; shows: DayShow[] }[] = [];
   for (const show of shows) {
     const last = groups[groups.length - 1];
@@ -448,7 +673,7 @@ function LocationSections({ shows }: { shows: DayShow[] }) {
     <div className="space-y-6">
       {groups.map(({ location, shows: locationShows }) => {
         const slots = locationShows.reduce((n, s) => n + s.slotCount, 0);
-        const filled = locationShows.reduce((n, s) => n + s.bookings.length, 0);
+        const filled = locationShows.reduce((n, s) => n + s.bookings.filter((b) => b.declinedAt == null).length, 0);
         return (
           <section key={location.id} aria-label={location.name}>
             <h2 className="mb-2 flex items-center gap-2 text-sm font-semibold text-fg">
@@ -468,7 +693,7 @@ function LocationSections({ shows }: { shows: DayShow[] }) {
       })}
     </div>
   );
-}
+});
 
 function NoShows({ date }: { date: string }) {
   return (

@@ -11,7 +11,7 @@ import { hashPassword } from '../auth/password';
 import { signIn } from '../auth/sessions';
 import type { AppEnv } from '../context';
 import { locations, users } from '../db/schema';
-import { jsonError } from '../lib/http';
+import { httpError, jsonError } from '../lib/http';
 import { getSettings, updateSettings } from '../lib/settings';
 import { validate } from '../lib/validate';
 
@@ -19,15 +19,20 @@ export const setupRoutes = new Hono<AppEnv>();
 
 setupRoutes.get('/setup/status', (c) => c.json({ setupComplete: getSettings(c.var.db).setupComplete }));
 
+const ALREADY_SETUP = 'This club is already set up';
+
 setupRoutes.post('/setup', validate('json', setupSchema), async (c) => {
   const db = c.var.db;
   if (getSettings(db).setupComplete) {
-    return jsonError(c, 409, 'This club is already set up', 'already_setup');
+    return jsonError(c, 409, ALREADY_SETUP, 'already_setup');
   }
   const input = c.req.valid('json');
   const passwordHash = await hashPassword(input.admin.password);
 
   const admin = db.transaction((tx) => {
+    // Check again inside the transaction: two requests can both pass the check above while
+    // hashing; only the first to get here creates the club (the other gets 409, nothing saved).
+    if (getSettings(tx).setupComplete) throw httpError(409, ALREADY_SETUP, 'already_setup');
     updateSettings(tx, {
       clubName: input.clubName,
       timezone: input.timezone,

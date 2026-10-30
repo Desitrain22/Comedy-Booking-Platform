@@ -3,21 +3,26 @@
  * session. Loading the page only READS the week (GET; email scanners prefetch links), and
  * confirming is an explicit POST, which also signs the comedian in.
  *
- * States: the week's spots + "Confirm my spots" · confirmed 🎉 · already confirmed ·
- * no spots left this week · expired link · invalid link.
+ * When the club allows declines, each spot has "Can't make it?" (optional note; a POST),
+ * and the email's per-spot link (`?decline=<bookingId>`) opens that spot's form — it never
+ * declines by itself. "Confirm my spots" confirms the rest; declined spots stay declined.
+ *
+ * States: the week's spots + "Confirm my spots" · confirmed 🎉 · already confirmed (or
+ * all set, with some declined) · can't make any · no spots left this week · expired link
+ * · invalid link.
  */
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { CalendarDays, CircleCheck, LinkIcon, Mic, RotateCw, TimerOff } from 'lucide-react';
-import type { ReactNode } from 'react';
-import { Link, useNavigate, useParams } from 'react-router';
-import type { ConfirmLinkInfo, ConfirmLinkResult } from '../../../shared/api/portal';
+import { useMemo, type ReactNode } from 'react';
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router';
+import { DECLINE_QUERY_PARAM, type ConfirmLinkInfo, type ConfirmLinkResult } from '../../../shared/api/portal';
 import { formatDateShort, formatWeekday } from '../../../shared/time';
 import { buttonClasses, Button, Card, PageSpinner } from '../../components/ui';
 import { api, errorMessage, isApiError } from '../../lib/api';
 import { usePageTitle } from '../../lib/usePageTitle';
 import { useMe, useRefreshMe } from '../../lib/useMe';
 import { portalKeys, useConfirmLink } from './portalQueries';
-import { SpotList, weekLabel, weekRange } from './SpotList';
+import { SpotList, weekLabel, weekRange, type SpotDeclineActions } from './SpotList';
 
 function firstName(name: string): string {
   return name.trim().split(/\s+/)[0] || name;
@@ -37,6 +42,39 @@ export function ConfirmPage() {
   const navigate = useNavigate();
   const info = useConfirmLink(token);
   const signedIn = Boolean(useMe().data?.comedian);
+  const [params] = useSearchParams();
+  const declineParam = Number(params.get(DECLINE_QUERY_PARAM));
+  const openId = Number.isInteger(declineParam) && declineParam > 0 ? declineParam : null;
+
+  const tokenPath = `/portal/confirm/${encodeURIComponent(token)}`;
+  const afterDecline = (result: ConfirmLinkInfo) => {
+    queryClient.setQueryData<ConfirmLinkInfo>(portalKeys.confirm(token), (old) =>
+      // Keep the confirm result's extra fields (it's the same week).
+      old ? { ...old, ...result } : result,
+    );
+    void queryClient.invalidateQueries({ queryKey: portalKeys.all, predicate: (q) => q.queryKey[1] !== 'confirm' });
+  };
+  const decline = useMutation({
+    mutationFn: ({ bookingId, note }: { bookingId: number; note: string }) =>
+      api.post<ConfirmLinkInfo>(`${tokenPath}/spots/${bookingId}/decline`, { note }),
+    meta: { silent: true }, // the row toasts
+    onSuccess: afterDecline,
+  });
+  const undoDecline = useMutation({
+    mutationFn: (bookingId: number) => api.del<ConfirmLinkInfo>(`${tokenPath}/spots/${bookingId}/decline`),
+    meta: { silent: true },
+    onSuccess: afterDecline,
+  });
+  const { mutateAsync: declineAsync } = decline;
+  const { mutateAsync: undoAsync } = undoDecline;
+  const declineActions = useMemo<SpotDeclineActions>(
+    () => ({
+      openId,
+      onDecline: (spot, note) => declineAsync({ bookingId: spot.bookingId, note }),
+      onUndo: (spot) => undoAsync(spot.bookingId),
+    }),
+    [openId, declineAsync, undoAsync],
+  );
 
   const confirm = useMutation({
     mutationFn: () => api.post<ConfirmLinkResult>(`/portal/confirm/${encodeURIComponent(token)}`),
@@ -100,7 +138,12 @@ export function ConfirmPage() {
   const name = firstName(data.comedianName);
   const week = weekPhrase(data.weekStart, data.today);
   const justConfirmed = confirm.isSuccess;
-  const nextSpot = data.spots.find((s) => s.date >= data.today);
+  const playing = data.spots.filter((s) => s.declinedAt == null);
+  const declinedCount = data.spots.length - playing.length;
+  const nextSpot = playing.find((s) => s.startsAt > Date.now());
+  const declines = data.allowDeclines ? declineActions : undefined;
+  const spotList = <SpotList spots={data.spots} today={data.today} declines={declines} />;
+  const declinedPhrase = `you can't make ${declinedCount === 1 ? 'one spot' : `${declinedCount} spots`}`;
 
   if (data.spots.length === 0) {
     return (
@@ -123,8 +166,10 @@ export function ConfirmPage() {
         icon={<CircleCheck />}
         tone="success"
         title="You're confirmed!"
-        description={`Thanks, ${name}.${nextSpot ? ` See you ${nextSpot.date === data.today ? 'tonight' : formatWeekday(nextSpot.date)}.` : ''}`}
-        spots={<SpotList spots={data.spots} today={data.today} />}
+        description={`Thanks, ${name}.${nextSpot ? ` See you ${nextSpot.date === data.today ? 'tonight' : formatWeekday(nextSpot.date)}.` : ''}${
+          declinedCount > 0 ? ` The club knows ${declinedPhrase}.` : ''
+        }`}
+        spots={spotList}
       >
         <Link to="/portal/spots" className={buttonClasses({ size: 'lg', className: 'w-full sm:w-auto' })}>
           <Mic /> See all my spots
@@ -137,13 +182,20 @@ export function ConfirmPage() {
   }
 
   if (data.unconfirmedCount === 0) {
+    const allDeclined = playing.length === 0;
     return (
       <Panel
-        icon={<CircleCheck />}
-        tone="success"
-        title="You're already confirmed"
-        description={`Hey ${name}, all your spots ${week} are confirmed. Nothing else to do.`}
-        spots={<SpotList spots={data.spots} today={data.today} />}
+        icon={allDeclined ? <CalendarDays /> : <CircleCheck />}
+        tone={allDeclined ? 'muted' : 'success'}
+        title={allDeclined ? 'Thanks for letting the club know' : declinedCount > 0 ? "You're all set" : "You're already confirmed"}
+        description={
+          allDeclined
+            ? `Hey ${name}, the club knows you can't make your ${data.spots.length === 1 ? 'spot' : 'spots'} ${week}.`
+            : declinedCount > 0
+              ? `Hey ${name}, the club knows ${declinedPhrase} ${week}; the rest are confirmed.`
+              : `Hey ${name}, all your spots ${week} are confirmed. Nothing else to do.`
+        }
+        spots={spotList}
       >
         <Button variant="secondary" size="lg" className="w-full sm:w-auto" onClick={() => openPortal.mutate()} loading={openPortal.isPending}>
           Open my portal
@@ -152,12 +204,13 @@ export function ConfirmPage() {
     );
   }
 
-  const count = data.spots.length;
+  const count = playing.length;
+  const toConfirm = data.unconfirmedCount;
   return (
     <Panel
       title={`Hey ${name}, you're booked for ${count === 1 ? 'this spot' : 'these spots'} ${week}`}
       description={`${weekRange(data.weekStart)} · Please confirm so the club knows you're coming.`}
-      spots={<SpotList spots={data.spots} today={data.today} />}
+      spots={spotList}
     >
       <div className="w-full space-y-3">
         {confirm.isError && (
@@ -166,9 +219,16 @@ export function ConfirmPage() {
           </p>
         )}
         <Button size="lg" className="h-12 w-full text-base" onClick={() => confirm.mutate()} loading={confirm.isPending}>
-          <CircleCheck /> Confirm my {count === 1 ? 'spot' : 'spots'}
+          <CircleCheck />{' '}
+          {declinedCount > 0
+            ? `Confirm the other ${toConfirm === 1 ? 'spot' : `${toConfirm} spots`}`
+            : `Confirm my ${count === 1 ? 'spot' : 'spots'}`}
         </Button>
-        <p className="text-center text-xs text-fg-muted">Can't make one? Reply to the club's email to let them know.</p>
+        <p className="text-center text-xs text-fg-muted">
+          {data.allowDeclines
+            ? 'Can’t make one? Tap “Can’t make it?” under that spot first.'
+            : "Can't make one? Reply to the club's email to let them know."}
+        </p>
       </div>
     </Panel>
   );

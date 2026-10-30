@@ -148,6 +148,10 @@ test('the monthly rhythm, from new shows to a confirmed lineup', async ({ page, 
   // 2. Ask the Hosts for next month's availability ----------------------------------------
   await page.getByRole('navigation', { name: 'Main' }).first().getByRole('link', { name: 'Dashboard' }).click();
   await page.getByRole('button', { name: 'Request availability' }).click();
+  // The dialog opens on the planning month, as a Reminder once that month was asked for (the
+  // seed already asked): pick next month, then switch to a fresh Request.
+  await page.getByRole('dialog').getByLabel('Month').selectOption(nextMonth);
+  await page.getByRole('dialog').getByRole('radio', { name: 'Request' }).click();
   const request = page.getByRole('dialog', { name: 'Request availability' });
   await expect(request.getByLabel('Month')).toHaveValue(nextMonth);
   const hosts = request.getByLabel('Send to').locator('option', { hasText: COMIC.tag });
@@ -187,7 +191,8 @@ test('the monthly rhythm, from new shows to a confirmed lineup', async ({ page, 
   const comicCard = pool.getByRole('button', { name: new RegExp(`^${COMIC.name}\\. available 9–11 PM`) });
   await expect(comicCard).toBeVisible();
   await drag(page, comicCard, lineup.getByRole('button', { name: /^Slot 1, empty/ }));
-  await expect(lineup.getByRole('button', { name: new RegExp(`^Slot 1: ${COMIC.name}, Not sent$`) })).toBeVisible();
+  // The chip's name ends with the comedian's note count when they have notes (UX A5).
+  await expect(lineup.getByRole('button', { name: new RegExp(`^Slot 1: ${COMIC.name}, Not sent(, \\d+ notes?)?$`) })).toBeVisible();
 
   // Someone who isn't free then: "Book anyway".
   const unavailable = withDb(
@@ -207,7 +212,9 @@ test('the monthly rhythm, from new shows to a confirmed lineup', async ({ page, 
   await expect(ask).toBeVisible();
   await ask.getByRole('button', { name: 'Book anyway' }).click();
   await expect(
-    lineup.getByRole('button', { name: `Slot 2: ${unavailable}, Not sent, booked anyway (not marked available)` }),
+    lineup.getByRole('button', {
+      name: new RegExp(`^Slot 2: ${unavailable}, Not sent, booked anyway \\(not marked available\\)(, \\d+ notes?)?$`),
+    }),
   ).toBeVisible();
   const saturdayBookings = withDb(
     (db) =>

@@ -50,7 +50,7 @@ export function ComedianProfilePage() {
 
 function NotFound() {
   return (
-    <div className="mx-auto max-w-xl">
+    <div>
       <PageHeader title="Comedian not found" />
       <Card>
         <EmptyState
@@ -97,7 +97,7 @@ function Profile({ comedian }: { comedian: ComedianDetail }) {
   });
 
   return (
-    <div className="mx-auto max-w-6xl">
+    <div>
       <Link
         to="/app/comedians"
         className="mb-3 inline-flex items-center gap-1 text-xs font-medium text-fg-muted hover:text-fg"

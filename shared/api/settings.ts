@@ -2,8 +2,12 @@
  * F6 Settings — API shapes shared by server/routes/settings.ts and client/pages/settings.
  *
  *   GET  /api/settings                   SettingsDto (never the SMTP password)
- *   PUT  /api/settings                   UpdateSettingsInput (partial) → SettingsDto
+ *   PUT  /api/settings                   UpdateSettingsInput (partial) → SettingsDto; changing an
+ *                                        ADMIN_ONLY_SETTINGS field as a non-admin → 403 admin_only
  *   POST /api/settings/test-email        { to? } → TestEmailResponse | 502 email_failed | 504 email_timeout
+ *                                        (non-admins: only to themselves, else 403 forbidden)
+ *   POST /api/auth/password              ChangePasswordInput → { ok: true } (signed-in booker; signs
+ *                                        out their other sessions) | 400 wrong_password | 429 rate_limited
  *   GET  /api/email-log?q&kind&status&limit   EmailLogItem[] (newest first, default 100)
  *   GET  /api/email-log/:id              EmailLogDetail
  *   GET  /api/users                      BookerUserDto[]                      (admin)
@@ -15,7 +19,7 @@
  */
 import { z } from 'zod';
 import { AVAILABILITY_MAX_END, AVAILABILITY_MIN_START } from '../availability';
-import { emailSchema, timeZoneSchema } from '../schemas';
+import { emailSchema, passwordSchema, timeZoneSchema } from '../schemas';
 import { EMAIL_KINDS, EMAIL_STATUSES, ROLES, type EmailKind, type EmailStatus, type Role } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -58,6 +62,22 @@ export interface SettingsDto {
   confirmationDay: number;
   /** Minutes after local midnight, 0–1439. */
   confirmationTimeMin: number;
+  /**
+   * Daily catch-up (default on): every day at confirmationTimeMin, email comedians with
+   * spots this week (Mon–Sun) that haven't been emailed yet (booked after the weekly send).
+   */
+  catchUpEnabled: boolean;
+  /**
+   * Comedians can decline single spots ("Can't make it") in the portal and the
+   * confirmation email (default off = confirm the whole week or reply to the email).
+   */
+  allowDeclines: boolean;
+  /**
+   * Mondays (this week on) whose automatic send already ran. Settings → Confirmations uses
+   * it to show a missed send that goes out right after saving (the scheduler catches up any
+   * due send whose week isn't over).
+   */
+  confirmationWeeksSent: string[];
 }
 
 const HOSTNAME_RE = /^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$/;
@@ -115,6 +135,8 @@ export const updateSettingsSchema = z
     confirmationsEnabled: z.boolean(),
     confirmationDay: z.number().int().min(0).max(6),
     confirmationTimeMin: z.number().int().min(0).max(1439),
+    catchUpEnabled: z.boolean(),
+    allowDeclines: z.boolean(),
   })
   .partial()
   .superRefine((v, ctx) => {
@@ -124,11 +146,62 @@ export const updateSettingsSchema = z
   });
 export type UpdateSettingsInput = z.input<typeof updateSettingsSchema>;
 
+/**
+ * Settings only admins may change. They decide where every email goes and where its links
+ * point (sign-in links, confirmations, invites), and they hold the SMTP password, so a
+ * booker account must not be able to redirect them. Bookers can still save other fields;
+ * sending one of these unchanged is fine.
+ */
+export const ADMIN_ONLY_SETTINGS = [
+  'appUrl',
+  'smtpHost',
+  'smtpPort',
+  'smtpSecure',
+  'smtpUser',
+  'smtpPass',
+  'clearSmtpPass',
+  'fromName',
+  'fromEmail',
+  'replyTo',
+] as const satisfies readonly (keyof UpdateSettingsInput)[];
+export type AdminOnlySetting = (typeof ADMIN_ONLY_SETTINGS)[number];
+
+/**
+ * Where the SMTP password is sent. Changing any of these without giving the password again
+ * removes the saved one, so it's never handed to a server it wasn't entered for.
+ */
+export const SMTP_CONNECTION_FIELDS = ['smtpHost', 'smtpPort', 'smtpSecure', 'smtpUser'] as const satisfies readonly (
+  keyof SettingsDto
+)[];
+
+// ---------------------------------------------------------------------------
+// Account (the signed-in booker)
+// ---------------------------------------------------------------------------
+
+/** `POST /api/auth/password`: change your own password (other sessions are signed out). */
+export const changePasswordSchema = z
+  .object({
+    current: z.string().min(1, 'Enter your current password').max(200),
+    next: passwordSchema,
+  })
+  .refine((v) => v.next !== v.current, { path: ['next'], message: 'Choose a new password, not your current one' });
+export type ChangePasswordInput = z.input<typeof changePasswordSchema>;
+
+/** `POST /api/auth/password` success. */
+export interface ChangePasswordResponse {
+  ok: true;
+  /** How many other sessions (devices) were signed out. */
+  signedOut: number;
+}
+
 // ---------------------------------------------------------------------------
 // Test email
 // ---------------------------------------------------------------------------
 
-/** `POST /api/settings/test-email` — `to` defaults to the signed-in booker's email. */
+/**
+ * `POST /api/settings/test-email` — `to` defaults to the signed-in booker's email. Only
+ * admins may send it anywhere else.
+ */
 export const testEmailSchema = z.object({ to: emailSchema.optional() });
 export type TestEmailInput = z.input<typeof testEmailSchema>;
 

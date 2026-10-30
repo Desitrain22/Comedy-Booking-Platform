@@ -230,6 +230,20 @@ export function monthGrid(month: string): (string | null)[][] {
   return weeks;
 }
 
+/** From this day of the month on, the club is planning next month (see `planningMonth`). */
+export const PLANNING_NEXT_MONTH_FROM_DAY = 20;
+
+/**
+ * The month the club is booking / collecting availability for: next month from the 20th
+ * on, else the current month. One rule for the portal, dashboard and create-shows defaults.
+ * planningMonth('2026-11-19') → '2026-11'; planningMonth('2026-11-20') → '2026-12';
+ * planningMonth('2026-12-31') → '2027-01'.
+ */
+export function planningMonth(today: string): string {
+  const month = monthOf(today);
+  return parseDate(today).d >= PLANNING_NEXT_MONTH_FROM_DAY ? addMonths(month, 1) : month;
+}
+
 // ---------------------------------------------------------------------------
 // Formatting dates
 // ---------------------------------------------------------------------------
@@ -286,6 +300,60 @@ export function formatRelative(timestampMs: number, nowMs: number = Date.now()):
   const dt = new Date(timestampMs);
   const label = `${MONTH_SHORT[dt.getMonth()]} ${dt.getDate()}`;
   return dt.getFullYear() === new Date(nowMs).getFullYear() ? label : `${label}, ${dt.getFullYear()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Comedian-facing show times (after-midnight shows)
+// ---------------------------------------------------------------------------
+
+/**
+ * The calendar date a show actually starts on: its own date, or the next day when it
+ * starts after midnight (startMin >= 1440). showStartDate('2026-11-08', 1500) → '2026-11-09'.
+ */
+export function showStartDate(date: string, startMin: number): string {
+  return startMin >= MINUTES_PER_DAY ? addDays(date, Math.floor(startMin / MINUTES_PER_DAY)) : date;
+}
+
+export interface ShowWhenOptions {
+  /** 'short' (default) → "Sun, Nov 8"; 'long' → "Sunday, Nov 8" (emails). */
+  weekday?: 'short' | 'long';
+  /** Between the date and the time (formatShowWhen only). Default ' · '. */
+  separator?: string;
+}
+
+function formatDateFor(date: string, weekday: ShowWhenOptions['weekday']): string {
+  return weekday === 'long' ? formatDateLong(date) : formatDateMedium(date);
+}
+
+/**
+ * For after-midnight shows, the real calendar day: "early Mon, Nov 9" (or "early Monday,
+ * Nov 9" with weekday 'long'). Null for shows before midnight.
+ * afterMidnightLabel('2026-11-08', 1500) → 'early Mon, Nov 9'; ('2026-11-08', 1260) → null.
+ */
+export function afterMidnightLabel(date: string, startMin: number, options: ShowWhenOptions = {}): string | null {
+  if (startMin < MINUTES_PER_DAY) return null;
+  return `early ${formatDateFor(showStartDate(date, startMin), options.weekday)}`;
+}
+
+/**
+ * The start time, unambiguous for comedians: "9 PM", or "1 AM (early Mon, Nov 9)" when the
+ * show is after midnight. Use next to a date that is already shown (date tiles, tables).
+ */
+export function formatShowTime(date: string, startMin: number, options: ShowWhenOptions = {}): string {
+  const label = afterMidnightLabel(date, startMin, options);
+  return label ? `${formatTime(startMin)} (${label})` : formatTime(startMin);
+}
+
+/**
+ * Date + time of a show for comedian-facing text (portal, emails). The show's own date
+ * (the night it belongs to) comes first; after-midnight shows add the real calendar day:
+ *   formatShowWhen('2026-11-08', 1260) → 'Sun, Nov 8 · 9 PM'
+ *   formatShowWhen('2026-11-08', 1500) → 'Sun, Nov 8 · 1 AM (early Mon, Nov 9)'
+ *   formatShowWhen('2026-11-08', 1500, { weekday: 'long', separator: ' — ' })
+ *     → 'Sunday, Nov 8 — 1 AM (early Monday, Nov 9)'
+ */
+export function formatShowWhen(date: string, startMin: number, options: ShowWhenOptions = {}): string {
+  return `${formatDateFor(date, options.weekday)}${options.separator ?? ' · '}${formatShowTime(date, startMin, options)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +420,26 @@ export function nowMinutesInTz(timeZone: string, now: Date = new Date()): number
   return p.hour * 60 + p.minute;
 }
 
+/** Before this local time (6 AM) it is still the previous night at the club. */
+export const CLUB_NIGHT_CUTOFF_MIN = 360;
+
+/**
+ * The club's current *night*: today's date, or yesterday's while local time is before
+ * `cutoffMin` (default 6 AM), so a 1 AM show still belongs to "tonight". Use it for
+ * "tonight" lists and the red `unconfirmed_today` status; keep `todayInTz` for calendar
+ * logic (past-day locking, availability editing).
+ * At 1:30 AM Mon Nov 9 (club time) → '2026-11-08'; at 6 AM → '2026-11-09'.
+ */
+export function clubNightDate(
+  timeZone: string,
+  now: Date = new Date(),
+  cutoffMin: number = CLUB_NIGHT_CUTOFF_MIN,
+): string {
+  const p = zonedParts(now, timeZone);
+  const today = `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
+  return p.hour * 60 + p.minute < cutoffMin ? addDays(today, -1) : today;
+}
+
 function offsetMs(utcMs: number, timeZone: string): number {
   const p = zonedParts(new Date(utcMs), timeZone);
   const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
@@ -367,5 +455,16 @@ export function zonedTimeToUtc(date: string, minutes: number, timeZone: string):
   const { y, m, d } = parseDate(date);
   const localAsUtc = Date.UTC(y, m - 1, d, 0, minutes);
   const guess = localAsUtc - offsetMs(localAsUtc, timeZone);
-  return localAsUtc - offsetMs(guess, timeZone);
+  const result = localAsUtc - offsetMs(guess, timeZone);
+  if (result + offsetMs(result, timeZone) === localAsUtc) return result;
+  // A local time the clocks skip (2:30 AM on spring-forward day): the first instant after the
+  // gap (3:00 AM), which is also when a "time of day has passed" check first succeeds.
+  let lo = result; // still the old offset
+  let hi = localAsUtc - offsetMs(result, timeZone); // already the new one
+  while (hi - lo > 60_000) {
+    const mid = lo + Math.max(60_000, Math.floor((hi - lo) / 120_000) * 60_000);
+    if (offsetMs(mid, timeZone) === offsetMs(lo, timeZone)) lo = mid;
+    else hi = mid;
+  }
+  return hi;
 }

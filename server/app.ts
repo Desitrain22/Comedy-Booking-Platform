@@ -7,14 +7,25 @@
  */
 import { serveStatic } from '@hono/node-server/serve-static';
 import { Hono } from 'hono';
+import { bodyLimit } from 'hono/body-limit';
 import { csrf } from 'hono/csrf';
 import { HTTPException } from 'hono/http-exception';
 import { logger } from 'hono/logger';
+import { secureHeaders } from 'hono/secure-headers';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { timingDummyHash } from './auth/password';
 import type { AppEnv } from './context';
 import type { Db } from './db/client';
+import { env } from './env';
 import { HttpError } from './lib/http';
+import {
+  DEFAULT_RATE_LIMITS,
+  RateLimiter,
+  scaleRateLimits,
+  setRateLimiter,
+  type RateLimitConfig,
+} from './lib/rateLimit';
 import { authRoutes } from './routes/auth';
 import { comediansRoutes } from './routes/comedians';
 import { dashboardRoutes } from './routes/dashboard';
@@ -31,6 +42,53 @@ export interface CreateAppOptions {
   clientDir?: string;
   /** Log each request to the console. */
   logRequests?: boolean;
+  /**
+   * Sign-in rate limits (server/lib/rateLimit.ts). Default: the production limits, ×10 under
+   * `npm run dev` so repeated e2e runs against one dev server never trip them.
+   */
+  rateLimits?: Partial<RateLimitConfig>;
+}
+
+/** Largest request body the API accepts (bulk-adding 500 comedians is well under this). */
+export const API_BODY_LIMIT_BYTES = 1024 * 1024;
+
+/**
+ * Content-Security-Policy for the app shell (production serves it; in dev Vite does).
+ * - Scripts: only our own bundle (no inline scripts, no eval).
+ * - Styles: our CSS plus inline styles (React style props, toasts, and the sandboxed email
+ *   previews, whose srcdoc documents inherit this policy, all use them).
+ * - Images: anywhere (comedian headshots are links to any site), plus data:/blob:.
+ * - Never framed by another site (frame-ancestors 'none'; X-Frame-Options DENY for old browsers).
+ */
+export const CONTENT_SECURITY_POLICY = {
+  defaultSrc: ["'self'"],
+  scriptSrc: ["'self'"],
+  styleSrc: ["'self'", "'unsafe-inline'"],
+  imgSrc: ['*', 'data:', 'blob:'],
+  fontSrc: ["'self'", 'data:'],
+  connectSrc: ["'self'"],
+  frameSrc: ["'self'"],
+  workerSrc: ["'self'"],
+  manifestSrc: ["'self'"],
+  objectSrc: ["'none'"],
+  baseUri: ["'self'"],
+  formAction: ["'self'"],
+  frameAncestors: ["'none'"],
+};
+
+/**
+ * Writes must be JSON: form and text/plain posts (what a cross-site page can send without a
+ * CORS preflight) never reach a handler, where a JSON validator would read them as `{}`.
+ */
+const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+function isJsonContentType(value: string): boolean {
+  const type = value.split(';')[0]!.trim().toLowerCase();
+  return type === 'application/json' || (type.startsWith('application/') && type.endsWith('+json'));
+}
+
+function resolveRateLimits(overrides: Partial<RateLimitConfig> = {}): RateLimitConfig {
+  const base = !env.isProduction && !env.isTest ? scaleRateLimits(DEFAULT_RATE_LIMITS, 10) : DEFAULT_RATE_LIMITS;
+  return { ...base, ...overrides };
 }
 
 /** Same-host check that ignores scheme (TLS is often terminated by a proxy). */
@@ -42,8 +100,11 @@ function sameHost(origin: string, requestUrl: string): boolean {
   }
 }
 
-export function createApp({ db, clientDir, logRequests = false }: CreateAppOptions): Hono<AppEnv> {
+export function createApp({ db, clientDir, logRequests = false, rateLimits }: CreateAppOptions): Hono<AppEnv> {
   const app = new Hono<AppEnv>();
+  setRateLimiter(db, new RateLimiter(resolveRateLimits(rateLimits)));
+  // Hash the sign-in timing decoy now (with the configured bcrypt cost), not on the first login.
+  void timingDummyHash();
 
   if (logRequests) app.use('/api/*', logger());
 
@@ -53,12 +114,43 @@ export function createApp({ db, clientDir, logRequests = false }: CreateAppOptio
   });
 
   app.use(
+    '*',
+    secureHeaders({
+      contentSecurityPolicy: CONTENT_SECURITY_POLICY,
+      xFrameOptions: 'DENY',
+      // Emailed links carry their token in the path (/portal/confirm/<token>): never send
+      // it to another site (headshots, provider help links).
+      referrerPolicy: 'no-referrer',
+      // Browsers ignore this over plain http; on https it pins the club's host to https.
+      strictTransportSecurity: 'max-age=15552000',
+      permissionsPolicy: { camera: [], microphone: [], geolocation: [], payment: [], usb: [] },
+    }),
+  );
+
+  app.use(
+    '/api/*',
+    bodyLimit({
+      maxSize: API_BODY_LIMIT_BYTES,
+      onError: (c) => c.json({ error: 'That request is too large', code: 'payload_too_large' }, 413),
+    }),
+  );
+
+  app.use(
     '/api/*',
     csrf({
       origin: (origin, c) => sameHost(origin, c.req.url),
-      secFetchSite: ['same-origin', 'same-site'],
+      // Same origin only: a sibling subdomain ("same-site") is another site for us.
+      secFetchSite: 'same-origin',
     }),
   );
+
+  app.use('/api/*', async (c, next) => {
+    const type = c.req.header('content-type');
+    if (MUTATING_METHODS.has(c.req.method) && type && !isJsonContentType(type)) {
+      return c.json({ error: 'Send JSON (Content-Type: application/json)', code: 'unsupported_media_type' }, 415);
+    }
+    await next();
+  });
 
   app.get('/api/health', (c) => c.json({ ok: true as const }));
 

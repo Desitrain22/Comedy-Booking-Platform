@@ -5,6 +5,7 @@
  * by time; a red dot means someone on it is unconfirmed tonight; cancelled shows are
  * struck through. Clicking a day opens the day view; clicking a pill opens the show
  * editor, which is URL-driven (`?show=<id>`) so F2's "Edit show" link deep-links to it.
+ * Without `?month` it opens the month being planned (next month from the 20th on, UX B8).
  */
 import { CalendarPlus, CalendarSync, ChevronLeft, ChevronRight, Plus, TriangleAlert } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
@@ -18,7 +19,15 @@ import { cn } from '../../lib/cn';
 import { CopyPatternDialog } from '../shows/CopyPatternDialog';
 import { ShowPill } from '../shows/ShowPill';
 import { plural } from '../shows/showFormat';
-import { monthParam, useClubToday, useLocations, useMonthShows, useShowDetail } from '../shows/showsData';
+import {
+  copySourceEmptyReason,
+  monthParam,
+  useClubToday,
+  useCopySourceCount,
+  useLocations,
+  useMonthShows,
+  useShowDetail,
+} from '../shows/showsData';
 import { ShowEditDialog } from './ShowEditDialog';
 
 function parseIds(value: string | null): number[] {
@@ -45,6 +54,7 @@ export function CalendarPage() {
 
   const shows = useMonthShows(month);
   const locations = useLocations();
+  const copyBlocked = copySourceEmptyReason(month, useCopySourceCount(addMonths(month, -1)));
 
   /** Update some query params, keeping the rest (replace: no history spam). */
   function updateParams(changes: Record<string, string | null>) {
@@ -126,7 +136,7 @@ export function CalendarPage() {
   );
 
   return (
-    <div className="mx-auto max-w-[1600px]">
+    <div>
       <PageHeader
         eyebrow="Calendar"
         title={formatMonthLong(month)}
@@ -222,11 +232,18 @@ export function CalendarPage() {
               <div className="min-w-0 flex-1">
                 <p className="text-sm font-medium text-fg">No shows in {formatMonthName(month)} yet</p>
                 <p className="text-sm text-fg-muted">
-                  Paint a run of shows, or copy {formatMonthName(addMonths(month, -1))}’s weekly pattern in one go.
+                  {copyBlocked
+                    ? `Paint a run of shows. ${formatMonthName(addMonths(month, -1))} has no shows, so there’s no pattern to copy yet.`
+                    : `Paint a run of shows, or copy ${formatMonthName(addMonths(month, -1))}’s weekly pattern in one go.`}
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
-                <Button variant="secondary" onClick={() => setCopyOpen(true)}>
+                <Button
+                  variant="secondary"
+                  onClick={() => setCopyOpen(true)}
+                  disabled={copyBlocked != null}
+                  title={copyBlocked ?? undefined}
+                >
                   <CalendarSync aria-hidden /> Copy {formatMonthName(addMonths(month, -1))}’s pattern
                 </Button>
                 <Link to={`/app/shows/new?month=${month}`} className={buttonClasses()}>

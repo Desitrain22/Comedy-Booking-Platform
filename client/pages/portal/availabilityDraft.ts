@@ -99,3 +99,78 @@ export function dayLabel(range: AvailabilityRange, allNight: AvailabilityRange):
   const parts: [string, string] = dash < 0 ? [text, ''] : [text.slice(0, dash + 1), text.slice(dash + 1)];
   return { allNight: isSameRange(range, allNight), parts };
 }
+
+// ---------------------------------------------------------------------------
+// Editing history: Undo (one paint stroke / weekday tap at a time) and Discard
+// ---------------------------------------------------------------------------
+
+/** How many steps Undo remembers. */
+export const UNDO_LIMIT = 50;
+
+export interface EditorState {
+  draft: Draft;
+  /** The draft before each step, oldest first; Undo restores the last one. */
+  history: readonly Draft[];
+  /** The paint gesture in progress: one drag is one undo step. */
+  stroke: number | null;
+}
+
+export type EditorAction =
+  /** Paint `dates` (null range erases). `stroke` groups a drag (MonthGrid's gesture id); omit for one-off taps. */
+  | { type: 'paint'; dates: readonly string[]; range: AvailabilityRange | null; stroke?: number }
+  /** The drag ended (pointer up / cancel). A drag that changed nothing leaves no undo step. */
+  | { type: 'strokeEnd'; stroke: number }
+  | { type: 'undo' }
+  /** Back to what's saved — itself undoable. */
+  | { type: 'discard'; saved: Draft }
+  /** Saved: keep the draft, forget the history (the saved state is the new baseline). */
+  | { type: 'saved' }
+  /** Start over from `draft` (fresh server data). */
+  | { type: 'reset'; draft: Draft };
+
+export function initEditor(draft: Draft): EditorState {
+  return { draft, history: [], stroke: null };
+}
+
+function remember(history: readonly Draft[], draft: Draft): readonly Draft[] {
+  const next = [...history, draft];
+  return next.length > UNDO_LIMIT ? next.slice(next.length - UNDO_LIMIT) : next;
+}
+
+/**
+ * Pure reducer behind the availability editor. Painting stays immediate (no press-and-hold);
+ * a mistaken drag — e.g. a vertical swipe on a phone that painted instead of scrolling —
+ * is one tap of Undo away.
+ */
+export function editorReducer(state: EditorState, action: EditorAction): EditorState {
+  switch (action.type) {
+    case 'paint': {
+      const draft = paint(state.draft, action.dates, action.range);
+      if (action.stroke !== undefined && action.stroke === state.stroke) {
+        return draft === state.draft ? state : { ...state, draft };
+      }
+      // A new drag (remember even if its first day is unchanged: later days may change),
+      // or a one-off tap that changed something.
+      if (action.stroke === undefined && draft === state.draft) return state;
+      return { draft, history: remember(state.history, state.draft), stroke: action.stroke ?? null };
+    }
+    case 'strokeEnd': {
+      if (state.stroke !== action.stroke) return state;
+      const before = state.history[state.history.length - 1];
+      if (before && sameDraft(before, state.draft)) return { ...state, history: state.history.slice(0, -1), stroke: null };
+      return { ...state, stroke: null };
+    }
+    case 'undo': {
+      const before = state.history[state.history.length - 1];
+      if (!before) return state;
+      return { draft: before, history: state.history.slice(0, -1), stroke: null };
+    }
+    case 'discard':
+      if (sameDraft(state.draft, action.saved)) return state;
+      return { draft: action.saved, history: remember(state.history, state.draft), stroke: null };
+    case 'saved':
+      return state.history.length === 0 ? state : { ...state, history: [] };
+    case 'reset':
+      return initEditor(action.draft);
+  }
+}

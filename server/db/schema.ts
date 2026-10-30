@@ -49,6 +49,16 @@ export const settings = sqliteTable(
     /** 0 = Sunday … 6 = Saturday. */
     confirmationDay: integer('confirmation_day').notNull().default(1),
     confirmationTimeMin: integer('confirmation_time_min').notNull().default(600),
+    /**
+     * Daily catch-up: each day at confirmationTimeMin, email comedians whose spots in the
+     * current week (Mon–Sun) were booked after that week's confirmations went out.
+     */
+    catchUpEnabled: bool('catch_up_enabled').notNull().default(true),
+    /**
+     * Comedians may decline a single spot ("Can't make it") from the portal and the
+     * confirmation email. Off = all-or-nothing "confirm the week".
+     */
+    allowDeclines: bool('allow_declines').notNull().default(false),
     setupComplete: bool('setup_complete').notNull().default(false),
     createdAt: createdAt(),
   },
@@ -196,6 +206,13 @@ export const bookings = sqliteTable(
     confirmationSentAt: integer('confirmation_sent_at'),
     confirmedAt: integer('confirmed_at'),
     confirmedBy: text('confirmed_by', { enum: ['comedian', 'booker'] }),
+    /**
+     * The comedian said they can't make it (only when settings.allowDeclines). The booking
+     * keeps its slot so the booker sees who to replace; status `declined` wins over all.
+     */
+    declinedAt: integer('declined_at'),
+    /** Optional reason the comedian gave when declining ('' when none). */
+    declineNote: text('decline_note').notNull().default(''),
     createdAt: createdAt(),
   },
   (t) => [

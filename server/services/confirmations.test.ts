@@ -1,5 +1,6 @@
 import { eq } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { declineLink } from '../../shared/api/portal';
 import { findConfirmToken } from '../auth/tokens';
 import { bookings, type Booking, type Comedian, type LocationRow } from '../db/schema';
 import { setTransportFactory } from '../email/mailer';
@@ -9,12 +10,14 @@ import {
   createComedian,
   createLocation,
   createShow,
+  createUser,
   emailsTo,
   makeTestApp,
   type TestApp,
 } from '../test/helpers';
 import {
   countConfirmationRecipients,
+  countUnsentSpots,
   sendConfirmationToComedian,
   sendConfirmationsForWeek,
   weekPhrase,
@@ -180,6 +183,94 @@ describe('sendConfirmationsForWeek', () => {
     expect(emailsTo(t.db, 'john@example.com')[0]!.subject).toBe(
       'Please confirm your spot next week at Test Comedy Club',
     );
+  });
+});
+
+describe('declined spots', () => {
+  it('are never listed, never a reason to email, never stamped (and never counted)', async () => {
+    const fri = createShow(t.db, { locationId: cellar.id, date: '2026-11-06', startMin: 1260, name: 'Late Show' });
+    const sat = createShow(t.db, { locationId: cellar.id, date: '2026-11-07', startMin: 1140, name: 'Early Show' });
+    // John: one declined, one to confirm. Maria: only a declined spot.
+    const johnDeclined = createBooking(t.db, { showId: fri.id, comedianId: john.id, declinedAt: EARLIER, declineNote: 'Sick' });
+    createBooking(t.db, { showId: sat.id, comedianId: john.id });
+    const mariaDeclined = createBooking(t.db, { showId: sat.id, comedianId: maria.id, declinedAt: EARLIER });
+
+    expect(countConfirmationRecipients(t.db, WEEK, { now: NOW })).toEqual({ pendingComedians: 1, unsentComedians: 1 });
+    expect(countUnsentSpots(t.db, WEEK, { now: NOW })).toBe(1);
+
+    const result = await sendConfirmationsForWeek(t.db, WEEK, { now: NOW });
+    expect(result.comedianIds).toEqual([john.id]);
+    const mail = emailsTo(t.db, 'john@example.com')[0]!;
+    expect(mail.subject).toBe('Please confirm your spot this week at Test Comedy Club');
+    expect(mail.bodyText).toContain('Sat, Nov 7 — 7 PM · Early Show');
+    expect(mail.bodyText).not.toContain('Late Show');
+    expect(booking(johnDeclined.id).confirmationSentAt).toBeNull();
+    expect(emailsTo(t.db, 'maria@example.com')).toHaveLength(0);
+    expect(booking(mariaDeclined.id).confirmationSentAt).toBeNull();
+
+    // A resend for a comedian whose only spot is declined is skipped.
+    expect(await sendConfirmationToComedian(t.db, maria.id, WEEK, { now: NOW })).toEqual({
+      status: 'skipped',
+      bookingCount: 0,
+    });
+  });
+});
+
+describe('confirmation email content', () => {
+  it('names the real day for after-midnight shows (correctness#2)', async () => {
+    const late = createShow(t.db, { locationId: cellar.id, date: '2026-11-08', startMin: 1500, name: 'Insomniac Hour' });
+    createBooking(t.db, { showId: late.id, comedianId: john.id });
+    await sendConfirmationsForWeek(t.db, WEEK, { now: NOW });
+    const mail = emailsTo(t.db, 'john@example.com')[0]!;
+    expect(mail.bodyText).toContain('• Sun, Nov 8 — 1 AM (early Mon, Nov 9) · Insomniac Hour');
+    expect(mail.bodyHtml).toContain('1 AM (early Mon, Nov 9) · Insomniac Hour');
+    expect(mail.bodyHtml).toContain('Nov 8, 1 AM (early Mon, Nov 9) at The Cellar'); // preheader
+  });
+
+  it("has a per-spot \"Can't make it?\" link to the confirm page only when declines are allowed", async () => {
+    const fri = createShow(t.db, { locationId: cellar.id, date: '2026-11-06', startMin: 1260 });
+    const sat = createShow(t.db, { locationId: cellar.id, date: '2026-11-07', startMin: 1260 });
+    const b1 = createBooking(t.db, { showId: fri.id, comedianId: john.id });
+    const b2 = createBooking(t.db, { showId: sat.id, comedianId: john.id, confirmedAt: EARLIER, confirmedBy: 'comedian' });
+
+    // Off (the default): exactly as before — reply to the email.
+    await sendConfirmationsForWeek(t.db, WEEK, { now: NOW });
+    const off = emailsTo(t.db, 'john@example.com')[0]!;
+    expect(off.bodyText).not.toContain("Can't make it?");
+    expect(off.bodyHtml).not.toContain('decline=');
+    expect(off.bodyText).toMatch(/Can't make one\? Reply to this email\.$/);
+
+    updateSettings(t.db, { allowDeclines: true });
+    await sendConfirmationsForWeek(t.db, WEEK, { now: NOW });
+    const on = emailsTo(t.db, 'john@example.com')[0]!;
+    const url = /Confirm my spots: (\S+)/.exec(on.bodyText)![1]!;
+    for (const b of [b1, b2]) {
+      const link = declineLink(url, b.id);
+      expect(link).toMatch(new RegExp(`/portal/confirm/[\\w-]+\\?decline=${b.id}$`));
+      expect(on.bodyText).toContain(`Can't make it? ${link}`);
+      expect(on.bodyHtml).toContain(`href="${link}"`);
+    }
+    expect(on.bodyText).toContain('Can\'t make one? Use the "Can\'t make it?" link under that spot, or reply to this email.');
+    expect(on.bodyHtml).toContain('under that spot, or reply to this email');
+  });
+
+  it("replies go to the configured Reply-To, else the club's first admin", async () => {
+    const replyTos: unknown[] = [];
+    setTransportFactory(() => ({
+      sendMail: (async (mail: { replyTo?: unknown }) => {
+        replyTos.push(mail.replyTo);
+        return {};
+      }) as never,
+    }));
+    updateSettings(t.db, { smtpHost: 'smtp.example.test', fromEmail: 'club@example.test', replyTo: '' });
+    createUser(t.db, { role: 'admin', email: 'owner@example.test' });
+    const show = createShow(t.db, { locationId: cellar.id, date: '2026-11-06', startMin: 1260 });
+    createBooking(t.db, { showId: show.id, comedianId: john.id });
+
+    await sendConfirmationsForWeek(t.db, WEEK, { now: NOW });
+    updateSettings(t.db, { replyTo: 'desk@example.test' });
+    await sendConfirmationToComedian(t.db, john.id, WEEK, { now: NOW });
+    expect(replyTos).toEqual(['owner@example.test', 'desk@example.test']);
   });
 });
 

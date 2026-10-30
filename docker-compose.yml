@@ -7,7 +7,10 @@ services:
     image: comedy-booking-platform:latest
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      # Only reachable from this machine. Put a reverse proxy with HTTPS in front (e.g. Caddy:
+      # `booking.yourclub.com { reverse_proxy localhost:3000 }`) and set TRUST_PROXY=1 below.
+      # To open it to your network without a proxy (plain http, not recommended), use "3000:3000".
+      - "127.0.0.1:3000:3000"
     environment:
       # Public URL used in email links. The setup wizard saves the URL you open it from;
       # this is only a fallback (e.g. https://booking.yourclub.com).
@@ -22,6 +25,10 @@ services:
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       SMTP_FROM_NAME: ${SMTP_FROM_NAME:-}
       SMTP_REPLY_TO: ${SMTP_REPLY_TO:-}
+      # Set to 1 when a reverse proxy sits in front (it does with the port binding above), so
+      # sign-in rate limits see each visitor's IP (X-Forwarded-For) and https (X-Forwarded-Proto).
+      # Leave empty if the app is reachable directly: anyone could fake those headers.
+      TRUST_PROXY: ${TRUST_PROXY:-}
     volumes:
       - club-data:/data
 

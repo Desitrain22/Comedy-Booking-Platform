@@ -4,9 +4,11 @@
  * (toggle every such day) or by clicking / dragging across the calendar (a drag starting
  * on an unselected day adds, on a selected day removes). Existing shows show as pills in
  * their location color, new ones preview in the accent color, and a live summary says
- * what will be created. The selection survives month navigation; Create sends it all.
+ * what will be created. The selection survives month navigation; Create sends it all, and
+ * the success toast can Undo it. Without `?month` it opens the month being planned (next
+ * month from the 20th on).
  */
-import { useQueries } from '@tanstack/react-query';
+import { useQueries, useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, CalendarSync, ChevronLeft, ChevronRight, MapPin, TriangleAlert } from 'lucide-react';
 import { useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router';
@@ -61,7 +63,17 @@ import {
   selectableWeekdayDates,
   toggleWeekday,
 } from './showFormat';
-import { monthParam, showsQueryOptions, useBulkCreateShows, useClubToday, useLocations, useMonthShows } from './showsData';
+import {
+  copySourceEmptyReason,
+  monthParam,
+  showsQueryOptions,
+  undoCreatedShows,
+  useBulkCreateShows,
+  useClubToday,
+  useCopySourceCount,
+  useLocations,
+  useMonthShows,
+} from './showsData';
 
 const START_TIMES = timeOptions(SHOW_START_MIN, SHOW_START_PICKER_MAX, SHOW_START_STEP);
 const dupKey = (locationId: number, date: string, startMin: number) => `${locationId}|${date}|${startMin}`;
@@ -130,7 +142,7 @@ export function CreateShowsPage() {
 
 function Shell({ month, children }: { month: string; children: ReactNode }) {
   return (
-    <div className="mx-auto max-w-[1240px]">
+    <div>
       <PageHeader
         eyebrow={
           <Link
@@ -165,6 +177,8 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
   const [copyOpen, setCopyOpen] = useState(false);
   const paintMode = useRef<'add' | 'remove'>('add');
   const bulk = useBulkCreateShows();
+  const queryClient = useQueryClient();
+  const copyBlocked = copySourceEmptyReason(month, useCopySourceCount(addMonths(month, -1)));
 
   const location = locations.find((l) => l.id === locationId) ?? locations[0]!;
   const slotCount = Number(slotInput);
@@ -217,9 +231,14 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
       const created = result.created.length;
       const what = `${name.trim() ? `“${name.trim()}”, ` : ''}${formatTime(startMin)} at ${location.name}`;
       const firstMonth = monthOf(result.created[0]?.date ?? selectedDates[0] ?? `${month}-01`);
+      const ids = result.created.map((s) => s.id);
+      const viewCalendar = { label: 'View calendar', onClick: () => void navigate(`/app/calendar?month=${firstMonth}`) };
       toast.success(created ? `Created ${plural(created, 'show')}` : 'No new shows', {
         description: `${what}${result.skipped.length ? ` · ${result.skipped.length} already existed` : ''}`,
-        action: { label: 'View calendar', onClick: () => void navigate(`/app/calendar?month=${firstMonth}`) },
+        // Undo deletes exactly what was just created (anything booked since is kept).
+        ...(created
+          ? { action: { label: 'Undo', onClick: () => void undoCreatedShows(queryClient, ids) }, cancel: viewCalendar, duration: 10_000 }
+          : { action: viewCalendar }),
       });
       setSelected(new Set());
     } catch {
@@ -308,11 +327,18 @@ function ShowPainter({ month, today, locations, onMonthChange }: ShowPainterProp
               <button
                 type="button"
                 onClick={() => setCopyOpen(true)}
-                className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-border-strong px-3 py-2 text-[13px] text-fg-muted transition-colors hover:border-accent hover:bg-accent-soft hover:text-accent"
+                disabled={copyBlocked != null}
+                aria-describedby={copyBlocked ? 'copy-pattern-blocked' : undefined}
+                className="flex w-full items-center justify-center gap-2 rounded-lg border border-dashed border-border-strong px-3 py-2 text-[13px] text-fg-muted transition-colors enabled:hover:border-accent enabled:hover:bg-accent-soft enabled:hover:text-accent disabled:cursor-not-allowed disabled:opacity-60"
               >
                 <CalendarSync className="size-4 shrink-0" aria-hidden />
                 {copyPatternLabel(month)}
               </button>
+              {copyBlocked && (
+                <p id="copy-pattern-blocked" className="text-center text-xs text-fg-muted">
+                  {copyBlocked}.
+                </p>
+              )}
             </div>
           </div>
         </CardBody>

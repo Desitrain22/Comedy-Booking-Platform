@@ -12,17 +12,37 @@
  *                                          400 `validation_error` (bad range), 400
  *                                          `date_outside_month`, 400 `duplicate_date`,
  *                                          400 `month_past`
+ *                                          Also re-evaluates `overrideUnavailable` (the ⚠ "booked
+ *                                          anyway" marker) on the comedian's bookings in the
+ *                                          saved nights, so it stays truthful.
  *   GET  /api/portal/spots                 PortalSpotsResponse (past 2 weeks + upcoming)
  *   POST /api/portal/spots/confirm         ConfirmWeekInput → ConfirmWeekResponse
- *                                          400 `invalid_week` (not a Monday), 400 `week_past`
+ *                                          400 `invalid_week` (not a Monday), 400 `week_past`.
+ *                                          Never confirms a declined spot.
+ *   POST   /api/portal/spots/:bookingId/decline   DeclineSpotInput → DeclineSpotResponse
+ *                                          "Can't make it" (keeps the slot; the booker replaces
+ *                                          it). Idempotent (keeps the first declinedAt, takes the
+ *                                          latest note). 409 `declines_off` unless
+ *                                          settings.allowDeclines, 404 `not_found` (not their
+ *                                          spot / cancelled show), 409 `spot_past` (started).
+ *   DELETE /api/portal/spots/:bookingId/decline   → DeclineSpotResponse — undo a decline
+ *                                          (works even if declines were switched off since).
+ *                                          404 `not_found`, 409 `spot_past`. Idempotent.
  *   GET  /api/portal/profile               PortalProfile
  *   PUT  /api/portal/profile               UpdatePortalProfileInput → PortalProfile
  *   GET  /api/portal/confirm/:token        ConfirmLinkInfo — read-only, no session needed
  *                                          (email scanners prefetch links)
  *   POST /api/portal/confirm/:token        ConfirmLinkResult — confirms the week's scheduled,
- *                                          unconfirmed spots (confirmedBy 'comedian') and signs
- *                                          the comedian in. Idempotent.
- *                                          Both: 404 `invalid_token`, 410 `expired_token`.
+ *                                          unconfirmed, not-declined spots (confirmedBy
+ *                                          'comedian') and signs the comedian in. Idempotent.
+ *   POST   /api/portal/confirm/:token/spots/:bookingId/decline  DeclineSpotInput → ConfirmLinkInfo
+ *   DELETE /api/portal/confirm/:token/spots/:bookingId/decline  → ConfirmLinkInfo
+ *                                          The same decline / undo from the emailed link (no
+ *                                          session; the spot must be in the link's week).
+ *                                          The email's per-spot link is a GET of the page with
+ *                                          `?decline=<bookingId>`, which only opens the form.
+ *                                          All confirm-link routes: 404 `invalid_token`,
+ *                                          410 `expired_token`.
  *
  * All routes except the confirm-token ones require a comedian session (`cbp_comedian`);
  * a booker session never grants portal access.
@@ -31,7 +51,7 @@ import { z } from 'zod';
 import { isValidAvailabilityRange, type AvailabilityEntry, type AvailabilityRange } from '../availability';
 import type { BookingStatus } from '../bookingStatus';
 import { dateSchema, monthSchema } from '../schemas';
-import { addMonths, monthOf } from '../time';
+import { PLANNING_NEXT_MONTH_FROM_DAY, planningMonth } from '../time';
 import type { ClubInfo, ConfirmedBy, MeComedian } from '../types';
 
 // ---------------------------------------------------------------------------
@@ -47,16 +67,41 @@ export const AVAILABILITY_STEP_MIN = 30;
 export const DEFAULT_CUSTOM_RANGE: AvailabilityRange = { startMin: 1260, endMin: 1380 };
 /** How many past weeks `GET /api/portal/spots` includes (shown collapsed). */
 export const PAST_SPOT_WEEKS = 2;
-/** From this day of the month on, the availability page opens on next month. */
-export const NEXT_MONTH_FROM_DAY = 20;
+/** Longest note a comedian can leave when declining a spot (`bookings.declineNote`). */
+export const DECLINE_NOTE_MAX = 300;
 
 /**
- * The month the availability page opens on when no `?month=` is given: next month from
- * the 20th on (that's what the club is booking), else the current month.
+ * Body for declining one spot ("Can't make it"; only when the club allows declines).
+ * Shared by the portal's session route and the emailed confirm-link route.
+ */
+export const declineSpotSchema = z.object({
+  note: z.string().trim().max(DECLINE_NOTE_MAX, `Keep it under ${DECLINE_NOTE_MAX} characters`).optional().default(''),
+});
+export type DeclineSpotInput = z.input<typeof declineSpotSchema>;
+
+/**
+ * Query param on the emailed confirm link that opens "Can't make it" for one spot:
+ * `/portal/confirm/<token>?decline=<bookingId>`. The link only *opens* the page (email
+ * scanners prefetch links); the decline itself is a POST from the page.
+ */
+export const DECLINE_QUERY_PARAM = 'decline';
+
+/** The per-spot "Can't make it" link for a confirmation email. */
+export function declineLink(confirmUrl: string, bookingId: number): string {
+  const url = new URL(confirmUrl);
+  url.searchParams.set(DECLINE_QUERY_PARAM, String(bookingId));
+  return url.toString();
+}
+
+/** From this day of the month on, the availability page opens on next month. */
+export const NEXT_MONTH_FROM_DAY = PLANNING_NEXT_MONTH_FROM_DAY;
+
+/**
+ * The month the availability page opens on when no `?month=` is given: the club's
+ * planning month (`planningMonth`: next month from the 20th on, else the current month).
  */
 export function defaultAvailabilityMonth(today: string): string {
-  const month = monthOf(today);
-  return Number(today.slice(8, 10)) >= NEXT_MONTH_FROM_DAY ? addMonths(month, 1) : month;
+  return planningMonth(today);
 }
 
 /** `http(s)://host…` */
@@ -133,7 +178,7 @@ export interface PortalMeResponse {
   spots: {
     /** Scheduled spots from today on. */
     upcoming: number;
-    /** …of which not yet confirmed. */
+    /** …of which still to confirm (not confirmed, not declined; `isUnconfirmed`). */
     unconfirmed: number;
   };
 }
@@ -166,16 +211,26 @@ export interface PortalSpot {
   startMin: number;
   showName: string;
   location: PortalSpotLocation;
+  /** `declined` when the comedian said they can't make it (wins over `confirmed`). */
   status: BookingStatus;
   confirmedAt: number | null;
   confirmedBy: ConfirmedBy | null;
+  /** When the comedian said "Can't make it", else null. */
+  declinedAt: number | null;
+  /** Their optional reason ('' when none). */
+  declineNote: string;
+  /** When the show starts (ms). Declining / undoing is possible until then. */
+  startsAt: number;
 }
 
 export interface PortalSpotWeek {
   /** Monday. */
   weekStart: string;
   spots: PortalSpot[];
+  /** Spots still to confirm (declined ones don't count). */
   unconfirmedCount: number;
+  /** Spots the comedian can't make. */
+  declinedCount: number;
   /** The whole week is before today (read-only, shown collapsed). */
   past: boolean;
 }
@@ -184,6 +239,13 @@ export interface PortalSpotWeek {
 export interface PortalSpotsResponse {
   today: string;
   weeks: PortalSpotWeek[];
+  /** The club lets comedians decline single spots (settings.allowDeclines). */
+  allowDeclines: boolean;
+}
+
+/** `POST/DELETE /api/portal/spots/:bookingId/decline` — the spot as it is now. */
+export interface DeclineSpotResponse {
+  spot: PortalSpot;
 }
 
 /** `POST /api/portal/spots/confirm` */
@@ -198,8 +260,12 @@ export interface ConfirmLinkInfo {
   comedianName: string;
   weekStart: string;
   today: string;
+  /** Includes declined spots (status `declined`). */
   spots: PortalSpot[];
+  /** Spots still to confirm (declined ones don't count). */
   unconfirmedCount: number;
+  /** The club lets comedians decline single spots (settings.allowDeclines). */
+  allowDeclines: boolean;
 }
 
 /** `POST /api/portal/confirm/:token` — the state after confirming. */

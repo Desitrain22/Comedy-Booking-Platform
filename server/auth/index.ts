@@ -3,6 +3,7 @@ export { requireAdmin, requireBooker, requireComedian, getSessionBooker, getSess
 export {
   SESSION_COOKIES,
   createSession,
+  deleteOtherSessions,
   deleteSessionsFor,
   deleteExpiredSessions,
   signIn,
@@ -17,6 +18,7 @@ export {
   touchToken,
   safeRedirectPath,
   deleteExpiredTokens,
+  deleteTokensFor,
   type LoginLinkOptions,
 } from './tokens';
 export {
@@ -28,5 +30,6 @@ export {
   INVITE_TTL_MS,
   type InviteResult,
 } from './invites';
-export { issueLoginCode, verifyLoginCode, deleteStaleLoginCodes } from './codes';
-export { hashPassword, verifyPassword } from './password';
+export { issueLoginCode, verifyLoginCode, deleteStaleLoginCodes, deleteLoginCodesFor } from './codes';
+export { hashPassword, verifyPassword, timingDummyHash } from './password';
+export { clientIp, isHttpsRequest, trustProxyHops } from './request';

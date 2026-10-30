@@ -1,15 +1,18 @@
 /**
  * Dashboard section 1 (top, red): one row per unconfirmed booking tonight,
- * "John · 7 PM @ The Cellar · unconfirmed", with [Resend] and [Mark confirmed].
+ * "John · 7 PM @ The Cellar · unconfirmed", with [Resend] and [Mark confirmed] (Undo in the
+ * toast). Archived comedians are never emailed, so their rows say "Archived" instead of
+ * offering Resend; nor is a spot whose show has started (emails only list spots ahead).
+ * Declined spots live in "Needs a replacement", not here.
  */
 import { CircleAlert, CircleCheck, Check, Mail, MoonStar } from 'lucide-react';
 import { Link } from 'react-router';
 import type { DashboardResponse, UnconfirmedTonightRow } from '../../../shared/api/dashboard';
-import { formatRelative } from '../../../shared/time';
+import { CLUB_NIGHT_CUTOFF_MIN, formatRelative, MINUTES_PER_DAY } from '../../../shared/time';
 import { ComedianHoverCard } from '../../components/ComedianHoverCard';
-import { Button, ColorDot } from '../../components/ui';
+import { Badge, Button, ColorDot } from '../../components/ui';
 import { cn } from '../../lib/cn';
-import { spotLabel } from './format';
+import { plural, spotLabel, tonightCounts } from './format';
 import { useMarkConfirmed, useResendConfirmation } from './useDashboard';
 
 export interface UnconfirmedTonightProps {
@@ -18,12 +21,14 @@ export interface UnconfirmedTonightProps {
 
 export function UnconfirmedTonight({ data }: UnconfirmedTonightProps) {
   const rows = data.unconfirmedTonight;
-  const bookedTonight = data.tonight.reduce((n, s) => n + (s.status === 'scheduled' ? s.bookedCount : 0), 0);
+  const counts = tonightCounts(data);
   const markConfirmed = useMarkConfirmed();
   const resend = useResendConfirmation(data.emailConfigured);
+  // Minutes into tonight's club night (after midnight, the night's date is yesterday's).
+  const nightMin = data.nowMin < CLUB_NIGHT_CUTOFF_MIN ? data.nowMin + MINUTES_PER_DAY : data.nowMin;
 
   if (rows.length === 0) {
-    const nobodyBooked = bookedTonight === 0;
+    const nobodyBooked = counts.booked === 0;
     return (
       <section
         aria-labelledby="unconfirmed-tonight-title"
@@ -42,12 +47,20 @@ export function UnconfirmedTonight({ data }: UnconfirmedTonightProps) {
         </span>
         <div className="min-w-0">
           <h2 id="unconfirmed-tonight-title" className="text-sm font-semibold text-fg">
-            {nobodyBooked ? 'Nobody is booked tonight' : "Everyone's confirmed for tonight 🎉"}
+            {nobodyBooked
+              ? 'No one is booked tonight'
+              : counts.declined > 0
+                ? 'Everyone else is confirmed for tonight'
+                : "Everyone's confirmed for tonight 🎉"}
           </h2>
           <p className="text-sm text-fg-muted">
             {nobodyBooked
-              ? 'Unconfirmed comedians for tonight will show up here in red.'
-              : `All ${bookedTonight} comedians on tonight's lineups have confirmed.`}
+              ? counts.shows > 0
+                ? 'Book comedians on the day view; anyone unconfirmed tonight shows up here in red.'
+                : 'Anyone unconfirmed tonight shows up here in red.'
+              : counts.declined > 0
+                ? `${plural(counts.confirmed, 'comedian')} confirmed · ${counts.declined} declined (see Needs a replacement).`
+                : `All ${plural(counts.booked, 'comedian')} on tonight's lineups ${counts.booked === 1 ? 'has' : 'have'} confirmed.`}
           </p>
         </div>
       </section>
@@ -73,8 +86,16 @@ export function UnconfirmedTonight({ data }: UnconfirmedTonightProps) {
           <UnconfirmedRow
             key={row.bookingId}
             row={row}
-            onResend={() =>
-              resend.mutate({ comedianId: row.comedianId, weekStart: data.week.weekStart, comedianName: row.comedianName })
+            started={row.startMin <= nightMin}
+            onResend={
+              row.comedianArchived || row.startMin <= nightMin
+                ? undefined
+                : () =>
+                    resend.mutate({
+                      comedianId: row.comedianId,
+                      weekStart: data.week.weekStart,
+                      comedianName: row.comedianName,
+                    })
             }
             resending={resend.isPending && resend.variables?.comedianId === row.comedianId}
             onConfirm={() => markConfirmed.mutate(row)}
@@ -88,13 +109,16 @@ export function UnconfirmedTonight({ data }: UnconfirmedTonightProps) {
 
 interface UnconfirmedRowProps {
   row: UnconfirmedTonightRow;
-  onResend: () => void;
+  /** The show has started: too late to email (Mark confirmed still works). */
+  started: boolean;
+  /** Absent for archived comedians (they're never emailed) and once the show has started. */
+  onResend?: () => void;
   resending: boolean;
   onConfirm: () => void;
   confirming: boolean;
 }
 
-function UnconfirmedRow({ row, onResend, resending, onConfirm, confirming }: UnconfirmedRowProps) {
+function UnconfirmedRow({ row, started, onResend, resending, onConfirm, confirming }: UnconfirmedRowProps) {
   const spot = spotLabel(row.startMin, row.location.name);
   return (
     <li className="relative flex flex-wrap items-center gap-x-4 gap-y-2 py-3 pr-4 pl-5">
@@ -109,6 +133,11 @@ function UnconfirmedRow({ row, onResend, resending, onConfirm, confirming }: Unc
               {row.comedianName}
             </Link>
           </ComedianHoverCard>
+          {row.comedianArchived && (
+            <Badge variant="outline" className="py-0 text-[11px]">
+              Archived
+            </Badge>
+          )}
           <span aria-hidden className="text-fg-subtle">
             ·
           </span>
@@ -123,24 +152,29 @@ function UnconfirmedRow({ row, onResend, resending, onConfirm, confirming }: Unc
         </p>
         <p className="mt-0.5 truncate text-xs text-fg-muted">
           {row.showName && <>{row.showName} · </>}
-          {row.confirmationSentAt != null ? (
+          {row.comedianArchived ? (
+            <>Archived comedians don't get emails. Replace them or mark them confirmed.</>
+          ) : row.confirmationSentAt != null ? (
             <>Confirmation emailed {formatRelative(row.confirmationSentAt)}</>
           ) : (
             <>Confirmation never sent</>
           )}
+          {started && !row.comedianArchived && <> · The show has started</>}
         </p>
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        <Button
-          size="sm"
-          variant="ghost"
-          onClick={onResend}
-          loading={resending}
-          aria-label={`Resend confirmation email to ${row.comedianName}`}
-        >
-          {!resending && <Mail aria-hidden />}
-          Resend
-        </Button>
+        {onResend && (
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={onResend}
+            loading={resending}
+            aria-label={`Resend confirmation email to ${row.comedianName}`}
+          >
+            {!resending && <Mail aria-hidden />}
+            Resend
+          </Button>
+        )}
         <Button
           size="sm"
           variant="secondary"
