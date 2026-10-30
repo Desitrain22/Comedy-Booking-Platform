@@ -6,6 +6,7 @@
  *   /setup                     first-run wizard (only until setup is complete)
  *   /login                     booker sign-in
  *   /accept-invite/:token      invited booker sets a password
+ *   /welcome#<token>           hosted mode: signed in right after sign-up → the setup guide
  *   /app                       Dashboard                (F5)   ┐
  *   /app/calendar?month        Month calendar           (F1)   │
  *   /app/shows/new?month       Create shows             (F1)   │ BookerLayout,
@@ -21,6 +22,9 @@
  *   /portal/spots              My spots                 (F4)   │ comedian session
  *   /portal/profile            Profile                  (F4)   ┘ (else /portal/login?next=…)
  *   /dev/month-grid            MonthGrid playground (dev builds only)
+ *
+ * This is a club's app: the self-hosted single club, or one club of a hosted install
+ * (client/HostGate.tsx picks it; the platform site is client/platform/PlatformApp.tsx).
  */
 import { Route, Routes } from 'react-router';
 import { RequireBooker, RequireComedian, RootRedirect, SetupGate } from './components/guards';
@@ -33,6 +37,7 @@ import { ComediansPage } from './pages/comedians/ComediansPage';
 import { DashboardPage } from './pages/dashboard/DashboardPage';
 import { DayPage } from './pages/day/DayPage';
 import { MonthGridPlayground } from './pages/dev/MonthGridPlayground';
+import { WelcomePage } from './pages/hosted/WelcomePage';
 import { LoginPage } from './pages/login/LoginPage';
 import { NotFoundPage } from './pages/notFound/NotFoundPage';
 import { AvailabilityPage } from './pages/portal/AvailabilityPage';
@@ -54,6 +59,7 @@ export function App() {
         <Route path="setup" element={<SetupPage />} />
         <Route path="login" element={<LoginPage />} />
         <Route path="accept-invite/:token" element={<AcceptInvitePage />} />
+        <Route path="welcome" element={<WelcomePage />} />
 
         <Route path="app" element={<RequireBooker />}>
           <Route element={<BookerLayout />}>

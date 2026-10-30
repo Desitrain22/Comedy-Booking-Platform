@@ -3,19 +3,17 @@ import './lib/zodConfig';
 import { QueryClientProvider } from '@tanstack/react-query';
 import { StrictMode, useSyncExternalStore } from 'react';
 import { createRoot } from 'react-dom/client';
-import { createBrowserRouter } from 'react-router';
-import { RouterProvider } from 'react-router/dom';
 import { Toaster } from 'sonner';
-import { App } from './App';
+import { HostGate } from './HostGate';
 import { queryClient } from './lib/queryClient';
 import './styles.css';
 
 const root = document.getElementById('root');
 if (!root) throw new Error('#root element missing from index.html');
 
-// A data router, so pages can block navigation (`useBlocker`: the portal's unsaved-changes
-// guard also catches Back/Forward). One splat route renders App's declarative <Routes>.
-const router = createBrowserRouter([{ path: '*', element: <App /> }]);
+// HostGate asks the server what this host is (a club, or in hosted mode the platform site), then
+// renders that app in a data router, so pages can block navigation (`useBlocker`: the portal's
+// unsaved-changes guard also catches Back/Forward). One splat route renders its <Routes>.
 
 /** Sonner's phone layout (full-width toasts) kicks in at this width. */
 const PHONE_QUERY = '(max-width: 600px)';
@@ -47,7 +45,7 @@ function AppToaster() {
 createRoot(root).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <RouterProvider router={router} />
+      <HostGate />
       <AppToaster />
     </QueryClientProvider>
   </StrictMode>,

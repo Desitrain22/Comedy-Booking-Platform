@@ -63,7 +63,7 @@ const FIELD_SCHEMAS: Record<keyof SetupForm, z.ZodType> = {
   adminPassword: passwordSchema,
 };
 
-function browserTimeZone(): string {
+export function browserTimeZone(): string {
   const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
   return tz && timeZoneSchema.safeParse(tz).success ? tz : 'America/New_York';
 }
@@ -146,23 +146,7 @@ export function SetupPage() {
       className="max-w-md"
       footer={<GuideSteps />}
     >
-      {/* The wizard's own pages: labelled bars, not numbers (the 1-2-3 under the card is the guide). */}
-      <ol className="mb-5 grid grid-cols-3 gap-2" aria-label="Setup progress">
-        {STEPS.map((s, i) => (
-          <li key={s.title} aria-current={i === step ? 'step' : undefined}>
-            <span aria-hidden className={cn('block h-1 rounded-full', i <= step ? 'bg-accent-solid' : 'bg-border')} />
-            <span
-              className={cn(
-                'mt-1.5 flex items-center gap-1 text-xs',
-                i === step ? 'font-semibold text-fg' : i < step ? 'text-fg-muted' : 'text-fg-subtle',
-              )}
-            >
-              {i < step && <Check className="size-3 text-accent" aria-label="Done:" />}
-              {s.label}
-            </span>
-          </li>
-        ))}
-      </ol>
+      <WizardProgress steps={STEPS} step={step} />
 
       <form onSubmit={handleSubmit} noValidate className="space-y-4">
         {step === 0 && (
@@ -248,8 +232,33 @@ export function SetupPage() {
   );
 }
 
-/** Under the card: this wizard is step 1 of the 3-step setup guide. */
-function GuideSteps() {
+/**
+ * The wizard's own pages: labelled bars, not numbers (the 1-2-3 under the card is the guide).
+ * Hosted sign-up (client/platform/SignupPage.tsx) shows the same.
+ */
+export function WizardProgress({ steps, step }: { steps: readonly { title: string; label: string }[]; step: number }) {
+  return (
+    <ol className="mb-5 grid grid-cols-3 gap-2" aria-label="Setup progress">
+      {steps.map((s, i) => (
+        <li key={s.title} aria-current={i === step ? 'step' : undefined}>
+          <span aria-hidden className={cn('block h-1 rounded-full', i <= step ? 'bg-accent-solid' : 'bg-border')} />
+          <span
+            className={cn(
+              'mt-1.5 flex items-center gap-1 text-xs',
+              i === step ? 'font-semibold text-fg' : i < step ? 'text-fg-muted' : 'text-fg-subtle',
+            )}
+          >
+            {i < step && <Check className="size-3 text-accent" aria-label="Done:" />}
+            {s.label}
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/** Under the card: this wizard is step 1 of the 3-step setup guide (hosted sign-up too). */
+export function GuideSteps() {
   const steps = ['Club', 'Shows', 'Comedians'];
   return (
     <div className="space-y-2">
