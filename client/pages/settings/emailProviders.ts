@@ -1,7 +1,8 @@
 /**
- * SMTP provider presets for Settings → Email, plus small pure helpers for the email log.
- * Kept free of React so they can be unit-tested.
+ * SMTP provider presets for Settings → Email and Account, plus small pure helpers for the
+ * email log. Kept free of React so they can be unit-tested.
  */
+import { EMAIL_VIA_LABELS, type EmailLogItem } from '../../../shared/api/settings';
 
 export type EmailProviderId = 'gmail' | 'resend' | 'postmark' | 'custom';
 
@@ -100,6 +101,17 @@ export function secureForPort(port: number): boolean | null {
 // ---------------------------------------------------------------------------
 // Email log helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * How a logged email went out, for the email log: "Platform sender", "Company mailbox",
+ * "Rich Brooks's mailbox", "Outbox", with the booker it was sent for when there was one
+ * ("Rich Brooks · Platform sender"). '' for emails logged before this was recorded.
+ */
+export function describeVia(email: Pick<EmailLogItem, 'via' | 'senderName'>): string {
+  if (!email.via) return '';
+  if (email.via === 'booker-mailbox') return email.senderName ? `${email.senderName}’s mailbox` : EMAIL_VIA_LABELS[email.via];
+  return email.senderName ? `${email.senderName} · ${EMAIL_VIA_LABELS[email.via]}` : EMAIL_VIA_LABELS[email.via];
+}
 
 /** The 6-digit sign-in code in a login-code email's text, if any. */
 export function extractLoginCode(text: string): string | null {

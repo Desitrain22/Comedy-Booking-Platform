@@ -114,7 +114,7 @@ export interface SettingsDto {
    * mode, or when the server has no SMTP_* sender). Emails go out through it when no mailbox
    * is connected.
    */
-  platformSender: { fromEmail: string } | null;
+  platformSender: { name: string; fromEmail: string } | null;
   /** What comedians see on company emails (sign-in links, invites, company mode), or null (outbox). */
   senderPreview: SenderPreview | null;
   /**

@@ -128,7 +128,7 @@ describe('what comedians see', () => {
       emailSource: 'platform',
       emailHost: PLATFORM_SMTP.host,
       emailFrom: '"Test Comedy Club" <bookings@mail.platform.test>',
-      platformSender: { fromEmail: 'bookings@mail.platform.test' },
+      platformSender: { name: 'Comedy Booking', fromEmail: 'bookings@mail.platform.test' },
       senderPreview: {
         via: 'platform',
         fromName: 'Test Comedy Club',

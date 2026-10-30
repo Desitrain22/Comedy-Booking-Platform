@@ -116,7 +116,7 @@ export function toSettingsDto(db: DbOrTx, viewerId: number | null = null): Setti
     emailHost: mail?.host ?? null,
     emailFrom: mail?.from || null,
     lastEmail: last && last.status !== 'outbox' ? { ...last, status: last.status } : null,
-    platformSender: env.hosted && env.smtp ? { fromEmail: env.smtp.fromEmail } : null,
+    platformSender: env.hosted && env.smtp ? { name: env.hosted.platformName, fromEmail: env.smtp.fromEmail } : null,
     senderPreview: previewSender(db, { senderMode: 'company' }),
     bookerSenderPreview: viewerId == null ? null : previewSender(db, { senderUserId: viewerId, senderMode: 'booker' }),
     appUrlLocked: env.hosted !== null,
