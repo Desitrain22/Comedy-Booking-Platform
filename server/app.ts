@@ -29,6 +29,7 @@ import { HttpError } from './lib/http';
 import { RateLimiter, setRateLimiter, type RateLimitConfig } from './lib/rateLimit';
 import { resolveRateLimits } from './lib/rateLimitConfig';
 import type { Platform } from './platform';
+import { platformAdminRoutes } from './platform/adminRoutes';
 import { platformRoutes } from './platform/routes';
 import { hostedTenancy } from './platform/tenancy';
 import { authRoutes } from './routes/auth';
@@ -181,8 +182,9 @@ export function createApp(options: CreateAppOptions): Hono<AppEnv> {
   if (!platform) app.get('/api/host', (c) => c.json({ mode: 'single' } satisfies HostContext));
 
   // Hosted mode, platform host only (the tenancy middleware keeps club hosts out): sign-up
-  // and find my club. The owner console (hosted MVP PR 3) mounts its routes here too.
+  // and find my club, and the owner console (/api/platform/admin/*).
   if (platform) app.route('/api', platformRoutes(platform));
+  if (platform) app.route('/api', platformAdminRoutes(platform));
 
   // Foundation
   app.route('/api', authRoutes);
