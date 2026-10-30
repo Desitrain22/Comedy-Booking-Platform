@@ -154,11 +154,16 @@ describe('confirmations', () => {
     await t.request('/api/confirmations/send', { method: 'POST', headers: rich.headers, json: { weekStart: week } });
     expect(latestEmail(t.db, john.email)?.senderUserId).toBe(rich.user.id);
 
+    // email_log.sender_user_id references them: migration 0003's ON DELETE SET NULL lets the
+    // delete through (with foreign keys on, NO ACTION would refuse it).
     const removed = await t.request(`/api/users/${rich.user.id}`, { method: 'DELETE', headers: admin.headers });
     expect(removed.status).toBe(200);
     expect(t.db.select().from(bookings).where(eq(bookings.id, booking.id)).get()?.bookedById).toBeNull();
     // Their earlier emails stay in the log, now as the company's.
     expect(emailsTo(t.db, john.email).map((r) => r.senderUserId)).toEqual([null]);
+    expect(
+      t.db.$client.prepare('SELECT COUNT(*) AS n FROM email_log WHERE sender_user_id IS NOT NULL').get(),
+    ).toEqual({ n: 0 });
 
     await t.request('/api/confirmations/resend', {
       method: 'POST',
