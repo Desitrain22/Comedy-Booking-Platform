@@ -34,7 +34,8 @@ WORKDIR /app
 COPY --from=build --chown=node:node /app/package.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
-COPY --chmod=755 scripts/docker-entrypoint.sh /usr/local/bin/cbp-entrypoint
+COPY scripts/docker-entrypoint.sh /usr/local/bin/cbp-entrypoint
+RUN chmod 755 /usr/local/bin/cbp-entrypoint
 RUN mkdir -p /data && chown node:node /data
 # Starts as root only to fix the data folder's owner, then runs the app as `node`
 # (scripts/docker-entrypoint.sh).
