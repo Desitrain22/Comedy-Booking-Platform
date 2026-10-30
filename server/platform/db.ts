@@ -16,7 +16,8 @@ export type PlatformDb = BetterSQLite3Database<PlatformSchema> & { $client: Data
 export function platformMigrationsFolder(): string {
   if (process.env.PLATFORM_MIGRATIONS_DIR) return path.resolve(process.env.PLATFORM_MIGRATIONS_DIR);
   const here = path.dirname(fileURLToPath(import.meta.url));
-  const candidates = [path.join(here, 'migrations'), path.join(here, 'platform-migrations')];
+  // The bundle first: dist/server/migrations exists there too, but holds the CLUB migrations.
+  const candidates = [path.join(here, 'platform-migrations'), path.join(here, 'migrations')];
   const found = candidates.find((dir) => existsSync(path.join(dir, 'meta', '_journal.json')));
   if (!found) throw new Error(`Platform migrations not found (looked in ${candidates.join(', ')})`);
   return found;
