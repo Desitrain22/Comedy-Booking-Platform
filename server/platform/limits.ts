@@ -1,5 +1,6 @@
 /**
- * Platform-level rate limits (hosted mode): sign-up and "find my club" on the platform host.
+ * Platform-level rate limits (hosted mode): sign-up, "find my club" and the owner console's
+ * sign-in on the platform host.
  * Same sliding-window machinery as the clubs' sign-in limits (server/lib/rateLimit.ts), in a
  * limiter of its own that lives with the Platform (one per server, not per club database).
  *
@@ -24,6 +25,20 @@ export const PLATFORM_RATE_LIMITS = {
    * address has an account.
    */
   findClubEmailsPerAddress: { limit: 3, windowMs: HOUR },
+  /** Owner-console sign-in code requests from one IP (every request counts). Past it: 429. */
+  adminCodeRequestsPerIp: { limit: 20, windowMs: 15 * MINUTE },
+  /**
+   * Owner-console codes emailed to one address. Past it the request still answers ok but no
+   * code is sent (the answer never says whether the address is an owner's).
+   */
+  adminCodeEmailsPerAddress: { limit: 5, windowMs: 15 * MINUTE },
+  /** Wrong owner-console codes from one IP, whatever the email. Past it: 429. */
+  adminCodeFailuresPerIp: { limit: 20, windowMs: 15 * MINUTE },
+  /**
+   * Wrong owner-console codes for one email from every IP together. Loose: each code already
+   * dies after 5 wrong tries, and this only backs that up.
+   */
+  adminCodeFailuresPerEmail: { limit: 50, windowMs: 15 * MINUTE },
 } as const satisfies Record<string, RateLimitRule>;
 
 export type PlatformRateLimitName = keyof typeof PLATFORM_RATE_LIMITS;
