@@ -3,15 +3,20 @@
  *
  *   GET  /api/settings                    any booker — never returns the SMTP password
  *   PUT  /api/settings                    any booker — partial update; blank smtpPass keeps it.
- *                                         Email settings + app URL (ADMIN_ONLY_SETTINGS) are admin-only
+ *                                         Email settings, sender mode + app URL (ADMIN_ONLY_SETTINGS)
+ *                                         are admin-only. Hosted mode: the app URL is locked
+ *                                         (400 app_url_locked) and the SMTP host must be public
+ *                                         (400 smtp_host_not_allowed). Mailbox passwords are
+ *                                         stored encrypted when APP_SECRET is set
  *   POST /api/settings/test-email         any booker — sends the test template via sendEmail
  *                                         (non-admins only to their own address)
+ *   /api/me/mailbox…                      each booker's own mailbox: ./mailbox.ts (mounted here)
  *   GET  /api/email-log, /email-log/:id   admin — holds comedians' sign-in codes and links (how
  *                                         dev users read the outbox)
  *   GET/POST /api/users, PATCH/DELETE /api/users/:id, POST /api/users/:id/resend-invite   admin
  *   GET  /api/backup                      admin — VACUUM INTO a temp file, streamed as a download
  */
-import { and, count, desc, eq, gte, isNotNull, like, ne, or, type SQL } from 'drizzle-orm';
+import { and, count, desc, eq, gte, inArray, isNotNull, like, ne, or, type SQL } from 'drizzle-orm';
 import { Hono } from 'hono';
 import { createReadStream } from 'node:fs';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
@@ -46,27 +51,43 @@ import { deleteSessionsFor } from '../auth/sessions';
 import type { AppEnv } from '../context';
 import type { DbOrTx } from '../db/client';
 import { emailLog, jobRuns, users, type EmailLogEntry, type User } from '../db/schema';
-import { getMailConfig, sendEmail, type SendEmailResult } from '../email/mailer';
+import { getMailConfig, previewSender, sendEmail } from '../email/mailer';
 import { testEmail } from '../email/templates';
+import { awaitTestEmail } from '../email/testEmail';
+import { env } from '../env';
+import { getClubHosting } from '../lib/hosting';
 import { httpError, orNotFound, parseId } from '../lib/http';
+import { SMTP_HOST_NOT_ALLOWED_MESSAGE, smtpHostNotAllowed } from '../email/smtpHostGuard';
+import { encryptSecret } from '../lib/secrets';
 import { clubToday, getAppUrl, getSettings, updateSettings, type Settings, type SettingsUpdate } from '../lib/settings';
 import { validate } from '../lib/validate';
 import { confirmationsJobKey } from '../services/scheduler';
+import { mailboxRoutes } from './mailbox';
+
+export { TEST_EMAIL_TIMEOUT_MS, smtpErrorHint } from '../email/testEmail';
 
 export const settingsRoutes = new Hono<AppEnv>();
+
+// Each booker's own mailbox (GET/PUT/DELETE /api/me/mailbox, POST /api/me/mailbox/test).
+settingsRoutes.route('/', mailboxRoutes);
 
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
 
-/** Settings as the API exposes them. Built field by field so the SMTP password can't leak. */
-export function toSettingsDto(db: DbOrTx): SettingsDto {
+/**
+ * Settings as the API exposes them. Built field by field so the SMTP password can't leak.
+ * `viewerId` (the signed-in booker) personalises `bookerSenderPreview`.
+ */
+export function toSettingsDto(db: DbOrTx, viewerId: number | null = null): SettingsDto {
   const s = getSettings(db);
+  const hosting = getClubHosting(db);
   const mail = getMailConfig(db);
+  // The company sender's latest real send (a booker's own mailbox failing isn't the company's).
   const last = db
     .select({ id: emailLog.id, status: emailLog.status, error: emailLog.error, createdAt: emailLog.createdAt })
     .from(emailLog)
-    .where(ne(emailLog.status, 'outbox'))
+    .where(and(ne(emailLog.status, 'outbox'), inArray(emailLog.via, ['', 'company-mailbox', 'platform'])))
     .orderBy(desc(emailLog.id))
     .limit(1)
     .get();
@@ -93,11 +114,16 @@ export function toSettingsDto(db: DbOrTx): SettingsDto {
     fromName: s.fromName,
     fromEmail: s.fromEmail,
     replyTo: s.replyTo,
+    senderMode: s.senderMode,
     emailConfigured: mail !== null,
     emailSource: mail?.source ?? null,
     emailHost: mail?.host ?? null,
     emailFrom: mail?.from || null,
     lastEmail: last && last.status !== 'outbox' ? { ...last, status: last.status } : null,
+    platformSender: hosting && env.smtp ? { name: hosting.hosted.platformName, fromEmail: env.smtp.fromEmail } : null,
+    senderPreview: previewSender(db, { senderMode: 'company' }),
+    bookerSenderPreview: viewerId == null ? null : previewSender(db, { senderUserId: viewerId, senderMode: 'booker' }),
+    appUrlLocked: hosting !== null,
     confirmationsEnabled: s.confirmationsEnabled,
     confirmationDay: s.confirmationDay,
     confirmationTimeMin: s.confirmationTimeMin,
@@ -113,7 +139,7 @@ function invalid(path: string, message: string, code = 'validation_error') {
 
 const SMTP_FIELDS = ['smtpHost', 'smtpUser', 'fromEmail'] as const;
 
-settingsRoutes.get('/settings', requireBooker, (c) => c.json(toSettingsDto(c.var.db)));
+settingsRoutes.get('/settings', requireBooker, (c) => c.json(toSettingsDto(c.var.db, c.var.booker.id)));
 
 /**
  * The admin-only fields this (validated) body would change. Unchanged values are fine, so a
@@ -137,6 +163,14 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
   const input = c.req.valid('json');
   const { smtpPass, clearSmtpPass, ...fields } = input;
   const current = getSettings(db);
+  const hosting = getClubHosting(db);
+
+  // Hosted mode: the club's address is its subdomain (set at sign-up) and every emailed link
+  // starts with it. Sending it back unchanged is fine.
+  if (hosting && input.appUrl !== undefined && input.appUrl !== hosting.clubUrl && input.appUrl !== current.appUrl) {
+    const message = `Your club's address is ${hosting.clubUrl} and can't be changed`;
+    throw httpError(400, message, 'app_url_locked', { issues: [{ path: 'appUrl', message }] });
+  }
 
   // Email settings decide where sign-in links, codes and confirmations go (and hold the SMTP
   // password); the app URL starts every emailed link. Only admins may redirect them.
@@ -151,7 +185,7 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
 
   const patch: SettingsUpdate = { ...fields };
   if (clearSmtpPass) patch.smtpPass = '';
-  else if (smtpPass !== undefined && smtpPass.trim() !== '') patch.smtpPass = smtpPass;
+  else if (smtpPass !== undefined && smtpPass.trim() !== '') patch.smtpPass = encryptSecret(smtpPass);
   // A saved password is only ever sent to the server it was entered for: pointing the
   // connection somewhere else without typing it again removes it.
   if (
@@ -160,6 +194,11 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
     SMTP_CONNECTION_FIELDS.some((f) => patch[f] !== undefined && patch[f] !== current[f])
   ) {
     patch.smtpPass = '';
+  }
+
+  // Hosted mode: the company mailbox must be a public server, never inside our network.
+  if (hosting && patch.smtpHost && smtpHostNotAllowed(patch.smtpHost)) {
+    throw invalid('smtpHost', SMTP_HOST_NOT_ALLOWED_MESSAGE, 'smtp_host_not_allowed');
   }
 
   // Cross-field checks run against the merged result (the body may hold only one side).
@@ -183,56 +222,12 @@ settingsRoutes.put('/settings', requireBooker, validate('json', updateSettingsSc
   }
 
   if (Object.keys(patch).length > 0) updateSettings(db, patch);
-  return c.json(toSettingsDto(db));
+  return c.json(toSettingsDto(db, c.var.booker.id));
 });
 
 // ---------------------------------------------------------------------------
 // Test email
 // ---------------------------------------------------------------------------
-
-/**
- * How long the test-email request waits for the SMTP server before giving up. A backstop:
- * the transport's own timeouts (`SMTP_TIMEOUTS`, 10s connect + 10s greeting, 20s idle)
- * normally fail first with a more specific error, which gets a hint like any other failure.
- */
-export const TEST_EMAIL_TIMEOUT_MS = 25_000;
-
-/** A plain-language next step for a raw SMTP error message. */
-export function smtpErrorHint(error: string, server: { host: string; port: number }): string {
-  const host = server.host.toLowerCase();
-  const where = `${server.host}:${server.port}`;
-  if (/EAUTH|invalid login|535|534|username and password not accepted|authentication (failed|unsuccessful)|bad ?credentials|missing credentials/i.test(error)) {
-    if (host.includes('gmail') || host.includes('google')) {
-      return 'Gmail rejected the username or password. Gmail needs an App Password — your normal Google password won’t work. Turn on 2-Step Verification, create an App Password at myaccount.google.com/apppasswords, and paste the 16 letters as the password. The username is your full Gmail address.';
-    }
-    if (host.includes('resend')) {
-      return 'Resend rejected the login. The username must be exactly "resend" and the password is an API key that starts with re_.';
-    }
-    if (host.includes('postmark')) {
-      return 'Postmark rejected the login. Use your Server API token as both the username and the password.';
-    }
-    return 'The server rejected the username or password. Check them with your email provider (many providers need an app password or API key here, not your normal password).';
-  }
-  if (/ENOTFOUND|EAI_AGAIN|getaddrinfo|EDNS/i.test(error)) {
-    return `Couldn't find a server called "${server.host}". Check the spelling of the SMTP host.`;
-  }
-  if (/ECONNREFUSED/i.test(error)) {
-    return `${where} refused the connection. Check the port — it's usually 465 (SSL/TLS) or 587 (STARTTLS).`;
-  }
-  if (/wrong version number|ssl routines|EPROTO|tls_validate|ssl3_get_record|unexpected eof/i.test(error)) {
-    return 'The "secure connection" setting doesn\'t match the port. Turn it on for port 465, and off for port 587 (which upgrades with STARTTLS).';
-  }
-  if (/ETIMEDOUT|timed? ?out|greeting never received|ECONNRESET/i.test(error)) {
-    return `Couldn't talk to ${where}. Check the host and port, and that your server's network allows outgoing email (some hosts block ports 25, 465 and 587).`;
-  }
-  if (/self[- ]signed|certificate|CERT_/i.test(error)) {
-    return "The server's security certificate isn't trusted. Double-check the host name — it must match the provider's certificate.";
-  }
-  if (/sender|from address|not verified|domain|not allowed|550|553|554/i.test(error)) {
-    return 'The server refused the From address. Make sure the From email is allowed by your provider (for example a verified sender or domain).';
-  }
-  return 'Double-check the host, port, username and password with your email provider.';
-}
 
 settingsRoutes.post('/settings/test-email', requireBooker, validate('json', testEmailSchema), async (c) => {
   const db = c.var.db;
@@ -242,34 +237,12 @@ settingsRoutes.post('/settings/test-email', requireBooker, validate('json', test
   if (to !== me.email && me.role !== 'admin') {
     throw httpError(403, 'You can only send the test email to yourself', 'forbidden');
   }
+  // The company sender: the test checks what sign-in codes and company emails go out through.
   const config = getMailConfig(db);
   const content = testEmail({ clubName: getSettings(db).clubName, name: to === me.email ? me.name : undefined });
-
-  const sending = sendEmail(db, { to, kind: 'test', ...content });
-  // A late result still lands in the email log; don't let it surface as an unhandled rejection.
-  sending.catch(() => undefined);
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<'timeout'>((resolve) => {
-    timer = setTimeout(() => resolve('timeout'), TEST_EMAIL_TIMEOUT_MS);
+  const result = await awaitTestEmail(sendEmail(db, { to, kind: 'test', ...content }), config, {
+    platform: config?.source === 'platform',
   });
-  const result: SendEmailResult | 'timeout' = await Promise.race([sending, timeout]).finally(() => clearTimeout(timer));
-
-  if (result === 'timeout') {
-    const where = config ? `${config.host}:${config.port}` : 'the mail server';
-    throw httpError(504, `No answer from ${where} after ${TEST_EMAIL_TIMEOUT_MS / 1000} seconds`, 'email_timeout', {
-      hint: config
-        ? smtpErrorHint('ETIMEDOUT', config)
-        : 'Check the host and port with your email provider.',
-    });
-  }
-  if (result.status === 'failed') {
-    const smtpError = result.error ?? 'Unknown error';
-    throw httpError(502, `Couldn't send the test email: ${smtpError}`, 'email_failed', {
-      smtpError,
-      hint: config ? smtpErrorHint(smtpError, config) : undefined,
-      logId: result.id,
-    });
-  }
   return c.json({ status: result.status, to, logId: result.id } satisfies TestEmailResponse);
 });
 
@@ -277,7 +250,7 @@ settingsRoutes.post('/settings/test-email', requireBooker, validate('json', test
 // Email log
 // ---------------------------------------------------------------------------
 
-function toEmailLogItem(row: EmailLogEntry): EmailLogItem {
+function toEmailLogItem(row: EmailLogEntry, senderName: string | null): EmailLogItem {
   return {
     id: row.id,
     toEmail: row.toEmail,
@@ -287,7 +260,17 @@ function toEmailLogItem(row: EmailLogEntry): EmailLogItem {
     error: row.error,
     comedianId: row.comedianId,
     createdAt: row.createdAt,
+    via: row.via || null,
+    senderName,
   };
+}
+
+/** email_log rows with the name of the booker they were sent for. */
+function selectEmailLog(db: DbOrTx) {
+  return db
+    .select({ row: emailLog, senderName: users.name })
+    .from(emailLog)
+    .leftJoin(users, eq(users.id, emailLog.senderUserId));
 }
 
 /** Escape LIKE wildcards so a search for "50%" means the literal text. */
@@ -305,20 +288,22 @@ settingsRoutes.get('/email-log', requireAdmin, validate('query', emailLogQuerySc
   }
   if (kind) conditions.push(eq(emailLog.kind, kind));
   if (status) conditions.push(eq(emailLog.status, status));
-  const rows = c.var.db
-    .select()
-    .from(emailLog)
+  const rows = selectEmailLog(c.var.db)
     .where(and(...conditions))
     .orderBy(desc(emailLog.id))
     .limit(limit)
     .all();
-  return c.json(rows.map(toEmailLogItem));
+  return c.json(rows.map(({ row, senderName }) => toEmailLogItem(row, senderName)));
 });
 
 settingsRoutes.get('/email-log/:id', requireAdmin, (c) => {
   const id = parseId(c.req.param('id'));
-  const row = orNotFound(c.var.db.select().from(emailLog).where(eq(emailLog.id, id)).get(), 'Email');
-  return c.json({ ...toEmailLogItem(row), bodyHtml: row.bodyHtml, bodyText: row.bodyText } satisfies EmailLogDetail);
+  const { row, senderName } = orNotFound(selectEmailLog(c.var.db).where(eq(emailLog.id, id)).get(), 'Email');
+  return c.json({
+    ...toEmailLogItem(row, senderName),
+    bodyHtml: row.bodyHtml,
+    bodyText: row.bodyText,
+  } satisfies EmailLogDetail);
 });
 
 // ---------------------------------------------------------------------------
@@ -411,6 +396,7 @@ settingsRoutes.delete('/users/:id', requireAdmin, (c) => {
   }
   db.transaction((tx) => {
     deleteSessionsFor(tx, 'booker', target.id);
+    // Their bookings, notes and logged emails stay, now unattributed (ON DELETE SET NULL).
     tx.delete(users).where(eq(users.id, target.id)).run();
   });
   return c.json({ ok: true } satisfies OkResponse);

@@ -3,7 +3,8 @@
  * for a month to everyone or a tag, and reminders to the ones who haven't submitted.
  * Each email carries a magic link that signs the comedian in and opens
  * `/portal?month=YYYY-MM`. Every send is recorded in email_log; each blast in
- * availability_requests.
+ * availability_requests. The booker who sent it is the email's sender (hosted MVP spec §5):
+ * with senderMode `booker` it comes from them and replies go to them.
  */
 import { and, asc, desc, eq, inArray } from 'drizzle-orm';
 import {
@@ -242,6 +243,7 @@ export async function sendAvailabilityRequest(
       ...content,
       kind: input.kind === 'reminder' ? 'availability_reminder' : 'availability_request',
       comedianId: comedian.id,
+      senderUserId: input.sentById,
     });
   });
   const failed = results.filter((r) => r.status === 'failed').length;

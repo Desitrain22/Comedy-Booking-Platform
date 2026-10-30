@@ -2,13 +2,13 @@
  * Data hooks and form helpers for the Settings tabs.
  *
  * Query keys: `['settings']`, `['email-log', filters]`, `['email-log', 'detail', id]`,
- * `['users']`, `['locations', { includeArchived: true }]`.
+ * `['users']`, `['locations', { includeArchived: true }]`, `['mailbox']` (your own).
  */
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import type { z } from 'zod';
-import type { SettingsDto, UpdateSettingsInput } from '../../../shared/api/settings';
-import { updateSettingsSchema } from '../../../shared/api/settings';
+import type { MailboxDto, SettingsDto, UpdateMailboxInput, UpdateSettingsInput } from '../../../shared/api/settings';
+import { updateMailboxSchema, updateSettingsSchema } from '../../../shared/api/settings';
 import type { Location } from '../../../shared/types';
 import { api, ApiError } from '../../lib/api';
 import { useRefreshMe } from '../../lib/useMe';
@@ -17,6 +17,33 @@ export const SETTINGS_KEY = ['settings'] as const;
 export const USERS_KEY = ['users'] as const;
 export const EMAIL_LOG_KEY = ['email-log'] as const;
 export const ALL_LOCATIONS_KEY = ['locations', { includeArchived: true }] as const;
+export const MAILBOX_KEY = ['mailbox'] as const;
+
+/** The signed-in booker's own mailbox (Settings → Account). */
+export function useMailbox() {
+  return useQuery({
+    queryKey: MAILBOX_KEY,
+    queryFn: ({ signal }) => api.get<MailboxDto>('/me/mailbox', { signal }),
+  });
+}
+
+/**
+ * Connect/change (`input`) or disconnect (`null`) your own mailbox. Settings refresh too:
+ * their preview of emails sent as you follows your mailbox.
+ */
+export function useSaveMailbox() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: UpdateMailboxInput | null) =>
+      input ? api.put<MailboxDto>('/me/mailbox', input) : api.del<MailboxDto>('/me/mailbox'),
+    onSuccess: (data) => {
+      queryClient.setQueryData(MAILBOX_KEY, data);
+      void queryClient.invalidateQueries({ queryKey: SETTINGS_KEY });
+    },
+    // Callers show field errors / toasts themselves.
+    meta: { silent: true },
+  });
+}
 
 export function useSettings() {
   return useQuery({
@@ -83,6 +110,12 @@ export function apiFieldErrors(err: unknown): FieldErrors | null {
 /** Validate a settings patch on the client with the shared schema. Null when valid. */
 export function validateSettingsPatch(patch: UpdateSettingsInput): FieldErrors | null {
   const result = updateSettingsSchema.safeParse(patch);
+  return result.success ? null : issuesToErrors((result.error as z.ZodError).issues);
+}
+
+/** Validate a mailbox save on the client with the shared schema. Null when valid. */
+export function validateMailbox(input: UpdateMailboxInput): FieldErrors | null {
+  const result = updateMailboxSchema.safeParse(input);
   return result.success ? null : issuesToErrors((result.error as z.ZodError).issues);
 }
 

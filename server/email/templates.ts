@@ -184,22 +184,28 @@ This invite expires in 7 days.`;
   return { subject, html, text };
 }
 
-export function testEmail(params: { clubName: string; name?: string }): EmailContent {
+/**
+ * "Send test email". `mailbox: 'booker'` is the test of a booker's own mailbox (Settings →
+ * Account), which only carries the emails sent as them.
+ */
+export function testEmail(params: { clubName: string; name?: string; mailbox?: 'company' | 'booker' }): EmailContent {
   const { clubName, name } = params;
   const subject = `Test email from ${clubName}`;
   const greeting = name ? `Hi ${firstName(name)},` : 'Hi,';
+  const reaches =
+    params.mailbox === 'booker'
+      ? 'availability requests and confirmations sent as you will reach your comedians from your own address'
+      : 'sign-in codes, availability requests and confirmations will reach your comedians';
   const html = renderEmailLayout({
     clubName,
     heading: 'Email is working 🎉',
     bodyHtml: [
       emailParagraph(escapeHtml(greeting)),
-      emailParagraph(
-        `This is a test email from ${escapeHtml(clubName)}. If you're reading it, sign-in codes, availability requests and confirmations will reach your comedians.`,
-      ),
+      emailParagraph(`This is a test email from ${escapeHtml(clubName)}. If you're reading it, ${reaches}.`),
     ].join('\n'),
   });
   const text = `${greeting}
 
-This is a test email from ${clubName}. If you're reading it, sign-in codes, availability requests and confirmations will reach your comedians.`;
+This is a test email from ${clubName}. If you're reading it, ${reaches}.`;
   return { subject, html, text };
 }

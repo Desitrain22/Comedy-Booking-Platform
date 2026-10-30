@@ -34,7 +34,7 @@ import {
 import { api, errorMessage } from '../../lib/api';
 import { cn } from '../../lib/cn';
 import { useClub } from '../../lib/useMe';
-import { extractLinks, extractLoginCode, previewDocument } from './emailProviders';
+import { describeVia, extractLinks, extractLoginCode, previewDocument } from './emailProviders';
 import { Callout, CopyButton, CopyField } from './SettingsParts';
 import { EMAIL_LOG_KEY } from './settingsData';
 
@@ -163,6 +163,9 @@ export function EmailLogCard({ onOpen }: { onOpen: (id: number) => void }) {
                 <th scope="col" className="hidden px-2 py-2 font-medium md:table-cell">
                   Type
                 </th>
+                <th scope="col" className="hidden px-2 py-2 font-medium lg:table-cell">
+                  Sent via
+                </th>
                 <th scope="col" className="px-4 py-2 text-right font-medium">
                   Status
                 </th>
@@ -194,6 +197,9 @@ export function EmailLogCard({ onOpen }: { onOpen: (id: number) => void }) {
                   </td>
                   <td className="hidden px-2 py-2.5 whitespace-nowrap text-fg-muted md:table-cell">
                     {EMAIL_KIND_LABELS[email.kind]}
+                  </td>
+                  <td className="hidden max-w-48 truncate px-2 py-2.5 text-fg-muted lg:table-cell" title={describeVia(email)}>
+                    {describeVia(email)}
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     <EmailStatusBadge status={email.status} />
@@ -258,6 +264,12 @@ function EmailDetail({ email, sentAt }: { email: EmailLogDetail; sentAt: string 
         <dd>
           <EmailStatusBadge status={email.status} />
         </dd>
+        {email.via && (
+          <>
+            <dt className="text-fg-muted">Sent via</dt>
+            <dd className="min-w-0 break-words text-fg">{describeVia(email)}</dd>
+          </>
+        )}
       </dl>
 
       {email.status === 'outbox' && (

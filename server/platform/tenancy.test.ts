@@ -282,13 +282,17 @@ describe('the club app address in hosted mode', () => {
 
     const refused = await put({ appUrl: 'https://evil.example', clubName: 'Renamed' });
     expect(refused.status).toBe(400);
-    expect(await readJson(refused)).toMatchObject({ code: 'validation_error', issues: [{ path: 'appUrl' }] });
+    expect(await readJson(refused)).toMatchObject({
+      code: 'app_url_locked',
+      error: "Your club's address is http://broadway.localhost:3000 and can't be changed",
+      issues: [{ path: 'appUrl' }],
+    });
     expect(getSettings(db).clubName).not.toBe('Renamed');
 
-    expect((await put({ appUrl: '' })).status).toBe(400);
+    expect(await readJson(await put({ appUrl: '' }))).toMatchObject({ code: 'app_url_locked' });
     expect((await put({ appUrl: 'http://broadway.localhost:3000/', clubName: 'Same URL' })).status).toBe(200);
     expect(getSettings(db).clubName).toBe('Same URL');
-    // The body the guard read is the one the route validates and saves.
+    // No address at all: other fields save as usual.
     expect((await put({ clubName: 'No URL' })).status).toBe(200);
     expect(getSettings(db).clubName).toBe('No URL');
   });
