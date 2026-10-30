@@ -7,6 +7,8 @@
  * Hosted mode (the `hosted` project): `withPlatformDb` opens `platform.db` (the club registry,
  * the platform email log), `withHostedClubDb(slug, …)` one club's `clubs/<id>.db`, and
  * `setClubStatus(slug, …)` suspends / archives / reactivates a club like the owner console.
+ * `latestAdminCode(email)` reads the newest owner-console sign-in code from the platform email
+ * log, and `adminEventsFor(slug)` the console's actions on a club.
  */
 import { test } from '@playwright/test';
 import Database from 'better-sqlite3';
@@ -72,4 +74,32 @@ export function setClubStatus(slug: string, status: 'active' | 'suspended' | 'ar
       .run(status, reason, Date.now(), slug).changes;
     if (changed !== 1) throw new Error(`No hosted club ${slug}`);
   });
+}
+
+/**
+ * The newest owner-console sign-in code emailed to `email` (outbox rows keep the body), with
+ * its email's id (to tell a new code from the last one), or null.
+ */
+export function latestAdminCode(email: string): { id: number; code: string } | null {
+  const row = withPlatformDb(
+    (db) =>
+      db
+        .prepare(
+          `SELECT id, body_text FROM platform_email_log WHERE kind = 'admin_login_code' AND to_email = ? ORDER BY id DESC LIMIT 1`,
+        )
+        .get(email.toLowerCase()) as { id: number; body_text: string } | undefined,
+  );
+  const code = /\b(\d{6})\b/.exec(row?.body_text ?? '')?.[1];
+  return row && code ? { id: row.id, code } : null;
+}
+
+/** The owner console's actions on the club at `slug`, oldest first. */
+export function adminEventsFor(slug: string): { action: string; admin_email: string; reason: string }[] {
+  const id = hostedClubId(slug);
+  return withPlatformDb(
+    (db) =>
+      db
+        .prepare('SELECT action, admin_email, reason FROM admin_events WHERE club_id = ? ORDER BY id')
+        .all(id) as { action: string; admin_email: string; reason: string }[],
+  );
 }
